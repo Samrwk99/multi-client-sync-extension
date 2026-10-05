@@ -4,6 +4,11 @@
     "requires": [],
     "optional": [],
     "generate_interceptor": "multiClientSyncGenerateInterceptor",
+    "hooks": {
+        "activate": "onActivate",
+        "enable": "onEnable",
+        "disable": "onDisable"
+    },
     "js": "index.js",
     "css": "style.css",
     "author": "SillyTavern",

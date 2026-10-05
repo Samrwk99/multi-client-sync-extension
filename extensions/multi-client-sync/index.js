@@ -43,6 +43,10 @@ let remoteRenderTimer = null;
 let lastStreamSentAt = 0;
 let pendingStream = null;
 let terminalizingGenerationId = null;
+let scopeRetryTimer = null;
+let sseEpoch = 0;
+const registeredEventHandlers = [];
+const registeredUiHandlers = [];
 let heartbeatTimer = null;
 let generationHeartbeatTimer = null;
 let sendLockReason = '';
@@ -129,8 +133,17 @@ function durableSnapshot() {
 }
 function syncSnapshot(snapshot) {
     const normalized = normalizeSnapshot(snapshot);
-    if (settings.syncMetadata) return normalized;
-    return { messages: normalized.messages, metadata: clone(baseSnapshot?.metadata || {}) };
+    return {
+        messages: settings.syncMessages ? clone(normalized.messages) : clone(durableMessages()),
+        metadata: settings.syncMetadata ? clone(normalized.metadata) : clone(ctx?.chatMetadata || {}),
+    };
+}
+function incomingSnapshot(snapshot) {
+    const remote = normalizeSnapshot(snapshot);
+    return {
+        messages: settings.syncMessages ? clone(remote.messages) : clone(durableMessages()),
+        metadata: settings.syncMetadata ? clone(remote.metadata) : clone(ctx?.chatMetadata || {}),
+    };
 }
 function normalizeSnapshot(snapshot) {
     if (!snapshot || !Array.isArray(snapshot.messages)) return { messages: [], metadata: {} };
@@ -155,7 +168,16 @@ function encodeScope(scope) {
         .replace(/\//g, '_')
         .replace(/=+$/g, '');
 }
-function makeScopeKey(scope) { return scope ? [scope.kind, scope.ownerId, scope.chatId, scope.branchId || ''].join('|') : ''; }
+function makeScopeKey(scope) {
+    return scope
+        ? JSON.stringify([
+            String(scope.kind || ''),
+            String(scope.ownerId || ''),
+            String(scope.chatId || ''),
+            String(scope.branchId || ''),
+        ])
+        : '';
+}
 
 function openDb() {
     return new Promise((resolve, reject) => {
@@ -273,17 +295,49 @@ function mergeMetadata(base, local, remote) {
     if (deepEqual(local, base)) return clone(remote);
     if (deepEqual(remote, base)) return clone(local);
     if (deepEqual(local, remote)) return clone(local);
-    if (Array.isArray(local) || Array.isArray(remote) || Array.isArray(base)) return clone(local);
+
+    if (
+        Array.isArray(local) ||
+        Array.isArray(remote) ||
+        Array.isArray(base)
+    ) {
+        // Deterministic conflict resolution: the newer server-side value wins.
+        return clone(remote);
+    }
+
     const out = {};
-    const keys = new Set([...Object.keys(base || {}), ...Object.keys(local || {}), ...Object.keys(remote || {})]);
+    const keys = new Set([
+        ...Object.keys(base || {}),
+        ...Object.keys(local || {}),
+        ...Object.keys(remote || {}),
+    ]);
+
     for (const key of keys) {
         if (forbiddenKeys.has(key)) continue;
-        const b = base?.[key], l = local?.[key], r = remote?.[key];
-        if (deepEqual(l, b)) out[key] = clone(r);
-        else if (deepEqual(r, b)) out[key] = clone(l);
-        else if (l && r && typeof l === 'object' && typeof r === 'object') out[key] = mergeMetadata(b, l, r);
-        else out[key] = clone(l);
+
+        const b = base?.[key];
+        const l = local?.[key];
+        const r = remote?.[key];
+
+        if (deepEqual(l, b)) {
+            out[key] = clone(r);
+        } else if (deepEqual(r, b)) {
+            out[key] = clone(l);
+        } else if (
+            l && r &&
+            typeof l === 'object' &&
+            typeof r === 'object'
+        ) {
+            out[key] = mergeMetadata(
+                b,
+                l,
+                r,
+            );
+        } else {
+            out[key] = clone(r);
+        }
     }
+
     return out;
 }
 function mergeSnapshots(base, local, remote) {
@@ -306,7 +360,7 @@ function mergeSnapshots(base, local, remote) {
         else if (!lv && !rv) chosen = null;
         else if (!lv) chosen = rv;
         else if (!rv) chosen = lv;
-        else chosen = lv;
+        else chosen = rv;
         if (chosen) merged.push(clone(chosen));
     }
     const rank = new Map();
@@ -420,27 +474,111 @@ async function publishLocalSnapshot(snapshot = durableSnapshot()) {
 
 async function flushQueue() {
     if (!currentScope || !settings.enabled || !settings.syncMessages) return;
+
     const rows = await idbList(scopeKeyValue);
+
     for (const row of rows) {
         if (!currentScope) return;
+
         try {
-            const result = await sendSnapshotDirect(row.snapshot, Number(serverState?.revision ?? row.baseRevision), row.id);
+            let nextSnapshot = clone(row.snapshot);
+            let nextBase = clone(
+                row.baseSnapshot ||
+                baseSnapshot ||
+                { messages: [], metadata: {} },
+            );
+            let nextRevision = Number(
+                row.baseRevision || 0
+            );
+
+            const remote = serverState?.snapshot
+                ? clone(serverState.snapshot)
+                : null;
+
+            const remoteRevision = Number(
+                serverState?.revision ||
+                nextRevision
+            );
+
+            if (
+                remote &&
+                remoteRevision !== nextRevision
+            ) {
+                nextSnapshot = mergeSnapshots(
+                    nextBase,
+                    nextSnapshot,
+                    remote,
+                );
+                nextBase = clone(remote);
+                nextRevision = remoteRevision;
+
+                row.snapshot = clone(nextSnapshot);
+                row.baseSnapshot = clone(nextBase);
+                row.baseRevision = nextRevision;
+                await idbPut(row);
+            }
+
+            const result = await sendSnapshotDirect(
+                nextSnapshot,
+                nextRevision,
+                row.id,
+            );
+
             serverState = result.state;
-            baseSnapshot = clone(result.state.snapshot);
+            baseSnapshot = clone(
+                result.state.snapshot
+            );
+
             await idbDelete(row.id);
         } catch (error) {
-            if (error?.status === 409 && error?.payload?.state) {
+            if (
+                error?.status === 409 &&
+                error?.payload?.state
+            ) {
                 const remote = error.payload.state;
-                const merged = mergeSnapshots(row.baseSnapshot, row.snapshot, remote.snapshot);
+
+                if (
+                    error.payload.error ===
+                    'generation_active'
+                ) {
+                    serverState = remote;
+                    baseSnapshot = clone(
+                        remote.snapshot
+                    );
+                    break;
+                }
+
+                const merged = mergeSnapshots(
+                    row.baseSnapshot,
+                    row.snapshot,
+                    remote.snapshot,
+                );
+
                 serverState = remote;
-                baseSnapshot = clone(remote.snapshot);
-                await applySnapshot(merged, { save: true, render: true });
+                baseSnapshot = clone(
+                    remote.snapshot
+                );
+
                 row.snapshot = clone(merged);
-                row.baseSnapshot = clone(remote.snapshot);
-                row.baseRevision = Number(remote.revision);
+                row.baseSnapshot = clone(
+                    remote.snapshot
+                );
+                row.baseRevision = Number(
+                    remote.revision
+                );
+
+                await applySnapshot(
+                    incomingSnapshot(merged),
+                    {
+                        save: true,
+                        render: true,
+                    },
+                );
+
                 await idbPut(row);
                 continue;
             }
+
             break;
         }
     }
@@ -452,7 +590,9 @@ function broadcastWake(kind) {
 
 async function openScope(epoch) {
     if (!settings.enabled || !settings.autoConnect || !currentScope) return;
+
     const localSnapshot = syncSnapshot(durableSnapshot());
+
     try {
         const result = await api('/join', 'POST', {
             scope: currentScope,
@@ -460,19 +600,29 @@ async function openScope(epoch) {
             deviceId,
             snapshot: localSnapshot,
         });
+
         if (!currentScopeGuard(epoch)) return;
+
+        if (scopeRetryTimer) {
+            clearTimeout(scopeRetryTimer);
+            scopeRetryTimer = null;
+        }
+
         serverState = result.state;
         baseSnapshot = clone(result.state.snapshot);
-        if (!deepEqual(localSnapshot, result.state.snapshot)) {
-            const queued = await idbList(scopeKeyValue);
-            if (queued.length) {
-                await flushQueue();
-            } else {
-                await applySnapshot(result.state.snapshot, { save: true, render: true });
-            }
+
+        const incoming = incomingSnapshot(result.state.snapshot);
+        const queued = await idbList(scopeKeyValue);
+
+        if (queued.length) {
+            await flushQueue();
+        } else if (!deepEqual(localSnapshot, incoming)) {
+            await applySnapshot(incoming, { save: true, render: true });
         }
+
         connectSse(epoch);
         startHeartbeats(epoch);
+
         if (result.state.generation?.message && result.state.generation?.clientId !== clientId) {
             pendingStream = {
                 message: clone(result.state.generation.message),
@@ -481,16 +631,27 @@ async function openScope(epoch) {
             };
             scheduleRemoteRender();
         }
+
         await flushQueue();
         updateGenerationUi();
         statusText(`Connected · rev ${serverState.revision}`);
     } catch (error) {
         warn('join failed', error);
         statusText(`Offline: ${error?.message || 'connection failed'}`);
+
+        if (!currentScopeGuard(epoch) || scopeRetryTimer) return;
+
+        scopeRetryTimer = setTimeout(() => {
+            scopeRetryTimer = null;
+            if (currentScopeGuard(epoch)) {
+                openScope(epoch).catch(retryError => warn('scope retry failed', retryError));
+            }
+        }, 2000);
     }
 }
 
 function disconnectSse() {
+    ++sseEpoch;
     if (eventSource) {
         try { eventSource.close(); } catch { /* ignore */ }
         eventSource = null;
@@ -504,37 +665,98 @@ function stopHeartbeats() {
 }
 function connectSse(epoch) {
     disconnectSse();
+    if (!currentScope || !currentScopeGuard(epoch)) return;
+
+    const localSseEpoch = sseEpoch;
     const query = `?scope=${encodeURIComponent(encodeScope(currentScope))}&clientId=${encodeURIComponent(clientId)}&deviceId=${encodeURIComponent(deviceId)}`;
-    eventSource = new EventSource(`${PLUGIN_BASE}/events${query}`, { withCredentials: true });
-    const handle = (type, fn) => eventSource.addEventListener(type, event => {
-        try { fn(JSON.parse(event.data)); } catch (error) { warn('bad SSE payload', type, error); }
-    });
-    handle('hello', data => { if (currentScopeGuard(epoch)) handleServerHello(data); });
-    handle('replay_complete', data => { if (currentScopeGuard(epoch)) statusText(`Connected · rev ${data.revision}`); });
-    handle('resync_required', () => { if (currentScopeGuard(epoch)) resyncCurrentScope(epoch); });
-    handle('snapshot', data => { if (currentScopeGuard(epoch)) handleSnapshotEvent(data); });
-    handle('generation_claimed', data => { if (currentScopeGuard(epoch)) handleGenerationEvent(data); });
-    handle('generation_started', data => { if (currentScopeGuard(epoch)) handleGenerationEvent(data); });
-    handle('generation_stream', data => { if (currentScopeGuard(epoch)) handleGenerationStreamEvent(data); });
-    handle('generation_stop_requested', data => { if (currentScopeGuard(epoch)) handleRemoteStopEvent(data); });
-    handle('generation_terminal', data => { if (currentScopeGuard(epoch)) handleGenerationTerminalEvent(data); });
-    handle('generation_recovered', () => { if (currentScopeGuard(epoch)) handleGenerationRecovered(); });
-    eventSource.onerror = () => { if (currentScopeGuard(epoch)) statusText('Reconnecting…'); };
+    const source = new EventSource(`${PLUGIN_BASE}/events${query}`, { withCredentials: true });
+    eventSource = source;
+
+    const handle = (type, fn) => {
+        source.addEventListener(type, event => {
+            if (!currentScopeGuard(epoch) || localSseEpoch !== sseEpoch) return;
+            try {
+                fn(JSON.parse(event.data));
+            } catch (error) {
+                warn('bad SSE payload', type, error);
+            }
+        });
+    };
+
+    handle('hello', handleServerHello);
+    handle('replay_complete', data => statusText(`Connected · rev ${data.revision}`));
+    handle('resync_required', () => resyncCurrentScope(epoch));
+    handle('snapshot', handleSnapshotEvent);
+    handle('generation_claimed', handleGenerationEvent);
+    handle('generation_started', handleGenerationEvent);
+    handle('generation_stream', handleGenerationStreamEvent);
+    handle('generation_stop_requested', handleRemoteStopEvent);
+    handle('generation_terminal', handleGenerationTerminalEvent);
+    handle('generation_recovered', handleGenerationRecovered);
+
+    source.onerror = () => {
+        if (!currentScopeGuard(epoch) || localSseEpoch !== sseEpoch) return;
+        statusText('Reconnecting…');
+        // EventSource performs automatic retries. Membership heartbeat recovers
+        // cases where the browser slept long enough to expire membership.
+    };
 }
 function handleServerHello(data) {
     if (data.protocol !== PROTOCOL || data.schema !== SCHEMA) {
         statusText(`Protocol mismatch (${data.protocol}/${data.schema})`);
         return;
     }
-    serverState = { ...(serverState || {}), revision: data.revision, generation: data.generation, scope: data.scope };
+
+    const generation = clone(data.generation || null);
+    const previousGenerationId = serverState?.generation?.generationId || null;
+
+    serverState = {
+        ...(serverState || {}),
+        revision: Number(data.revision),
+        generation,
+        scope: clone(data.scope),
+    };
+
+    if (
+        localGeneration &&
+        previousGenerationId &&
+        (!generation || generation.generationId !== previousGenerationId)
+    ) {
+        try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+        localGeneration = null;
+        stopGenerationHeartbeat();
+    }
+
+    if (generation?.message && generation.clientId !== clientId) {
+        pendingStream = {
+            message: clone(generation.message),
+            messageIndex: Number.isInteger(generation.messageIndex) ? generation.messageIndex : null,
+            generationId: generation.generationId,
+        };
+        scheduleRemoteRender();
+    }
+
     updateGenerationUi();
 }
 function handleSnapshotEvent(data) {
     if (Number(data.revision) <= Number(serverState?.revision || 0)) return;
-    serverState = { ...(serverState || {}), revision: Number(data.revision), snapshot: clone(data.snapshot) };
+
+    serverState = {
+        ...(serverState || {}),
+        revision: Number(data.revision),
+        snapshot: clone(data.snapshot),
+    };
     baseSnapshot = clone(data.snapshot);
-    if (data.sourceClientId === clientId) return;
-    applySnapshot(data.snapshot, { save: true, render: true }).catch(error => warn('remote snapshot apply failed', error));
+
+    if (data.sourceClientId === clientId) {
+        updateGenerationUi();
+        return;
+    }
+
+    const snapshot = incomingSnapshot(data.snapshot);
+    applySnapshot(snapshot, { save: true, render: true })
+        .catch(error => warn('remote snapshot apply failed', error));
+
     broadcastWake('state');
     updateGenerationUi();
 }
@@ -542,55 +764,81 @@ function handleGenerationEvent(data) {
     serverState = { ...(serverState || {}), generation: clone(data.generation) };
     updateGenerationUi();
 }
-function handleGenerationRecovered() {
+async function handleGenerationRecovered() {
     serverState = { ...(serverState || {}), generation: null };
+
     if (localGeneration) {
         try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
         localGeneration = null;
+        stopGenerationHeartbeat();
     }
+
     renderBanner('Generation was lost; chat was unlocked.');
     setTimeout(() => renderBanner(''), 1800);
     updateGenerationUi();
+    await resyncCurrentScope(scopeEpoch);
 }
 function handleGenerationStreamEvent(data) {
-    const g = data.generation;
+    const g = data?.generation;
+    if (!g) return;
+
     serverState = { ...(serverState || {}), generation: clone(g) };
-    if (!g || g.clientId === clientId && g.deviceId === deviceId) return;
+
+    if (
+        (g.clientId === clientId && g.deviceId === deviceId) ||
+        !data.message
+    ) {
+        updateGenerationUi();
+        return;
+    }
+
     pendingStream = {
         message: clone(data.message),
         messageIndex: Number.isInteger(data.messageIndex) ? data.messageIndex : null,
         generationId: g.generationId,
     };
+
     scheduleRemoteRender();
     updateGenerationUi();
 }
 function scheduleRemoteRender() {
     if (remoteRenderTimer) return;
+
     remoteRenderTimer = setTimeout(() => {
         remoteRenderTimer = null;
         const item = pendingStream;
         pendingStream = null;
+
         if (!item || !ctx?.chat) return;
+
         const g = serverState?.generation;
         if (!g || g.generationId !== item.generationId || (g.clientId === clientId && g.deviceId === deviceId)) return;
+
         applyingRemoteDepth += 1;
         try {
             const id = messageId(item.message);
-            let index = ctx.chat.findIndex(m => messageId(m) === id);
-            if (index < 0 && Number.isInteger(item.messageIndex) && item.messageIndex >= 0 && item.messageIndex <= ctx.chat.length) {
-                index = item.messageIndex;
-                if (index === ctx.chat.length) ctx.chat.push(clone(item.message));
-                else ctx.chat[index] = clone(item.message);
-            } else if (index >= 0) {
-                ctx.chat[index] = clone(item.message);
-            } else {
-                ctx.chat.push(clone(item.message));
-                index = ctx.chat.length - 1;
+            if (!id) return;
+
+            const index = ctx.chat.findIndex(message => messageId(message) === id);
+
+            if (index < 0) {
+                if (Number.isInteger(item.messageIndex) && item.messageIndex >= 0 && item.messageIndex <= ctx.chat.length) {
+                    if (item.messageIndex === ctx.chat.length) ctx.chat.push(clone(item.message));
+                    else ctx.chat[item.messageIndex] = clone(item.message);
+                } else {
+                    ctx.chat.push(clone(item.message));
+                }
+
+                try { ctx.printMessages?.(); } catch { /* ignore */ }
+                return;
             }
+
+            ctx.chat[index] = clone(item.message);
+
             try {
-                ctx.updateMessageBlock?.(index, clone(item.message), { rerenderMessage: true });
+                ctx.updateMessageBlock?.(id, clone(item.message), { rerenderMessage: true });
             } catch {
-                ctx.printMessages?.();
+                try { ctx.printMessages?.(); } catch { /* ignore */ }
             }
         } finally {
             applyingRemoteDepth -= 1;
@@ -598,17 +846,42 @@ function scheduleRemoteRender() {
     }, REMOTE_RENDER_MS);
 }
 async function handleGenerationTerminalEvent(data) {
-    serverState = { ...(serverState || {}), revision: Number(data.revision), snapshot: clone(data.snapshot), generation: null };
+    serverState = {
+        ...(serverState || {}),
+        revision: Number(data.revision),
+        snapshot: clone(data.snapshot),
+        generation: null,
+    };
+
     baseSnapshot = clone(data.snapshot);
-    if (data.generation?.clientId === clientId && data.generation?.deviceId === deviceId) {
+
+    const mine =
+        data.generation?.clientId === clientId &&
+        data.generation?.deviceId === deviceId;
+
+    if (mine) {
         localGeneration = null;
         stopGenerationHeartbeat();
         sendLockReason = '';
     } else {
-        await applySnapshot(data.snapshot, { save: true, render: true });
-        renderBanner('Generation finished in another client.');
-        setTimeout(() => renderBanner(''), 1500);
+        await applySnapshot(
+            incomingSnapshot(data.snapshot),
+            {
+                save: true,
+                render: true,
+            },
+        );
+
+        renderBanner(
+            'Generation finished in another client.'
+        );
+
+        setTimeout(
+            () => renderBanner(''),
+            1500,
+        );
     }
+
     pendingStream = null;
     updateGenerationUi();
     await flushQueue();
@@ -636,24 +909,80 @@ function stopGenerationHeartbeat() {
 }
 function startHeartbeats(epoch) {
     stopHeartbeats();
+
     heartbeatTimer = setInterval(async () => {
         if (!currentScopeGuard(epoch) || !serverState) return;
+
         try {
-            const result = await api('/heartbeat', 'POST', { scope: currentScope, clientId, deviceId });
-            if (currentScopeGuard(epoch) && Number(result.revision) !== Number(serverState.revision)) await resyncCurrentScope(epoch);
-        } catch { /* reconnect will recover */ }
+            const oldRevision = Number(serverState.revision || 0);
+            const oldGenerationId = serverState.generation?.generationId || null;
+
+            const result = await api('/heartbeat', 'POST', {
+                scope: currentScope,
+                clientId,
+                deviceId,
+            });
+
+            if (!currentScopeGuard(epoch)) return;
+            if (!Number.isInteger(Number(result.revision))) return;
+
+            const newRevision = Number(result.revision);
+            const newGenerationId = result.generation?.generationId || null;
+
+            serverState = {
+                ...serverState,
+                revision: newRevision,
+                generation: clone(result.generation || null),
+            };
+
+            if (oldRevision !== newRevision || oldGenerationId !== newGenerationId) {
+                await resyncCurrentScope(epoch);
+            }
+
+            updateGenerationUi();
+        } catch (error) {
+            if (error?.status === 403 && currentScopeGuard(epoch)) {
+                await openScope(epoch);
+                return;
+            }
+            log('membership heartbeat failed', error);
+        }
     }, HEARTBEAT_MS);
 }
 function startGenerationHeartbeat(epoch) {
     stopGenerationHeartbeat();
+
     generationHeartbeatTimer = setInterval(async () => {
         if (!currentScopeGuard(epoch) || !localGeneration) return;
+
         try {
-            const result = await api('/generation/heartbeat', 'POST', { scope: currentScope, clientId, deviceId, generationId: localGeneration.generationId });
+            const result = await api('/generation/heartbeat', 'POST', {
+                scope: currentScope,
+                clientId,
+                deviceId,
+                generationId: localGeneration.generationId,
+            });
+
             if (!currentScopeGuard(epoch)) return;
+
             serverState = result.state;
+
+            if (result.stopRequested || result.state?.generation?.stopRequested) {
+                try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+            }
+
+            const current = result.state?.generation;
+            if (!current || current.generationId !== localGeneration.generationId) {
+                try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+                localGeneration = null;
+                stopGenerationHeartbeat();
+                await resyncCurrentScope(epoch);
+                return;
+            }
+
+            updateGenerationUi();
         } catch (error) {
-            warn('generation heartbeat lost', error);
+            warn('generation heartbeat failed', error);
             try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
             localGeneration = null;
             stopGenerationHeartbeat();
@@ -664,15 +993,30 @@ function startGenerationHeartbeat(epoch) {
 
 async function resyncCurrentScope(epoch = scopeEpoch) {
     if (!currentScope || !currentScopeGuard(epoch)) return;
+
     try {
-        const result = await api('/state', 'POST', { scope: currentScope, clientId, deviceId });
+        const result = await api('/state', 'POST', {
+            scope: currentScope,
+            clientId,
+            deviceId,
+        });
+
         if (!currentScopeGuard(epoch)) return;
+
         const local = durableSnapshot();
         serverState = result.state;
         baseSnapshot = clone(result.state.snapshot);
+
         const queued = await idbList(scopeKeyValue);
-        if (queued.length) await flushQueue();
-        else if (!deepEqual(local, result.state.snapshot)) await applySnapshot(result.state.snapshot, { save: true, render: true });
+        if (queued.length) {
+            await flushQueue();
+        } else {
+            const incoming = incomingSnapshot(result.state.snapshot);
+            if (!deepEqual(local, incoming)) {
+                await applySnapshot(incoming, { save: true, render: true });
+            }
+        }
+
         if (result.state.generation?.message && result.state.generation?.clientId !== clientId) {
             pendingStream = {
                 message: clone(result.state.generation.message),
@@ -681,6 +1025,7 @@ async function resyncCurrentScope(epoch = scopeEpoch) {
             };
             scheduleRemoteRender();
         }
+
         updateGenerationUi();
     } catch (error) {
         warn('resync failed', error);
@@ -689,13 +1034,42 @@ async function resyncCurrentScope(epoch = scopeEpoch) {
 
 async function leaveCurrentScope() {
     if (!currentScope) return;
-    try { await api('/leave', 'POST', { scope: currentScope, clientId, deviceId }); } catch { /* ignore */ }
+
+    const leavingScope = clone(currentScope);
+
+    if (localGeneration) {
+        try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+        try { await sendGenerationTerminal('stopped'); } catch (error) { warn('generation cleanup failed while leaving scope', error); }
+    }
+
+    try {
+        await api('/leave', 'POST', {
+            scope: leavingScope,
+            clientId,
+            deviceId,
+        });
+    } catch { /* ignore */ }
+
     disconnectSse();
     stopHeartbeats();
+    stopGenerationHeartbeat();
+
+    if (scopeRetryTimer) {
+        clearTimeout(scopeRetryTimer);
+        scopeRetryTimer = null;
+    }
+
     serverState = null;
     baseSnapshot = null;
     localGeneration = null;
     pendingStream = null;
+
+    if (streamTimer) clearTimeout(streamTimer);
+    streamTimer = null;
+
+    if (remoteRenderTimer) clearTimeout(remoteRenderTimer);
+    remoteRenderTimer = null;
+
     setSendLock('');
     renderBanner('');
 }
@@ -720,18 +1094,26 @@ async function switchScope(reason = 'scope-change') {
 
 async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
     if (!settings.enabled || !settings.coordinateGeneration || applyingRemoteDepth > 0 || !currentScope) return;
+
     const g = serverState?.generation;
     if (g && !localGeneration) {
-        abort(true);
-        if (settings.notifications) statusText('Another client is already generating this shared chat.', true);
+        abort(false);
+        if (settings.notifications) {
+            statusText('Another client is already generating this shared chat.', true);
+        }
+        updateGenerationUi();
         return;
     }
+
     if (localGeneration) return;
 
-    const snapshot = syncSnapshot(durableSnapshot());
-    const base = clone(baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} });
+    await ensureIdsPersisted();
+
+    let desiredSnapshot = syncSnapshot(durableSnapshot());
+    let claimBase = clone(baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} });
     let revision = Number(serverState?.revision || 0);
     let claimResult = null;
+
     for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
             claimResult = await api('/generation/claim', 'POST', {
@@ -742,33 +1124,41 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
                 generationId: newId(),
                 generationType: String(type || 'normal'),
                 baseRevision: revision,
-                snapshot,
+                snapshot: desiredSnapshot,
             });
             break;
         } catch (error) {
             const payload = error?.payload;
+
             if (error?.status === 409 && payload?.state) {
                 if (payload.error === 'generation_active') {
                     serverState = payload.state;
                     baseSnapshot = clone(payload.state.snapshot);
-                    abort(true);
+                    abort(false);
                     updateGenerationUi();
                     return;
                 }
-                const merged = mergeSnapshots(base, snapshot, payload.state.snapshot);
+
+                const merged = mergeSnapshots(claimBase, desiredSnapshot, payload.state.snapshot);
                 serverState = payload.state;
                 baseSnapshot = clone(payload.state.snapshot);
                 await applySnapshot(merged, { save: true, render: true });
+
+                desiredSnapshot = syncSnapshot(durableSnapshot());
+                claimBase = clone(payload.state.snapshot);
                 revision = Number(payload.state.revision);
                 continue;
             }
+
             throw error;
         }
     }
+
     if (!claimResult) {
-        abort(true);
+        abort(false);
         return;
     }
+
     serverState = claimResult.state;
     baseSnapshot = clone(claimResult.state.snapshot);
     localGeneration = clone(claimResult.state.generation);
@@ -843,23 +1233,49 @@ function captureLocalStream() {
 async function sendGenerationTerminal(phase = 'completed') {
     if (!localGeneration || !currentScope) return;
     if (terminalizingGenerationId === localGeneration.generationId) return;
+
     terminalizingGenerationId = localGeneration.generationId;
     const g = clone(localGeneration);
+    let succeeded = false;
+
     try {
         const snapshot = syncSnapshot(durableSnapshot());
-        const result = await api('/generation/terminal', 'POST', {
-            scope: currentScope,
-            clientId,
-            deviceId,
-            generationId: g.generationId,
-            phase,
-            snapshot,
-        });
-        serverState = result.state;
-        baseSnapshot = clone(result.state.snapshot);
-    } catch (error) {
-        warn('generation terminal failed', error);
-        await enqueueSnapshot(syncSnapshot(durableSnapshot()), Number(serverState?.revision || 0), baseSnapshot);
+        let lastError = null;
+
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            try {
+                const result = await api('/generation/terminal', 'POST', {
+                    scope: currentScope,
+                    clientId,
+                    deviceId,
+                    generationId: g.generationId,
+                    phase,
+                    snapshot,
+                });
+
+                serverState = result.state;
+                baseSnapshot = clone(result.state.snapshot);
+                succeeded = true;
+                break;
+            } catch (error) {
+                lastError = error;
+                if (error?.status === 409 && error?.payload?.state) {
+                    serverState = error.payload.state;
+                    baseSnapshot = clone(error.payload.state.snapshot);
+                    break;
+                }
+                if (attempt < 2) await sleep(250 * (attempt + 1));
+            }
+        }
+
+        if (!succeeded && lastError) {
+            warn('generation terminal failed', lastError);
+            await enqueueSnapshot(
+                snapshot,
+                Number(serverState?.revision || 0),
+                baseSnapshot,
+            );
+        }
     } finally {
         localGeneration = null;
         stopGenerationHeartbeat();
@@ -869,6 +1285,8 @@ async function sendGenerationTerminal(phase = 'completed') {
         terminalizingGenerationId = null;
         updateGenerationUi();
     }
+
+    if (!succeeded) await resyncCurrentScope(scopeEpoch);
 }
 async function handleRemoteStopEvent(data) {
     const g = data?.generation;
@@ -894,14 +1312,42 @@ async function onGenerationStopped() { if (localGeneration) await sendGeneration
 
 async function publishAfterLocalEvent() {
     if (applyingRemoteDepth > 0 || !currentScope || !settings.enabled || !settings.syncMessages) return;
-    if (localGeneration && ['started', 'streaming'].includes(localGeneration.phase)) return;
-    try { await publishLocalSnapshot(syncSnapshot(durableSnapshot())); } catch (error) { warn('publish after local event failed', error); }
+    if (localGeneration && ['claimed', 'started', 'streaming'].includes(localGeneration.phase)) return;
+    try {
+        await publishLocalSnapshot(syncSnapshot(durableSnapshot()));
+    } catch (error) {
+        warn('publish after local event failed', error);
+    }
+}
+
+function unwireEvents() {
+    const es = ctx?.eventSource;
+    if (!es) {
+        registeredEventHandlers.length = 0;
+        return;
+    }
+
+    for (const [eventType, handler] of registeredEventHandlers) {
+        try {
+            if (typeof es.removeListener === 'function') es.removeListener(eventType, handler);
+            else if (typeof es.off === 'function') es.off(eventType, handler);
+        } catch { /* ignore */ }
+    }
+
+    registeredEventHandlers.length = 0;
 }
 
 function wireEvents() {
+    unwireEvents();
+
     const types = ctx.eventTypes;
     const es = ctx.eventSource;
-    const listen = (eventType, fn) => { if (eventType) es.on(eventType, fn); };
+    const listen = (eventType, fn) => {
+        if (!eventType || !es?.on) return;
+        es.on(eventType, fn);
+        registeredEventHandlers.push([eventType, fn]);
+    };
+
     listen(types.CHAT_CHANGED, () => switchScope('CHAT_CHANGED'));
     listen(types.CHAT_LOADED, () => switchScope('CHAT_LOADED'));
     listen(types.MESSAGE_SENT, publishAfterLocalEvent);
@@ -910,6 +1356,10 @@ function wireEvents() {
     listen(types.MESSAGE_UPDATED, publishAfterLocalEvent);
     listen(types.MESSAGE_DELETED, publishAfterLocalEvent);
     listen(types.MESSAGE_SWIPED, publishAfterLocalEvent);
+    listen(types.MESSAGE_SWIPE_DELETED, publishAfterLocalEvent);
+    listen(types.MESSAGE_REASONING_EDITED, publishAfterLocalEvent);
+    listen(types.MESSAGE_REASONING_DELETED, publishAfterLocalEvent);
+    listen(types.MORE_MESSAGES_LOADED, publishAfterLocalEvent);
     listen(types.GENERATION_STARTED, onGenerationStarted);
     listen(types.STREAM_TOKEN_RECEIVED, onStreamToken);
     listen(types.STREAM_REASONING_DONE, onReasoningDone);
@@ -922,29 +1372,54 @@ function wireEvents() {
     listen(types.GROUP_WRAPPER_FINISHED, onGenerationEnded);
 }
 
+function unwireUiGuards() {
+    for (const [type, handler, capture] of registeredUiHandlers) {
+        try { document.removeEventListener(type, handler, capture); } catch { /* ignore */ }
+    }
+    registeredUiHandlers.length = 0;
+}
+
 function wireUiGuards() {
-    document.addEventListener('click', async event => {
-        const target = event.target instanceof Element ? event.target.closest('button, .menu_button, [role="button"]') : null;
-        if (!target) return;
-        if (!isRemoteGenerationActive()) return;
+    unwireUiGuards();
+
+    const clickHandler = async event => {
+        const target = event.target instanceof Element
+            ? event.target.closest('button, .menu_button, [role="button"]')
+            : null;
+
+        if (!target || !isRemoteGenerationActive()) return;
+
         if (target.matches('#send_but, #option_regenerate, #regenerate_last_message, #swipe_left, #swipe_right')) {
             event.preventDefault();
             event.stopImmediatePropagation();
+
             if (target.matches('#send_but') && settings.remoteStop && serverState?.generation) {
                 try { await requestRemoteStop(); } catch (error) { warn('remote stop failed', error); }
             }
         }
-    }, true);
-    document.addEventListener('keydown', async event => {
+    };
+
+    const keydownHandler = async event => {
         if (!isRemoteGenerationActive()) return;
         if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+
         const target = event.target;
         if (!(target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement)) return;
         if (!settings.remoteStop) return;
+
         event.preventDefault();
         event.stopImmediatePropagation();
+
         try { await requestRemoteStop(); } catch (error) { warn('remote stop failed', error); }
-    }, true);
+    };
+
+    document.addEventListener('click', clickHandler, true);
+    document.addEventListener('keydown', keydownHandler, true);
+
+    registeredUiHandlers.push(
+        ['click', clickHandler, true],
+        ['keydown', keydownHandler, true],
+    );
 }
 async function requestRemoteStop() {
     const g = serverState?.generation;
@@ -959,14 +1434,22 @@ async function requestRemoteStop() {
 
 async function onActivate() {
     ctx = SillyTavern.getContext();
+
+    unwireEvents();
+    unwireUiGuards();
+
+    bc?.close?.();
     bc = 'BroadcastChannel' in window ? new BroadcastChannel(BC_NAME) : null;
+
     bc?.addEventListener('message', message => {
         if (message.data?.scopeKey !== scopeKeyValue) return;
         if (message.data?.kind === 'state' && currentScope) resyncCurrentScope();
     });
+
     wireEvents();
     wireUiGuards();
     await mountSettings();
+
     globalThis.multiClientSyncGenerateInterceptor = coordinatedGenerateInterceptor;
     await switchScope('activate');
 }
@@ -975,17 +1458,34 @@ async function onEnable() {
     settings.enabled = true;
     settings.autoConnect = true;
     saveSettings();
+
+    ++scopeEpoch;
+    wireEvents();
+    wireUiGuards();
+    globalThis.multiClientSyncGenerateInterceptor = coordinatedGenerateInterceptor;
+
     currentScope = scopeFromContext();
     scopeKeyValue = makeScopeKey(currentScope);
+
     if (currentScope) await openScope(scopeEpoch);
+    updateGenerationUi();
 }
 async function onDisable() {
     settings.enabled = false;
     saveSettings();
+    ++scopeEpoch;
+
+    unwireUiGuards();
+    unwireEvents();
+    delete globalThis.multiClientSyncGenerateInterceptor;
+
     await leaveCurrentScope();
+
     currentScope = null;
     scopeKeyValue = '';
-    ++scopeEpoch;
+
+    try { bc?.close?.(); } catch { /* ignore */ }
+    bc = null;
 }
 
 async function mountSettings() {
@@ -1019,8 +1519,18 @@ async function mountSettings() {
         el.addEventListener('change', async () => {
             settings[key] = !!el.checked;
             saveSettings();
-            if (key === 'enabled' && !settings.enabled) await leaveCurrentScope();
-            if (settings.enabled && settings.autoConnect && key !== 'enabled') await switchScope(`setting:${key}`);
+
+            if (key === 'enabled') {
+                if (settings.enabled) await onEnable();
+                else await onDisable();
+                return;
+            }
+
+            if (settings.enabled && settings.autoConnect) {
+                await switchScope(`setting:${key}`);
+            }
+
+            updateGenerationUi();
         });
     }
     document.getElementById('mcs_reconnect')?.addEventListener('click', () => switchScope('manual-reconnect'));
