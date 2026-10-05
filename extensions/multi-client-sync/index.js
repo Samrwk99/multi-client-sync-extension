@@ -1,5031 +1,4374 @@
 /**
- * Multi-Client Chat Synchronization Extension for SillyTavern
+ * Multi Client Sync - SillyTavern UI extension.
  *
- * Synchronizes chat state, messages, edits, deletions, generation, and streaming
- * across multiple browser tabs/devices connected to the same SillyTavern instance.
+ * Uses:
+ * - SillyTavern.getContext() public extension API
+ * - BroadcastChannel as a same-browser optimization
+ * - Server SSE as the authoritative live transport
+ * - IndexedDB for durable pending local mutations
+ * - Full snapshots + server revisions for deterministic conflict control
+ * - 3-way merge for concurrent message/metadata edits
+ * - Generation ownership/leases/fencing
  *
- * Client-side responsibilities implemented here:
- * - chat/session scoping
- * - ordered server-event application with gap detection/recovery
- * - BroadcastChannel + SSE duplicate suppression
- * - message identity/revision handling
- * - stable insertion anchors for concurrent message inserts
- * - ordered/deduplicated streaming
- * - generation conflict handling using server sequence order
- * - remote generation-stop requests through the existing event relay
- * - safer reconnect/chat-switch invalidation
- * - debounced normal SillyTavern persistence for remote changes
- *
- * Server-side responsibilities that cannot be implemented here:
- * - authorization / access control
- * - assigning authoritative server sequence numbers
- * - authoritative snapshot storage/serving
- * - heartbeat expiry policy
- * - persistent generation ownership leases across all server workers
+ * Important:
+ * - The server is authoritative for revision ordering.
+ * - BroadcastChannel is never authoritative.
+ * - ST itself remains responsible for persistent chat-file saving.
  */
 
-import { eventSource, event_types, getRequestHeaders } from '../../script.js';
-import { getContext } from '../../st-context.js';
-import { extension_settings } from '../extensions.js';
-import { getCurrentUserHandle } from '../../user.js';
-import { t } from '../../i18n.js';
+const MODULE = 'multi_client_sync';
+const PLUGIN_BASE = '/api/plugins/multi-client-sync';
+const PROTOCOL_VERSION = 2;
 
-const EXTENSION_NAME = 'multi-client-sync';
-const LOG_PREFIX = '[MCS]';
-const BROADCAST_CHANNEL_NAME = 'mcs_sync';
-const DEVICE_STORAGE_KEY = 'mcs_device_id';
+const DB_NAME = 'multi-client-sync-v2';
+const DB_VERSION = 1;
 
-const MAX_PROCESSED_EVENT_IDS = 5000;
-const PROCESSED_EVENT_PRUNE_COUNT = 1000;
+const CHANNEL_NAME = 'multi-client-sync-v2';
 
-const HEARTBEAT_INTERVAL_MS = 10000;
-const INITIAL_RECONNECT_DELAY_MS = 1000;
-const MAX_RECONNECT_DELAY_MS = 30000;
-const INITIAL_JOIN_DELAY_MS = 1500;
-const CHAT_SWITCH_JOIN_DELAY_MS = 250;
+const MAX_RECONNECT_MS = 30_000;
+const HEARTBEAT_MS = 10_000;
+const STREAM_FLUSH_MS = 120;
+const FINALIZE_DELAY_MS = 250;
+const SNAPSHOT_DEBOUNCE_MS = 80;
 
-const MESSAGE_SAVE_DEBOUNCE_MS = 350;
-const STREAM_SAVE_DEBOUNCE_MS = 1200;
-const STREAM_RENDER_DEBOUNCE_MS = 40;
-
-// ---------------------------------------------------------------------------
-// Settings
-// ---------------------------------------------------------------------------
-
-const defaultSettings = {
+const DEFAULTS = Object.freeze({
     enabled: true,
-    debugLogging: false,
-    showStatusIndicator: true,
-};
+    debug: false,
+});
 
-function getSettings() {
-    if (!extension_settings[EXTENSION_NAME]) {
-        extension_settings[EXTENSION_NAME] = { ...defaultSettings };
-    } else {
-        extension_settings[EXTENSION_NAME] = {
-            ...defaultSettings,
-            ...extension_settings[EXTENSION_NAME],
-        };
-    }
+let ctx = null;
+let initialized = false;
+let destroyed = false;
 
-    return extension_settings[EXTENSION_NAME];
-}
+let listeners = [];
+
+let broadcastChannel = null;
+let eventSource = null;
+
+let reconnectTimer = null;
+let heartbeatTimer = null;
+let pendingStreamTimer = null;
+let localMutationTimer = null;
+let finalizeTimer = null;
+
+let localSaveChain = Promise.resolve();
+
+let currentScope = null;
+let currentState = null;
+let currentClientId = null;
+let currentDeviceId = null;
+
+let scopeEpoch = 0;
+let reconnectAttempt = 0;
+
+let generationCandidate = null;
+let localStopIssued = false;
+let localGenerationClaimLost = false;
+let lastGenerationStatus = null;
+
+let streamInFlight = false;
+let latestStreamSnapshot = null;
+let latestStreamReason = null;
+
+let uiNode = null;
+
+
+/* -------------------------------------------------------------------------- */
+/* Utility                                                                    */
+/* -------------------------------------------------------------------------- */
 
 function log(...args) {
-    if (getSettings().debugLogging) {
-        console.log(LOG_PREFIX, ...args);
+    if (getSettings().debug) {
+        console.debug('[MultiClientSync]', ...args);
     }
 }
 
 function warn(...args) {
-    console.warn(LOG_PREFIX, ...args);
+    console.warn('[MultiClientSync]', ...args);
 }
 
-function error(...args) {
-    console.error(LOG_PREFIX, ...args);
-}
-
-function safeClone(value) {
+function clone(value) {
     if (value === undefined) return undefined;
 
-    try {
-        if (typeof structuredClone === 'function') {
+    if (typeof structuredClone === 'function') {
+        try {
             return structuredClone(value);
+        } catch {
+            // fallback below
         }
-    } catch (e) {
-        log('structuredClone failed; using JSON clone', e);
     }
 
-    try {
-        return JSON.parse(JSON.stringify(value));
-    } catch (e) {
-        return value;
-    }
+    return JSON.parse(JSON.stringify(value));
 }
 
-function escapeHtml(value) {
-    return String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
-}
-
-// ---------------------------------------------------------------------------
-// Identity
-// ---------------------------------------------------------------------------
-
-const CLIENT_ID =
-    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
-
-const DEVICE_ID = (() => {
+function randomId() {
     try {
-        const stored = localStorage.getItem(DEVICE_STORAGE_KEY);
-
-        if (stored) {
-            return stored;
+        if (globalThis.crypto?.randomUUID) {
+            return globalThis.crypto.randomUUID();
         }
-
-        const id =
-            `${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36).slice(-4)}`;
-
-        localStorage.setItem(DEVICE_STORAGE_KEY, id);
-        return id;
     } catch {
-        return 'unknown';
+        // fallback below
     }
-})();
 
-function getUserId() {
-    try {
-        return getCurrentUserHandle() ?? '';
-    } catch {
-        return '';
-    }
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
-function getClientIdentity() {
-    return {
-        clientId: CLIENT_ID,
-        deviceId: DEVICE_ID,
-        userId: getUserId(),
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Connection / synchronization state
-// ---------------------------------------------------------------------------
-
-/** @type {string|null} */
-let currentChatKey = null;
-
-/** @type {number} */
-let lastSequence = 0;
-
-/** @type {number} */
-let knownServerHeadSequence = 0;
-
-/** @type {EventSource|null} */
-let sseConnection = null;
-
-/** @type {boolean} */
-let isApplyingRemote = false;
-
-/** @type {boolean} */
-let isReconcilingChat = false;
-
-/** @type {boolean} */
-let isConnected = false;
-
-/** @type {Set<string>} */
-const processedEventIds = new Set();
-
-/**
- * @type {Map<number, {event:any, source:string, alreadyApplied:boolean}>}
- */
-const pendingSequenceEvents = new Map();
-
-/** @type {Map<string, number>} */
-const messageRevisions = new Map();
-
-/** @type {Map<string, number>} */
-const messageTombstones = new Map();
-
-/**
- * @type {Map<string, {nextExpected:number, pending:Map<number, any>}>}
- */
-const streamStates = new Map();
-
-/** @type {Map<string, {timer:number, messageKey:string|null}>} */
-const streamRenderTimers = new Map();
-
-let heartbeatTimer = null;
-let reconnectTimer = null;
-let reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
-let reconnectChatKey = null;
-
-let connectionGeneration = 0;
-let chatChangeGeneration = 0;
-
-let recoveryPromise = null;
-let recoveryTargetSequence = 0;
-
-/** @type {object|null} */
-let activeGeneration = null;
-
-/** @type {boolean} */
-let isGenerationOwner = false;
-
-let generationRequestTime = 0;
-
-const generationPublishChains = new Map();
-const pendingGenerationConflicts = new Map();
-
-/** @type {object|null} */
-let pendingRemoteGenerationAfterLocalStop = null;
-
-const finishedGenerationIds = new Set();
-const suppressedGenerationStopPublishes = new Set();
-
-let bcChannel = null;
-
-let chatSaveTimer = null;
-let chatSaveDelay = MESSAGE_SAVE_DEBOUNCE_MS;
-let chatSaveChain = Promise.resolve();
-
-// ---------------------------------------------------------------------------
-// Chat Identity
-// ---------------------------------------------------------------------------
-
-function getChatIdentity() {
-    const ctx = getContext();
-
-    return {
-        characterId: String(ctx.characterId ?? ''),
-        groupId: String(ctx.groupId ?? ''),
-        chatId: String(ctx.chatId ?? ''),
-    };
-}
-
-function buildChatKey(ident) {
-    const scope = ident.groupId
-        ? `g:${ident.groupId}`
-        : `c:${ident.characterId}`;
-
-    return `${scope}::${ident.chatId}`;
-}
-
-function getCurrentDesiredChatKey() {
-    const ident = getChatIdentity();
-
-    return ident.chatId
-        ? buildChatKey(ident)
-        : null;
-}
-
-function isCurrentChatKey(chatKey) {
-    if (!chatKey || chatKey !== currentChatKey) {
-        return false;
+function stableStringify(value) {
+    if (value === null || typeof value !== 'object') {
+        return JSON.stringify(value);
     }
 
-    return getCurrentDesiredChatKey() === chatKey;
+    if (Array.isArray(value)) {
+        return `[${value.map(stableStringify).join(',')}]`;
+    }
+
+    return `{${Object.keys(value).sort().map(
+        key => `${JSON.stringify(key)}:${stableStringify(value[key])}`,
+    ).join(',')}}`;
 }
 
-// ---------------------------------------------------------------------------
-// API Helpers
-// ---------------------------------------------------------------------------
-
-async function apiPost(path, body, options = {}) {
-    const res = await fetch(`/api/multi-client-sync${path}`, {
-        method: 'POST',
-        headers: {
-            ...getRequestHeaders(),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-        ...options,
-    });
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status}: ${text}`);
-    }
-
-    const text = await res.text();
-
-    if (!text) {
-        return {};
-    }
-
-    try {
-        return JSON.parse(text);
-    } catch {
-        return {
-            success: true,
-            raw: text,
-        };
-    }
-}
-
-function getEventSequence(event) {
-    const sequence = Number(event?.sequence);
-
-    return Number.isSafeInteger(sequence) && sequence > 0
-        ? sequence
-        : null;
-}
-
-// ---------------------------------------------------------------------------
-// BroadcastChannel
-// ---------------------------------------------------------------------------
-
-function initBroadcastChannel() {
-    if (typeof BroadcastChannel === 'undefined') {
-        return;
-    }
-
-    try {
-        bcChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-
-        bcChannel.onmessage = (messageEvent) => {
-            try {
-                const msg = messageEvent.data;
-
-                if (!msg || msg.type !== 'EVENT') {
-                    return;
-                }
-
-                if (msg.sourceClientId === CLIENT_ID) {
-                    return;
-                }
-
-                if (!isCurrentChatKey(msg.chatKey)) {
-                    return;
-                }
-
-                if (
-                    msg.userId &&
-                    getUserId() &&
-                    msg.userId !== getUserId()
-                ) {
-                    return;
-                }
-
-                handleRemoteEvent(msg.event, true, msg.chatKey);
-            } catch (e) {
-                warn('BroadcastChannel handler failed', e);
-            }
-        };
-    } catch (e) {
-        warn('BroadcastChannel init failed', e);
-        bcChannel = null;
-    }
-}
-
-function bcBroadcast(event, chatKey = currentChatKey) {
-    if (!bcChannel || !event || !chatKey) {
-        return;
-    }
-
-    try {
-        bcChannel.postMessage({
-            type: 'EVENT',
-            sourceClientId: CLIENT_ID,
-            userId: getUserId(),
-            chatKey,
-            event,
-        });
-    } catch (e) {
-        log('BroadcastChannel send failed', e);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Persistence
-// ---------------------------------------------------------------------------
-
-function scheduleChatSave(delay = MESSAGE_SAVE_DEBOUNCE_MS) {
-    if (!getSettings().enabled || !currentChatKey) {
-        return;
-    }
-
-    chatSaveDelay = Math.min(chatSaveDelay, delay);
-
-    if (chatSaveTimer !== null) {
-        return;
-    }
-
-    const targetChatKey = currentChatKey;
-
-    chatSaveTimer = window.setTimeout(() => {
-        chatSaveTimer = null;
-
-        const requestedDelay = chatSaveDelay;
-        chatSaveDelay = MESSAGE_SAVE_DEBOUNCE_MS;
-
-        void requestedDelay;
-
-        if (!isCurrentChatKey(targetChatKey)) {
-            return;
-        }
-
-        const ctx = getContext();
-
-        if (typeof ctx.saveChat !== 'function') {
-            return;
-        }
-
-        chatSaveChain = chatSaveChain
-            .catch(() => {})
-            .then(async () => {
-                if (!isCurrentChatKey(targetChatKey)) {
-                    return;
-                }
-
-                try {
-                    await ctx.saveChat();
-                    log('chat persisted', targetChatKey);
-                } catch (e) {
-                    warn('chat save failed', e);
-                }
-            });
-    }, delay);
-}
-
-function clearChatSaveTimer() {
-    if (chatSaveTimer !== null) {
-        clearTimeout(chatSaveTimer);
-        chatSaveTimer = null;
-    }
-
-    chatSaveDelay = MESSAGE_SAVE_DEBOUNCE_MS;
-}
-
-// ---------------------------------------------------------------------------
-// Message identity / revisions
-// ---------------------------------------------------------------------------
-
-function getMessageKey(message, fallbackIndex = null) {
-    if (!message) {
+async function sha256(text) {
+    if (!globalThis.crypto?.subtle) {
         return null;
     }
 
-    const explicit =
-        message.mcs_message_id ??
-        message.extra?.mcs_message_id;
+    const data = new TextEncoder().encode(text);
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', data);
 
-    if (
-        explicit !== undefined &&
-        explicit !== null &&
-        explicit !== ''
-    ) {
-        return `id:${String(explicit)}`;
+    return [...new Uint8Array(digest)]
+        .map(x => x.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+function safeGetContext() {
+    try {
+        return SillyTavern.getContext();
+    } catch (error) {
+        warn('SillyTavern.getContext() unavailable', error);
+        return null;
+    }
+}
+
+function getSettings() {
+    const settingsRoot = ctx?.extensionSettings || {};
+
+    if (!settingsRoot[MODULE]) {
+        settingsRoot[MODULE] = structuredClone(DEFAULTS);
     }
 
-    if (
-        message.send_date !== undefined &&
-        message.send_date !== null &&
-        message.send_date !== ''
-    ) {
-        return `date:${String(message.send_date)}`;
+    for (const [key, value] of Object.entries(DEFAULTS)) {
+        if (!(key in settingsRoot[MODULE])) {
+            settingsRoot[MODULE][key] = value;
+        }
     }
 
-    if (fallbackIndex !== null && fallbackIndex !== undefined) {
-        return `idx:${Number(fallbackIndex)}`;
+    return settingsRoot[MODULE];
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Identity                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function loadIdentity() {
+    let deviceId;
+    let clientId;
+
+    try {
+        deviceId = localStorage.getItem(`${MODULE}:deviceId`);
+    } catch {
+        // ignored
+    }
+
+    if (!deviceId) {
+        deviceId = randomId();
+
+        try {
+            localStorage.setItem(`${MODULE}:deviceId`, deviceId);
+        } catch {
+            // ignored
+        }
+    }
+
+    try {
+        clientId = sessionStorage.getItem(`${MODULE}:clientId`);
+    } catch {
+        // ignored
+    }
+
+    if (!clientId) {
+        clientId = randomId();
+
+        try {
+            sessionStorage.setItem(`${MODULE}:clientId`, clientId);
+        } catch {
+            // ignored
+        }
+    }
+
+    currentDeviceId = deviceId;
+    currentClientId = clientId;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Scope                                                                      */
+/* -------------------------------------------------------------------------- */
+
+function getScope() {
+    if (!ctx) return null;
+
+    const groupId = ctx.groupId ?? null;
+    const characterId = ctx.characterId ?? null;
+    const chatId = ctx.chatId ?? ctx.getCurrentChatId?.();
+
+    if (!chatId) {
+        return null;
+    }
+
+    if (groupId !== null && groupId !== undefined && String(groupId) !== '') {
+        return {
+            scopeType: 'group',
+            chatId: String(chatId),
+            characterId: null,
+            groupId: String(groupId),
+        };
+    }
+
+    if (characterId !== null && characterId !== undefined && String(characterId) !== '') {
+        return {
+            scopeType: 'character',
+            chatId: String(chatId),
+            characterId: String(characterId),
+            groupId: null,
+        };
     }
 
     return null;
 }
 
-function findMessageIndexByKey(key) {
-    if (!key) {
-        return -1;
-    }
-
-    const ctx = getContext();
-
-    for (let i = 0; i < ctx.chat.length; i++) {
-        if (getMessageKey(ctx.chat[i], i) === key) {
-            return i;
-        }
-    }
-
-    return -1;
+function scopeKey(scope) {
+    return scope ? JSON.stringify(scope) : 'none';
 }
 
-function findMessageIndex(payload = {}) {
-    const byKey = findMessageIndexByKey(payload.messageKey);
-
-    if (byKey >= 0) {
-        return byKey;
-    }
-
-    if (Number.isInteger(payload.messageId)) {
-        const ctx = getContext();
-
-        if (
-            payload.messageId >= 0 &&
-            payload.messageId < ctx.chat.length
-        ) {
-            return payload.messageId;
-        }
-    }
-
-    return -1;
+function sameScope(a, b) {
+    return Boolean(a && b && scopeKey(a) === scopeKey(b));
 }
 
-function getRevisionKeyForPayload(payload) {
-    return payload?.messageKey ??
-        (
-            Number.isInteger(payload?.messageId)
-                ? `idx:${payload.messageId}`
-                : null
-        );
+
+/* -------------------------------------------------------------------------- */
+/* Message identity / branch safety                                          */
+/* -------------------------------------------------------------------------- */
+
+function messageHasId(message) {
+    return Boolean(message?.extra?.multi_client_sync_id);
 }
 
-function isStaleMessageMutation(payload, sequence) {
-    const key = getRevisionKeyForPayload(payload);
+function ensureMessageIds(messages) {
+    let changed = false;
 
-    if (!key || !sequence) {
+    if (!Array.isArray(messages)) {
         return false;
     }
 
-    const lastRevision =
-        messageRevisions.get(key) ?? 0;
-
-    const tombstoneRevision =
-        messageTombstones.get(key) ?? 0;
-
-    return sequence <= Math.max(
-        lastRevision,
-        tombstoneRevision,
-    );
-}
-
-function recordMessageRevision(payload, sequence) {
-    const key = getRevisionKeyForPayload(payload);
-
-    if (!key || !sequence) {
-        return;
-    }
-
-    messageRevisions.set(
-        key,
-        Math.max(
-            messageRevisions.get(key) ?? 0,
-            sequence,
-        ),
-    );
-}
-
-function recordMessageTombstone(key, sequence) {
-    if (!key || !sequence) {
-        return;
-    }
-
-    messageTombstones.set(
-        key,
-        Math.max(
-            messageTombstones.get(key) ?? 0,
-            sequence,
-        ),
-    );
-
-    messageRevisions.set(
-        key,
-        Math.max(
-            messageRevisions.get(key) ?? 0,
-            sequence,
-        ),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Sequence ordering / recovery
-// ---------------------------------------------------------------------------
-
-function pruneProcessedEventIds() {
-    if (processedEventIds.size <= MAX_PROCESSED_EVENT_IDS) {
-        return;
-    }
-
-    const iterator = processedEventIds.values();
-
-    for (
-        let i = 0;
-        i < PROCESSED_EVENT_PRUNE_COUNT;
-        i++
-    ) {
-        const next = iterator.next();
-
-        if (next.done) {
-            break;
-        }
-
-        processedEventIds.delete(next.value);
-    }
-}
-
-function applyEventNow(
-    event,
-    source,
-    alreadyApplied = false,
-) {
-    const sequence = getEventSequence(event);
-
-    if (!sequence) {
-        return;
-    }
-
-    processedEventIds.add(event.eventId);
-    pruneProcessedEventIds();
-
-    lastSequence = sequence;
-    knownServerHeadSequence =
-        Math.max(knownServerHeadSequence, sequence);
-
-    log(
-        'applying event',
-        event.type,
-        'seq',
-        sequence,
-        'from',
-        event.clientId,
-        'source',
-        source,
-        alreadyApplied ? '(already local)' : '',
-    );
-
-    isApplyingRemote = true;
-
-    try {
-        switch (event.type) {
-            case 'MESSAGE_SENT':
-            case 'MESSAGE_RECEIVED':
-                applyRemoteMessageInserted(event);
-                break;
-
-            case 'MESSAGE_EDITED':
-                applyRemoteMessageEdited(event);
-                break;
-
-            case 'MESSAGE_DELETED':
-                applyRemoteMessageDeleted(event);
-                break;
-
-            case 'MESSAGE_SWIPED':
-                applyRemoteMessageSwiped(event);
-                break;
-
-            case 'CHAT_CHANGED':
-                break;
-
-            case 'GENERATION_STARTED':
-                applyRemoteGenerationStarted(event);
-                break;
-
-            case 'GENERATION_STREAM':
-                applyRemoteGenerationStream(event);
-                break;
-
-            case 'GENERATION_STOP_REQUESTED':
-                applyRemoteGenerationStopRequested(event);
-                break;
-
-            case 'GENERATION_STOPPED':
-                applyRemoteGenerationStopped(event);
-                break;
-
-            case 'GENERATION_COMPLETED':
-                applyRemoteGenerationCompleted(event);
-                break;
-
-            case 'GENERATION_FAILED':
-                applyRemoteGenerationFailed(event);
-                break;
-
-            case 'GENERATION_OWNER_RELEASED':
-                applyRemoteOwnerReleased(event);
-                break;
-
-            case 'CHAT_RELOADED':
-                applyRemoteChatReloaded(event.payload);
-                break;
-
-            default:
-                log('unhandled event type', event.type);
-        }
-    } catch (e) {
-        error(
-            'event application failed',
-            event.type,
-            e,
-        );
-    } finally {
-        isApplyingRemote = false;
-    }
-}
-
-function drainSequenceQueue() {
-    while (
-        pendingSequenceEvents.has(lastSequence + 1)
-    ) {
-        const item =
-            pendingSequenceEvents.get(lastSequence + 1);
-
-        pendingSequenceEvents.delete(
-            lastSequence + 1,
-        );
-
-        if (
-            processedEventIds.has(
-                item.event.eventId,
-            )
-        ) {
-            lastSequence =
-                getEventSequence(item.event);
+    for (const message of messages) {
+        if (!message || typeof message !== 'object') {
             continue;
         }
 
-        applyEventNow(
-            item.event,
-            item.source,
-            item.alreadyApplied,
-        );
-    }
-}
-
-function acceptSequencedEvent(
-    event,
-    source = 'server',
-    alreadyApplied = false,
-    allowRecovery = true,
-) {
-    if (
-        !event ||
-        typeof event !== 'object' ||
-        !event.eventId
-    ) {
-        return;
-    }
-
-    const eventChatKey =
-        event.chatKey || currentChatKey;
-
-    if (!isCurrentChatKey(eventChatKey)) {
-        return;
-    }
-
-    if (
-        event.userId &&
-        getUserId() &&
-        event.userId !== getUserId()
-    ) {
-        return;
-    }
-
-    const sequence =
-        getEventSequence(event);
-
-    if (!sequence) {
-        warn(
-            'Ignoring event without valid server sequence',
-            event,
-        );
-        return;
-    }
-
-    knownServerHeadSequence =
-        Math.max(
-            knownServerHeadSequence,
-            sequence,
-        );
-
-    if (sequence <= lastSequence) {
-        pendingSequenceEvents.delete(sequence);
-        processedEventIds.add(event.eventId);
-        pruneProcessedEventIds();
-        return;
-    }
-
-    const expected = lastSequence + 1;
-
-    if (sequence > expected) {
-        const existing =
-            pendingSequenceEvents.get(sequence);
-
-        if (!existing) {
-            pendingSequenceEvents.set(
-                sequence,
-                {
-                    event,
-                    source,
-                    alreadyApplied,
-                },
-            );
+        if (!message.extra || typeof message.extra !== 'object' || Array.isArray(message.extra)) {
+            message.extra = {};
         }
 
-        warn(
-            'Sequence gap detected',
-            {
-                expected,
-                received: sequence,
-                chatKey: currentChatKey,
-            },
-        );
-
-        if (allowRecovery) {
-            requestSequenceRecovery(sequence)
-                .catch((e) =>
-                    warn(
-                        'sequence recovery failed',
-                        e,
-                    ),
-                );
+        if (!messageHasId(message)) {
+            message.extra.multi_client_sync_id = randomId();
+            changed = true;
         }
-
-        return;
     }
 
-    if (processedEventIds.has(event.eventId)) {
-        return;
-    }
-
-    pendingSequenceEvents.delete(sequence);
-
-    applyEventNow(
-        event,
-        source,
-        alreadyApplied,
-    );
-
-    drainSequenceQueue();
+    return changed;
 }
 
-function handleRemoteEvent(
-    event,
-    fromBroadcastChannel = false,
-    hintedChatKey = null,
-) {
-    if (
-        !event ||
-        typeof event !== 'object' ||
-        !event.eventId
-    ) {
-        return;
-    }
-
-    const eventChatKey =
-        event.chatKey ||
-        hintedChatKey ||
-        currentChatKey;
-
-    if (!isCurrentChatKey(eventChatKey)) {
-        return;
-    }
-
-    acceptSequencedEvent(
-        event,
-        fromBroadcastChannel
-            ? 'broadcast'
-            : 'sse',
-        false,
-        true,
-    );
-}
-
-async function reconcileAuthoritatively(
-    reason,
-    authoritativeSequence = null,
-) {
-    const targetChatKey = currentChatKey;
-
-    if (
-        !targetChatKey ||
-        !isCurrentChatKey(targetChatKey)
-    ) {
-        return false;
-    }
-
-    const ctx = getContext();
-
-    if (
-        typeof ctx.reloadCurrentChat !==
-        'function'
-    ) {
-        warn(
-            'No reloadCurrentChat API available for recovery',
-            reason,
-        );
-        return false;
-    }
-
-    log(
-        'authoritative chat reconciliation',
-        reason,
-        targetChatKey,
-        authoritativeSequence,
-    );
-
-    isReconcilingChat = true;
-    isApplyingRemote = true;
-
+function repairBranchIntegrity() {
+    /**
+     * Current ST branch/checkpoint chat metadata can share lineage fields with
+     * the parent. A separate integrity identity per child prevents the sync
+     * extension from depending on a shared parent identity.
+     *
+     * Only branch/checkpoint chats carrying main_chat are changed.
+     */
     try {
-        await ctx.reloadCurrentChat();
+        const metadata = ctx?.chatMetadata;
 
-        if (!isCurrentChatKey(targetChatKey)) {
+        if (!metadata || typeof metadata !== 'object') {
             return false;
         }
 
-        pendingSequenceEvents.clear();
-
-        if (
-            Number.isSafeInteger(
-                authoritativeSequence,
-            ) &&
-            authoritativeSequence >= 0
-        ) {
-            lastSequence =
-                authoritativeSequence;
-
-            knownServerHeadSequence =
-                Math.max(
-                    knownServerHeadSequence,
-                    authoritativeSequence,
-                );
+        if (!metadata.main_chat) {
+            return false;
         }
 
-        messageRevisions.clear();
-        messageTombstones.clear();
-        processedEventIds.clear();
+        if (metadata.multi_client_sync_branch_integrity_v1) {
+            return false;
+        }
+
+        if (typeof ctx.uuidv4 !== 'function') {
+            return false;
+        }
+
+        metadata.integrity = ctx.uuidv4();
+        metadata.multi_client_sync_branch_integrity_v1 = true;
 
         return true;
-    } catch (e) {
-        warn(
-            'authoritative chat reload failed',
-            e,
-        );
-
+    } catch (error) {
+        warn('Branch integrity repair failed', error);
         return false;
-    } finally {
-        isApplyingRemote = false;
-        isReconcilingChat = false;
     }
 }
 
-async function requestSequenceRecovery(
-    targetSequence = 0,
-) {
-    if (!currentChatKey) {
+
+/* -------------------------------------------------------------------------- */
+/* Snapshot                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function makeSnapshot() {
+    if (!ctx || !currentScope) {
+        return null;
+    }
+
+    const idsChanged = ensureMessageIds(ctx.chat || []);
+    const messages = clone(ctx.chat || []);
+    const metadata = clone(ctx.chatMetadata || {});
+
+    if (metadata?.main_chat && !metadata.multi_client_sync_parent_chat_id) {
+        metadata.multi_client_sync_parent_chat_id = String(metadata.main_chat);
+    }
+
+    return {
+        scopeType: currentScope.scopeType,
+        chatId: currentScope.chatId,
+        characterId: currentScope.characterId,
+        groupId: currentScope.groupId,
+        chat: messages,
+        chatMetadata: metadata,
+        idsChanged,
+    };
+}
+
+function normalizeSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+        return null;
+    }
+
+    if (!Array.isArray(snapshot.chat)) {
+        return null;
+    }
+
+    const out = {
+        scopeType: snapshot.scopeType,
+        chatId: snapshot.chatId,
+        characterId: snapshot.characterId ?? null,
+        groupId: snapshot.groupId ?? null,
+        chat: clone(snapshot.chat),
+        chatMetadata: clone(snapshot.chatMetadata || {}),
+    };
+
+    ensureMessageIds(out.chat);
+
+    return out;
+}
+
+function snapshotForHash(snapshot) {
+    const normalized = normalizeSnapshot(snapshot);
+
+    return stableStringify(normalized);
+}
+
+async function snapshotHash(snapshot) {
+    return sha256(snapshotForHash(snapshot));
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* API                                                                         */
+/* -------------------------------------------------------------------------- */
+
+function getHeaders(extra = {}) {
+    const base = typeof ctx?.getRequestHeaders === 'function'
+        ? ctx.getRequestHeaders()
+        : {};
+
+    return {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...base,
+        ...extra,
+    };
+}
+
+async function api(pathname, options = {}) {
+    const response = await fetch(`${PLUGIN_BASE}${pathname}`, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        ...options,
+        headers: {
+            ...getHeaders(),
+            ...(options.headers || {}),
+        },
+    });
+
+    let body = null;
+
+    try {
+        body = await response.json();
+    } catch {
+        // non-JSON response
+    }
+
+    if (!response.ok) {
+        const error = new Error(
+            body?.message || `HTTP ${response.status}`,
+        );
+
+        error.status = response.status;
+        error.code = body?.code || `http_${response.status}`;
+        error.state = body?.state;
+
+        throw error;
+    }
+
+    return body || { ok: true };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* IndexedDB durable queue                                                     */
+/* -------------------------------------------------------------------------- */
+
+function openDb() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onerror = () => reject(request.error);
+
+        request.onupgradeneeded = () => {
+            const db = request.result;
+
+            if (!db.objectStoreNames.contains('kv')) {
+                db.createObjectStore('kv');
+            }
+        };
+
+        request.onsuccess = () => resolve(request.result);
+    });
+}
+
+async function dbGet(key) {
+    try {
+        const db = await openDb();
+
+        return await new Promise((resolve, reject) => {
+            const tx = db.transaction('kv', 'readonly');
+            const request = tx.objectStore('kv').get(key);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve(request.result);
+
+            tx.oncomplete = () => db.close();
+            tx.onerror = () => db.close();
+        });
+    } catch (error) {
+        log('IndexedDB get failed', error);
+        return null;
+    }
+}
+
+async function dbPut(key, value) {
+    try {
+        const db = await openDb();
+
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction('kv', 'readwrite');
+
+            tx.objectStore('kv').put(value, key);
+
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        });
+
+        db.close();
+    } catch (error) {
+        log('IndexedDB put failed', error);
+    }
+}
+
+async function dbDelete(key) {
+    try {
+        const db = await openDb();
+
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction('kv', 'readwrite');
+
+            tx.objectStore('kv').delete(key);
+
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        });
+
+        db.close();
+    } catch (error) {
+        log('IndexedDB delete failed', error);
+    }
+}
+
+function pendingKey(scope) {
+    return `${MODULE}:pending:${scopeKey(scope)}`;
+}
+
+function metaKey(scope) {
+    return `${MODULE}:meta:${scopeKey(scope)}`;
+}
+
+async function savePending(pending) {
+    if (!pending?.scope) {
         return;
     }
 
-    recoveryTargetSequence =
-        Math.max(
-            recoveryTargetSequence,
-            Number(targetSequence) || 0,
-        );
-
-    if (recoveryPromise) {
-        return recoveryPromise;
-    }
-
-    const targetChatKey = currentChatKey;
-    const targetChatGeneration =
-        connectionGeneration;
-
-    recoveryPromise = (async () => {
-        try {
-            if (!isCurrentChatKey(targetChatKey)) {
-                return;
-            }
-
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
-            }
-
-            if (sseConnection) {
-                try {
-                    sseConnection.close();
-                } catch {
-                    // ignore
-                }
-
-                sseConnection = null;
-            }
-
-            isConnected = false;
-            updateStatusUI();
-
-            await syncJoinCurrentChat({
-                force: true,
-                recovery: true,
-                expectedChatKey:
-                    targetChatKey,
-                expectedGeneration:
-                    targetChatGeneration,
-            });
-        } finally {
-            recoveryTargetSequence = 0;
-            recoveryPromise = null;
-        }
-    })();
-
-    return recoveryPromise;
+    await dbPut(
+        pendingKey(pending.scope),
+        clone(pending),
+    );
 }
 
-// ---------------------------------------------------------------------------
-// Join / SSE / heartbeat
-// ---------------------------------------------------------------------------
+async function loadPending(scope) {
+    return dbGet(pendingKey(scope));
+}
 
-async function processMissedEvents(
-    missedEvents,
-    serverHeadSequence,
-    reason = 'join',
-) {
-    const events = Array.isArray(missedEvents)
-        ? [...missedEvents]
-            .filter(Boolean)
-            .sort(
-                (a, b) =>
-                    (getEventSequence(a) ?? 0) -
-                    (getEventSequence(b) ?? 0),
-            )
-        : [];
+async function deletePending(scope) {
+    await dbDelete(pendingKey(scope));
+}
 
-    if (events.length > 0) {
-        for (const event of events) {
-            acceptSequencedEvent(
-                event,
-                'join-replay',
-                false,
-                false,
-            );
-        }
+async function saveMeta(scope, meta) {
+    await dbPut(
+        metaKey(scope),
+        clone(meta),
+    );
+}
 
-        drainSequenceQueue();
+
+/* -------------------------------------------------------------------------- */
+/* UI                                                                          */
+/* -------------------------------------------------------------------------- */
+
+function setStatus(status, detail = '') {
+    if (!uiNode) {
+        return;
     }
 
-    const head =
-        Number.isSafeInteger(
-            Number(serverHeadSequence),
-        )
-            ? Number(serverHeadSequence)
+    const stateNode = uiNode.querySelector('.mcs-state');
+    const detailNode = uiNode.querySelector('.mcs-detail');
+    const stopButton = uiNode.querySelector('.mcs-stop-remote');
+
+    if (stateNode) {
+        stateNode.textContent = status;
+    }
+
+    if (detailNode) {
+        detailNode.textContent = detail;
+    }
+
+    const active = currentState?.generation;
+    const remote = Boolean(
+        active &&
+        active.ownerClientId !== currentClientId,
+    );
+
+    if (stopButton) {
+        stopButton.hidden = !remote;
+    }
+}
+
+function renderUi() {
+    if (uiNode || !document.body) {
+        return;
+    }
+
+    uiNode = document.createElement('div');
+    uiNode.id = 'mcs-status-panel';
+
+    uiNode.innerHTML = `
+        <div class="mcs-title">Multi-client sync</div>
+        <div class="mcs-state">Starting…</div>
+        <div class="mcs-detail"></div>
+
+        <button type="button" class="mcs-stop-remote" hidden>
+            Request remote stop
+        </button>
+
+        <label class="mcs-toggle">
+            <input type="checkbox" class="mcs-enabled">
+            Enabled
+        </label>
+
+        <label class="mcs-toggle">
+            <input type="checkbox" class="mcs-debug">
+            Debug
+        </label>
+    `;
+
+    Object.assign(uiNode.style, {
+        position: 'fixed',
+        right: '12px',
+        bottom: '12px',
+        zIndex: '99999',
+        background: 'rgba(20,20,20,.94)',
+        color: '#fff',
+        padding: '9px 11px',
+        borderRadius: '8px',
+        fontSize: '12px',
+        lineHeight: '1.35',
+        maxWidth: '280px',
+        boxShadow: '0 3px 18px rgba(0,0,0,.35)',
+    });
+
+    const title = uiNode.querySelector('.mcs-title');
+    if (title) {
+        title.style.fontWeight = '700';
+        title.style.marginBottom = '3px';
+    }
+
+    const detail = uiNode.querySelector('.mcs-detail');
+    if (detail) {
+        detail.style.opacity = '0.75';
+        detail.style.wordBreak = 'break-word';
+    }
+
+    for (const node of uiNode.querySelectorAll('.mcs-toggle')) {
+        node.style.display = 'block';
+    }
+
+    for (const node of uiNode.querySelectorAll('button')) {
+        node.style.marginTop = '5px';
+    }
+
+    document.body.appendChild(uiNode);
+
+    const settings = getSettings();
+
+    const enabledCheckbox = uiNode.querySelector('.mcs-enabled');
+    const debugCheckbox = uiNode.querySelector('.mcs-debug');
+
+    if (enabledCheckbox) {
+        enabledCheckbox.checked = settings.enabled;
+
+        enabledCheckbox.addEventListener('change', async event => {
+            settings.enabled = event.target.checked;
+            ctx?.saveSettingsDebounced?.();
+
+            if (settings.enabled) {
+                await start();
+            } else {
+                await stop();
+            }
+        });
+    }
+
+    if (debugCheckbox) {
+        debugCheckbox.checked = settings.debug;
+
+        debugCheckbox.addEventListener('change', event => {
+            settings.debug = event.target.checked;
+            ctx?.saveSettingsDebounced?.();
+        });
+    }
+
+    uiNode.querySelector('.mcs-stop-remote')?.addEventListener(
+        'click',
+        () => void requestRemoteStop(),
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* BroadcastChannel                                                            */
+/* -------------------------------------------------------------------------- */
+
+function broadcastLocal(message) {
+    try {
+        broadcastChannel?.postMessage({
+            protocolVersion: PROTOCOL_VERSION,
+            sourceClientId: currentClientId,
+            sourceDeviceId: currentDeviceId,
+            ...message,
+        });
+    } catch (error) {
+        log('BroadcastChannel send failed', error);
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* SSE                                                                          */
+/* -------------------------------------------------------------------------- */
+
+function closeSse() {
+    if (!eventSource) {
+        return;
+    }
+
+    try {
+        eventSource.close();
+    } catch {
+        // ignored
+    }
+
+    eventSource = null;
+}
+
+function clearReconnectTimer() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+    }
+
+    reconnectTimer = null;
+}
+
+function clearHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+    }
+
+    heartbeatTimer = null;
+}
+
+function scheduleReconnect(reason = 'reconnect') {
+    if (
+        destroyed ||
+        !getSettings().enabled ||
+        !currentScope ||
+        reconnectTimer
+    ) {
+        return;
+    }
+
+    const delay = Math.min(
+        MAX_RECONNECT_MS,
+        500 * (2 ** Math.min(reconnectAttempt, 6))
+            + Math.floor(Math.random() * 400),
+    );
+
+    reconnectAttempt += 1;
+
+    setStatus(
+        'Reconnecting',
+        `${reason}; ${Math.ceil(delay / 1000)}s`,
+    );
+
+    reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null;
+
+        try {
+            await joinAndConnect(
+                currentScope,
+                { reconnect: true },
+            );
+        } catch (error) {
+            warn('Reconnect failed', error);
+            scheduleReconnect(
+                error.code || 'reconnect_failed',
+            );
+        }
+    }, delay);
+}
+
+function startHeartbeat() {
+    clearHeartbeat();
+
+    heartbeatTimer = setInterval(async () => {
+        if (!currentScope || !currentState) {
+            return;
+        }
+
+        try {
+            const response = await api('/heartbeat', {
+                method: 'POST',
+                body: JSON.stringify({
+                    protocolVersion: PROTOCOL_VERSION,
+                    clientId: currentClientId,
+                    deviceId: currentDeviceId,
+                    scope: currentScope,
+
+                    generationId:
+                        currentState.generation?.ownerClientId === currentClientId
+                            ? currentState.generation.id
+                            : null,
+                }),
+            });
+
+            if (response.state) {
+                applyServerMeta(response.state);
+            }
+        } catch (error) {
+            if (
+                error.code === 'not_member' ||
+                error.code === 'membership_expired' ||
+                error.code === 'device_mismatch'
+            ) {
+                scheduleReconnect(error.code);
+            } else {
+                log('Heartbeat failed', error);
+            }
+        }
+    }, HEARTBEAT_MS);
+}
+
+function applyServerMeta(state) {
+    if (!currentState || !state) {
+        return;
+    }
+
+    currentState.serverRevision =
+        Number(state.revision) || 0;
+
+    currentState.serverSeq =
+        Number(state.seq) || 0;
+
+    currentState.serverEpoch =
+        state.epoch ||
+        currentState.serverEpoch ||
+        null;
+
+    currentState.snapshotHash =
+        state.snapshotHash ||
+        currentState.snapshotHash ||
+        null;
+
+    currentState.generation =
+        state.generation
+            ? clone(state.generation)
             : null;
 
-    if (head !== null) {
-        knownServerHeadSequence =
-            Math.max(
-                knownServerHeadSequence,
-                head,
-            );
+    void saveMeta(
+        currentScope,
+        {
+            serverRevision:
+                currentState.serverRevision,
+
+            serverSeq:
+                currentState.serverSeq,
+
+            serverEpoch:
+                currentState.serverEpoch,
+
+            snapshotHash:
+                currentState.snapshotHash,
+        },
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* ST application / persistence                                                */
+/* -------------------------------------------------------------------------- */
+
+async function applyAuthoritativeSnapshot(
+    snapshot,
+    {
+        persist = true,
+        serverState = null,
+        reason = 'remote',
+    } = {},
+) {
+    if (
+        !snapshot ||
+        !currentScope ||
+        !sameScope(snapshot, currentScope)
+    ) {
+        return false;
+    }
+
+    const normalized =
+        normalizeSnapshot(snapshot);
+
+    if (!normalized) {
+        return false;
+    }
+
+    const currentAtStart = getScope();
+
+    if (!sameScope(currentAtStart, currentScope)) {
+        return false;
+    }
+
+    /*
+     * Direct array mutation avoids creating another sync event.
+     */
+    if (Array.isArray(ctx.chat)) {
+        ctx.chat.splice(
+            0,
+            ctx.chat.length,
+            ...normalized.chat.map(clone),
+        );
     }
 
     if (
-        head !== null &&
-        lastSequence < head
+        ctx.chatMetadata &&
+        typeof ctx.chatMetadata === 'object'
     ) {
-        const recovered =
-            await reconcileAuthoritatively(
-                `${reason}: missed-event gap`,
-                head,
-            );
-
-        if (!recovered) {
-            warn(
-                'Unable to reconcile missing event range',
-                {
-                    lastSequence,
-                    serverHeadSequence: head,
-                },
-            );
-
-            return false;
+        for (
+            const key of Object.keys(ctx.chatMetadata)
+        ) {
+            delete ctx.chatMetadata[key];
         }
-    } else if (
-        head !== null &&
-        lastSequence > head
-    ) {
-        warn(
-            'Server sequence is behind local sequence; forcing authoritative reset',
-            {
-                lastSequence,
-                serverHeadSequence: head,
-            },
+
+        Object.assign(
+            ctx.chatMetadata,
+            clone(normalized.chatMetadata || {}),
         );
+    }
 
-        const recovered =
-            await reconcileAuthoritatively(
-                `${reason}: sequence regression`,
-                head,
+    if (
+        typeof ctx.clearChat === 'function' &&
+        typeof ctx.printMessages === 'function'
+    ) {
+        try {
+            ctx.clearChat();
+            ctx.printMessages();
+        } catch (error) {
+            log(
+                'Render after remote apply failed',
+                error,
             );
-
-        if (!recovered) {
-            return false;
         }
     }
+
+    if (persist) {
+        await persistCurrentChat('remote-apply');
+    }
+
+    if (serverState) {
+        currentState.serverSnapshot =
+            clone(normalized);
+
+        currentState.serverRevision =
+            Number(serverState.revision)
+            || currentState.serverRevision
+            || 0;
+
+        currentState.serverSeq =
+            Number(serverState.seq)
+            || currentState.serverSeq
+            || 0;
+
+        currentState.serverEpoch =
+            serverState.epoch
+            || currentState.serverEpoch
+            || null;
+
+        currentState.snapshotHash =
+            serverState.snapshotHash
+            || await snapshotHash(normalized);
+
+        currentState.generation =
+            serverState.generation
+            ? clone(serverState.generation)
+            : null;
+    } else {
+        currentState.serverSnapshot =
+            clone(normalized);
+
+        currentState.snapshotHash =
+            await snapshotHash(normalized);
+    }
+
+    setStatus(
+        'Synced',
+        `${reason}; rev ${currentState.serverRevision}`,
+    );
 
     return true;
 }
 
-async function joinGroup(
-    ident = getChatIdentity(),
-    token = connectionGeneration,
-    options = {},
-) {
-    if (!ident.chatId) {
-        return false;
+function persistCurrentChat(reason = 'local') {
+    const scopeAtStart =
+        currentScope
+            ? clone(currentScope)
+            : null;
+
+    if (
+        !scopeAtStart ||
+        !ctx?.saveChat
+    ) {
+        return Promise.resolve(false);
     }
 
-    const targetChatKey =
-        buildChatKey(ident);
+    localSaveChain =
+        localSaveChain.then(
+            async () => {
+                if (
+                    !sameScope(
+                        scopeAtStart,
+                        getScope(),
+                    )
+                ) {
+                    return false;
+                }
 
-    const previousChatKey =
-        currentChatKey;
+                try {
+                    /*
+                     * ST exposes this as its public conditional-save path.
+                     * We serialize our calls so sync cannot create overlapping
+                     * local save requests from this extension.
+                     */
+                    await ctx.saveChat();
 
-    try {
-        const identity =
-            getClientIdentity();
+                    log(
+                        'ST save requested',
+                        reason,
+                    );
 
-        const result = await apiPost(
-            '/join',
-            {
-                ...identity,
-                characterId:
-                    ident.characterId,
-                groupId:
-                    ident.groupId,
-                chatId:
-                    ident.chatId,
-                chatKey:
-                    targetChatKey,
-                lastSequence,
+                    return true;
+                } catch (error) {
+                    warn(
+                        `ST save failed (${reason})`,
+                        error,
+                    );
+
+                    return false;
+                }
             },
         );
 
-        if (
-            token !== connectionGeneration ||
-            getCurrentDesiredChatKey() !==
-                targetChatKey
-        ) {
-            try {
-                await apiPost(
-                    '/leave',
-                    {
-                        clientId: CLIENT_ID,
-                        userId: getUserId(),
-                        chatKey:
-                            result.chatKey ||
-                            targetChatKey,
-                    },
+    return localSaveChain;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Three-way merge                                                             */
+/* -------------------------------------------------------------------------- */
+
+function messageValueChanged(a, b) {
+    return stableStringify(a) !== stableStringify(b);
+}
+
+function mapByMessageId(messages) {
+    const map = new Map();
+    const duplicates = new Set();
+
+    for (
+        let index = 0;
+        index < messages.length;
+        index++
+    ) {
+        const id =
+            messages[index]
+                ?.extra
+                ?.multi_client_sync_id;
+
+        if (!id) {
+            continue;
+        }
+
+        if (map.has(id)) {
+            duplicates.add(id);
+        }
+
+        map.set(
+            id,
+            {
+                message: messages[index],
+                index,
+            },
+        );
+    }
+
+    return {
+        map,
+        duplicates,
+    };
+}
+
+function mergeMessages3Way(
+    base,
+    local,
+    remote,
+    conflicts,
+) {
+    const baseMessages =
+        Array.isArray(base?.chat)
+            ? base.chat
+            : [];
+
+    const localMessages =
+        Array.isArray(local?.chat)
+            ? local.chat
+            : [];
+
+    const remoteMessages =
+        Array.isArray(remote?.chat)
+            ? remote.chat
+            : [];
+
+    const baseMapInfo =
+        mapByMessageId(baseMessages);
+
+    const localMapInfo =
+        mapByMessageId(localMessages);
+
+    const remoteMapInfo =
+        mapByMessageId(remoteMessages);
+
+    /*
+     * Legacy or duplicate IDs cannot be merged safely.
+     */
+    if (
+        baseMapInfo.map.size !== baseMessages.length ||
+        localMapInfo.map.size !== localMessages.length ||
+        remoteMapInfo.map.size !== remoteMessages.length
+    ) {
+        const sameAsBase =
+            messageValueChanged(
+                localMessages,
+                baseMessages,
+            ) === false;
+
+        if (sameAsBase) {
+            return remoteMessages.map(clone);
+        }
+
+        const remoteSameAsBase =
+            messageValueChanged(
+                remoteMessages,
+                baseMessages,
+            ) === false;
+
+        if (remoteSameAsBase) {
+            return localMessages.map(clone);
+        }
+
+        conflicts.push({
+            type: 'message_identity',
+            policy: 'remote_wins',
+            reason:
+                'legacy_or_duplicate_message_ids',
+        });
+
+        return remoteMessages.map(clone);
+    }
+
+    const resultById = new Map();
+
+    const allIds = new Set([
+        ...baseMapInfo.map.keys(),
+        ...localMapInfo.map.keys(),
+        ...remoteMapInfo.map.keys(),
+    ]);
+
+    for (const id of allIds) {
+        const b =
+            baseMapInfo.map.get(id)?.message;
+
+        const l =
+            localMapInfo.map.get(id)?.message;
+
+        const r =
+            remoteMapInfo.map.get(id)?.message;
+
+        const lPresent = Boolean(l);
+        const rPresent = Boolean(r);
+        const bPresent = Boolean(b);
+
+        if (!lPresent && !rPresent) {
+            continue;
+        }
+
+        /*
+         * New message.
+         */
+        if (!bPresent) {
+            if (lPresent && rPresent) {
+                if (messageValueChanged(l, r)) {
+                    conflicts.push({
+                        type: 'concurrent_insert',
+                        id,
+                        policy: 'remote_wins',
+                    });
+
+                    resultById.set(
+                        id,
+                        clone(r),
+                    );
+                } else {
+                    resultById.set(
+                        id,
+                        clone(l),
+                    );
+                }
+            } else if (lPresent) {
+                resultById.set(
+                    id,
+                    clone(l),
                 );
-            } catch {
-                // stale join cleanup is best effort
+            } else {
+                resultById.set(
+                    id,
+                    clone(r),
+                );
             }
 
-            return false;
+            continue;
         }
 
-        if (!result?.success) {
-            warn(
-                'join failed',
-                result?.error || result,
-            );
+        const localSameAsBase =
+            lPresent &&
+            bPresent &&
+            !messageValueChanged(l, b);
 
-            return false;
-        }
+        const remoteSameAsBase =
+            rPresent &&
+            bPresent &&
+            !messageValueChanged(r, b);
 
-        currentChatKey =
-            result.chatKey ||
-            targetChatKey;
-
-        if (
-            !isCurrentChatKey(
-                currentChatKey,
-            )
-        ) {
-            try {
-                await apiPost(
-                    '/leave',
-                    {
-                        clientId:
-                            CLIENT_ID,
-                        userId:
-                            getUserId(),
-                        chatKey:
-                            currentChatKey,
-                    },
-                );
-            } catch {
-                // ignore
+        /*
+         * Local deletion.
+         */
+        if (!lPresent) {
+            if (remoteSameAsBase) {
+                continue;
             }
 
-            currentChatKey =
-                previousChatKey;
+            if (
+                !rPresent ||
+                messageValueChanged(r, b)
+            ) {
+                conflicts.push({
+                    type: 'delete_vs_change',
+                    id,
+                    policy: 'remote_wins',
+                });
 
-            return false;
+                if (rPresent) {
+                    resultById.set(
+                        id,
+                        clone(r),
+                    );
+                }
+            }
+
+            continue;
         }
 
-        const serverHeadSequence =
-            Number.isSafeInteger(
-                Number(result.nextSequence),
-            )
-                ? Number(result.nextSequence) -
-                  1
-                : null;
+        /*
+         * Remote deletion.
+         */
+        if (!rPresent) {
+            if (localSameAsBase) {
+                continue;
+            }
 
-        const replayOk =
-            await processMissedEvents(
-                result.missedEvents,
-                serverHeadSequence,
-                options.recovery
-                    ? 'recovery'
-                    : 'join',
+            conflicts.push({
+                type: 'change_vs_delete',
+                id,
+                policy: 'remote_wins',
+            });
+
+            continue;
+        }
+
+        /*
+         * Only remote changed.
+         */
+        if (
+            localSameAsBase &&
+            !remoteSameAsBase
+        ) {
+            resultById.set(
+                id,
+                clone(r),
             );
 
-        if (!replayOk) {
-            return false;
+            continue;
         }
+
+        /*
+         * Only local changed.
+         */
+        if (
+            remoteSameAsBase &&
+            !localSameAsBase
+        ) {
+            resultById.set(
+                id,
+                clone(l),
+            );
+
+            continue;
+        }
+
+        /*
+         * Both changed.
+         */
+        if (
+            !localSameAsBase &&
+            !remoteSameAsBase
+        ) {
+            if (messageValueChanged(l, r)) {
+                conflicts.push({
+                    type: 'concurrent_edit',
+                    id,
+                    policy: 'remote_wins',
+                });
+
+                resultById.set(
+                    id,
+                    clone(r),
+                );
+            } else {
+                resultById.set(
+                    id,
+                    clone(l),
+                );
+            }
+
+            continue;
+        }
+
+        /*
+         * Neither changed.
+         */
+        resultById.set(
+            id,
+            clone(b),
+        );
+    }
+
+    /*
+     * Preserve remote order first.
+     */
+    const output = [];
+    const emitted = new Set();
+
+    for (const message of remoteMessages) {
+        const id =
+            message
+                ?.extra
+                ?.multi_client_sync_id;
 
         if (
-            result.state &&
-            Object.prototype.hasOwnProperty.call(
-                result.state,
-                'generation',
-            )
+            !id ||
+            !resultById.has(id) ||
+            emitted.has(id)
         ) {
-            restoreGenerationState(
-                result.state.generation,
-            );
+            continue;
         }
 
-        if (
-            options.recovery &&
-            recoveryTargetSequence > 0 &&
-            lastSequence <
-                recoveryTargetSequence
-        ) {
-            await reconcileAuthoritatively(
-                'recovery target still not satisfied',
-                serverHeadSequence,
-            );
-        }
-
-        log(
-            'joined group',
-            currentChatKey,
-            'clients:',
-            result.clientCount,
-            'seq:',
-            lastSequence,
+        output.push(
+            clone(resultById.get(id)),
         );
 
+        emitted.add(id);
+    }
+
+    /*
+     * Place local-only inserts beside their local predecessor.
+     */
+    const localIds =
+        localMessages
+            .map(
+                message =>
+                    message
+                        ?.extra
+                        ?.multi_client_sync_id,
+            )
+            .filter(Boolean);
+
+    for (
+        let i = 0;
+        i < localIds.length;
+        i++
+    ) {
+        const id = localIds[i];
+
+        if (
+            emitted.has(id) ||
+            !resultById.has(id) ||
+            remoteMapInfo.map.has(id)
+        ) {
+            continue;
+        }
+
+        let insertAt =
+            output.length;
+
+        for (
+            let j = i - 1;
+            j >= 0;
+            j--
+        ) {
+            const previousId =
+                localIds[j];
+
+            const index =
+                output.findIndex(
+                    message =>
+                        message
+                            ?.extra
+                            ?.multi_client_sync_id
+                        === previousId,
+                );
+
+            if (index >= 0) {
+                insertAt = index + 1;
+                break;
+            }
+        }
+
+        output.splice(
+            insertAt,
+            0,
+            clone(resultById.get(id)),
+        );
+
+        emitted.add(id);
+
+        conflicts.push({
+            type: 'concurrent_insert',
+            id,
+            policy: 'local_position_near_anchor',
+        });
+    }
+
+    return output;
+}
+
+function mergeObject3Way(
+    base,
+    local,
+    remote,
+    conflicts,
+    fieldName,
+) {
+    const out =
+        clone(remote || {});
+
+    const keys = new Set([
+        ...Object.keys(base || {}),
+        ...Object.keys(local || {}),
+        ...Object.keys(remote || {}),
+    ]);
+
+    for (const key of keys) {
+        const b = base?.[key];
+        const l = local?.[key];
+        const r = remote?.[key];
+
+        const localChanged =
+            messageValueChanged(l, b);
+
+        const remoteChanged =
+            messageValueChanged(r, b);
+
+        if (
+            localChanged &&
+            !remoteChanged
+        ) {
+            out[key] = clone(l);
+        } else if (
+            localChanged &&
+            remoteChanged &&
+            messageValueChanged(l, r)
+        ) {
+            conflicts.push({
+                type: 'concurrent_metadata',
+                field: fieldName,
+                key,
+                policy: 'remote_wins',
+            });
+
+            out[key] = clone(r);
+        }
+    }
+
+    return out;
+}
+
+function mergeSnapshots3Way(
+    base,
+    local,
+    remote,
+) {
+    const conflicts = [];
+
+    const merged =
+        clone(remote);
+
+    merged.chat =
+        mergeMessages3Way(
+            base,
+            local,
+            remote,
+            conflicts,
+        );
+
+    merged.chatMetadata =
+        mergeObject3Way(
+            base?.chatMetadata || {},
+            local?.chatMetadata || {},
+            remote?.chatMetadata || {},
+            conflicts,
+            'chatMetadata',
+        );
+
+    merged.scopeType =
+        remote.scopeType;
+
+    merged.chatId =
+        remote.chatId;
+
+    merged.characterId =
+        remote.characterId;
+
+    merged.groupId =
+        remote.groupId;
+
+    return {
+        snapshot: merged,
+        conflicts,
+    };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Pending mutation pipeline                                                   */
+/* -------------------------------------------------------------------------- */
+
+async function sendPending(
+    pending,
+    depth = 0,
+) {
+    if (
+        !pending ||
+        !currentScope ||
+        !sameScope(
+            pending.scope,
+            currentScope,
+        )
+    ) {
+        return false;
+    }
+
+    if (depth > 5) {
+        setStatus(
+            'Pending',
+            'rebase limit reached; retrying on next sync',
+        );
+
+        return false;
+    }
+
+    try {
+        const result =
+            await api('/event', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        pending.scope,
+
+                    opId:
+                        pending.opId,
+
+                    type:
+                        pending.type,
+
+                    baseRevision:
+                        pending.baseRevision,
+
+                    payload:
+                        pending.payload || {},
+
+                    snapshot:
+                        pending.snapshot,
+                }),
+            });
+
+        if (result.state) {
+            applyServerMeta(
+                result.state,
+            );
+        }
+
+        if (result.state?.snapshot) {
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    result.state.snapshot,
+                );
+        }
+
+        await deletePending(
+            pending.scope,
+        );
+
+        currentState.pending = null;
+
+        setStatus(
+            'Synced',
+            `accepted ${pending.type}; rev ${currentState.serverRevision}`,
+        );
+
+        broadcastLocal({
+            kind: 'accepted',
+            scope: pending.scope,
+            event: result.event,
+            state: result.state,
+        });
+
         return true;
-    } catch (e) {
-        warn('join error', e);
+    } catch (error) {
+        /*
+         * Optimistic concurrency conflict.
+         */
+        if (
+            error.code === 'stale_revision' &&
+            error.state?.snapshot
+        ) {
+            const remote =
+                normalizeSnapshot(
+                    error.state.snapshot,
+                );
+
+            const base =
+                normalizeSnapshot(
+                    pending.baseSnapshot ||
+                    currentState.serverSnapshot ||
+                    remote,
+                );
+
+            const local =
+                normalizeSnapshot(
+                    pending.snapshot,
+                );
+
+            const merged =
+                mergeSnapshots3Way(
+                    base,
+                    local,
+                    remote,
+                );
+
+            currentState.serverSnapshot =
+                remote;
+
+            currentState.serverRevision =
+                Number(error.state.revision)
+                || 0;
+
+            currentState.serverSeq =
+                Number(error.state.seq)
+                || currentState.serverSeq
+                || 0;
+
+            currentState.serverEpoch =
+                error.state.epoch
+                || currentState.serverEpoch;
+
+            currentState.generation =
+                error.state.generation
+                || null;
+
+            currentState.pending = {
+                ...pending,
+
+                baseSnapshot:
+                    remote,
+
+                baseRevision:
+                    currentState.serverRevision,
+
+                snapshot:
+                    merged.snapshot,
+
+                opId:
+                    randomId(),
+
+                conflicts:
+                    [
+                        ...(pending.conflicts || []),
+                        ...merged.conflicts,
+                    ],
+            };
+
+            await savePending(
+                currentState.pending,
+            );
+
+            /*
+             * Show the server state first.
+             */
+            await applyAuthoritativeSnapshot(
+                remote,
+                {
+                    persist: true,
+                    serverState: error.state,
+                    reason: 'conflict-resync',
+                },
+            );
+
+            /*
+             * Then apply the deterministic three-way merge locally.
+             * Server revision remains the remote revision until the merged
+             * snapshot is accepted.
+             */
+            await applyAuthoritativeSnapshot(
+                merged.snapshot,
+                {
+                    persist: true,
+                    reason: 'apply-three-way-merge',
+                },
+            );
+
+            currentState.serverSnapshot =
+                remote;
+
+            currentState.serverRevision =
+                Number(error.state.revision)
+                || 0;
+
+            currentState.serverSeq =
+                Number(error.state.seq)
+                || 0;
+
+            currentState.serverEpoch =
+                error.state.epoch
+                || currentState.serverEpoch;
+
+            currentState.generation =
+                error.state.generation
+                || null;
+
+            if (merged.conflicts.length) {
+                setStatus(
+                    'Conflict resolved',
+                    `${merged.conflicts.length} conflict(s); server-biased`,
+                );
+            }
+
+            return sendPending(
+                currentState.pending,
+                depth + 1,
+            );
+        }
+
+        if (
+            error.code === 'generation_lock'
+        ) {
+            setStatus(
+                'Generation active',
+                'Remote generation owns this chat',
+            );
+        } else if (
+            error.code === 'not_member' ||
+            error.code === 'membership_expired'
+        ) {
+            scheduleReconnect(
+                error.code,
+            );
+        } else {
+            setStatus(
+                'Pending',
+                error.message ||
+                error.code ||
+                'event retry',
+            );
+        }
+
         return false;
     }
 }
 
-function connectSSE(
-    expectedChatKey = currentChatKey,
-    expectedGeneration =
-        connectionGeneration,
+async function enqueueSnapshotMutation(
+    type,
+    payload = {},
+    {
+        persist = true,
+    } = {},
 ) {
-    if (!expectedChatKey) {
+    if (
+        !getSettings().enabled ||
+        !currentScope ||
+        !currentState
+    ) {
         return;
     }
 
-    if (sseConnection) {
-        try {
-            sseConnection.close();
-        } catch {
-            // ignore
-        }
-
-        sseConnection = null;
+    if (currentState.suppressLocalEvents) {
+        return;
     }
 
-    const url =
-        `/api/multi-client-sync/events?clientId=${encodeURIComponent(
-            CLIENT_ID,
-        )}&chatKey=${encodeURIComponent(
-            expectedChatKey,
-        )}`;
-
-    const es =
-        new EventSource(url);
-
-    es.onopen = () => {
-        if (
-            expectedGeneration !==
-                connectionGeneration ||
-            !isCurrentChatKey(
-                expectedChatKey,
-            )
-        ) {
-            try {
-                es.close();
-            } catch {
-                // ignore
-            }
-
-            return;
-        }
-
-        isConnected = true;
-        reconnectDelay =
-            INITIAL_RECONNECT_DELAY_MS;
-        reconnectChatKey =
-            expectedChatKey;
-
-        updateStatusUI();
-
-        log('SSE connected');
-    };
-
-    es.onmessage = (event) => {
-        if (
-            expectedGeneration !==
-                connectionGeneration ||
-            !isCurrentChatKey(
-                expectedChatKey,
-            )
-        ) {
-            try {
-                es.close();
-            } catch {
-                // ignore
-            }
-
-            return;
-        }
-
-        try {
-            const data =
-                JSON.parse(event.data);
-
-            if (
-                data.type ===
-                'CONNECTED'
-            ) {
-                const sequence =
-                    Number(data.sequence);
-
-                if (
-                    Number.isSafeInteger(
-                        sequence,
-                    ) &&
-                    sequence >= 0
-                ) {
-                    knownServerHeadSequence =
-                        Math.max(
-                            knownServerHeadSequence,
-                            sequence,
-                        );
-
-                    if (
-                        sequence >
-                        lastSequence
-                    ) {
-                        requestSequenceRecovery(
-                            sequence,
-                        ).catch((e) =>
-                            warn(
-                                'CONNECTED recovery failed',
-                                e,
-                            ),
-                        );
-                    }
-                }
-
-                return;
-            }
-
-            if (
-                data.chatKey &&
-                data.chatKey !==
-                    expectedChatKey
-            ) {
-                return;
-            }
-
-            handleRemoteEvent(
-                data,
-                false,
-                expectedChatKey,
-            );
-        } catch (e) {
-            warn(
-                'SSE parse error',
-                e,
-            );
-        }
-    };
-
-    es.onerror = () => {
-        if (
-            expectedGeneration !==
-                connectionGeneration ||
-            !isCurrentChatKey(
-                expectedChatKey,
-            )
-        ) {
-            try {
-                es.close();
-            } catch {
-                // ignore
-            }
-
-            return;
-        }
-
-        isConnected = false;
-        updateStatusUI();
-
-        try {
-            es.close();
-        } catch {
-            // ignore
-        }
-
-        if (sseConnection === es) {
-            sseConnection = null;
-        }
-
-        scheduleReconnect(
-            expectedChatKey,
-            expectedGeneration,
+    /*
+     * While another generation is active, non-owner clients do not send chat
+     * mutations. Owner stream data is sent through generation_stream instead.
+     */
+    if (
+        currentState.generation &&
+        currentState.generation.ownerClientId !==
+            currentClientId
+    ) {
+        setStatus(
+            'Generation active',
+            'Remote owner has the mutation lock',
         );
-    };
 
-    sseConnection = es;
+        return;
+    }
+
+    /*
+     * Owner-side generation mutations are treated as stream state.
+     */
+    if (
+        currentState.generation &&
+        currentState.generation.ownerClientId ===
+            currentClientId &&
+        !localGenerationClaimLost
+    ) {
+        await queueStreamSnapshot(type);
+        return;
+    }
+
+    if (persist) {
+        await persistCurrentChat(type);
+    }
+
+    const snapshot =
+        makeSnapshot();
+
+    if (!snapshot) {
+        return;
+    }
+
+    if (
+        snapshot.idsChanged &&
+        persist
+    ) {
+        await persistCurrentChat(
+            'stable-message-ids',
+        );
+    }
+
+    delete snapshot.idsChanged;
+
+    const existing =
+        currentState.pending;
+
+    const pending = existing
+        ? {
+            ...existing,
+            snapshot,
+            type,
+            payload,
+            opId: randomId(),
+        }
+        : {
+            scope:
+                clone(currentScope),
+
+            opId:
+                randomId(),
+
+            type,
+
+            payload,
+
+            baseRevision:
+                currentState.serverRevision,
+
+            baseSnapshot:
+                clone(
+                    currentState.serverSnapshot
+                    || snapshot,
+                ),
+
+            snapshot,
+
+            conflicts: [],
+        };
+
+    currentState.pending =
+        pending;
+
+    await savePending(
+        pending,
+    );
+
+    broadcastLocal({
+        kind: 'local_pending',
+        scope: currentScope,
+        type,
+    });
+
+    await sendPending(
+        pending,
+    );
 }
 
-function scheduleReconnect(
-    expectedChatKey = currentChatKey,
-    expectedGeneration =
-        connectionGeneration,
+function enqueueSnapshotMutationSoon(
+    type,
+    payload = {},
+) {
+    if (localMutationTimer) {
+        clearTimeout(
+            localMutationTimer,
+        );
+    }
+
+    localMutationTimer =
+        setTimeout(
+            () => {
+                localMutationTimer = null;
+
+                void enqueueSnapshotMutation(
+                    type,
+                    payload,
+                );
+            },
+            SNAPSHOT_DEBOUNCE_MS,
+        );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Generation ownership / streaming                                           */
+/* -------------------------------------------------------------------------- */
+
+async function claimGeneration() {
+    if (
+        !currentScope ||
+        !currentState
+    ) {
+        return false;
+    }
+
+    const generationId =
+        randomId();
+
+    generationCandidate =
+        generationId;
+
+    localStopIssued =
+        false;
+
+    localGenerationClaimLost =
+        false;
+
+    try {
+        const result =
+            await api('/event', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        currentScope,
+
+                    opId:
+                        randomId(),
+
+                    type:
+                        'generation_claim',
+
+                    baseRevision:
+                        currentState.serverRevision,
+
+                    generationId,
+
+                    payload: {},
+                }),
+            });
+
+        if (result.state) {
+            applyServerMeta(
+                result.state,
+            );
+        }
+
+        if (
+            result.state?.generation?.id !==
+            generationId
+        ) {
+            localGenerationClaimLost =
+                true;
+
+            try {
+                ctx?.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+
+            return false;
+        }
+
+        currentState.generation =
+            clone(
+                result.state.generation,
+            );
+
+        currentState.serverSnapshot =
+            normalizeSnapshot(
+                result.state.snapshot ||
+                currentState.serverSnapshot,
+            );
+
+        setStatus(
+            'Generating',
+            'This client owns generation',
+        );
+
+        broadcastLocal({
+            kind: 'generation_owner',
+            scope: currentScope,
+            state: result.state,
+        });
+
+        return true;
+    } catch (error) {
+        localGenerationClaimLost =
+            true;
+
+        if (
+            error.code === 'generation_owned' ||
+            error.code === 'generation_not_owner'
+        ) {
+            try {
+                ctx?.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+
+            setStatus(
+                'Generation busy',
+                'Stopped local generation; another client owns it',
+            );
+        } else if (
+            error.code === 'stale_revision' &&
+            error.state
+        ) {
+            applyServerMeta(
+                error.state,
+            );
+
+            if (
+                error.state.snapshot
+            ) {
+                await applyAuthoritativeSnapshot(
+                    error.state.snapshot,
+                    {
+                        serverState:
+                            error.state,
+
+                        reason:
+                            'claim-resync',
+                    },
+                );
+            }
+
+            try {
+                ctx?.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+        } else {
+            warn(
+                'Generation claim failed',
+                error,
+            );
+
+            try {
+                ctx?.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+        }
+
+        return false;
+    }
+}
+
+async function queueStreamSnapshot(
+    reason = 'token',
 ) {
     if (
-        !expectedChatKey ||
-        reconnectTimer ||
+        !currentScope ||
+        !currentState?.generation ||
+        currentState.generation.ownerClientId !==
+            currentClientId ||
+        localGenerationClaimLost
+    ) {
+        return;
+    }
+
+    latestStreamSnapshot =
+        makeSnapshot();
+
+    if (!latestStreamSnapshot) {
+        return;
+    }
+
+    delete latestStreamSnapshot.idsChanged;
+
+    latestStreamReason =
+        reason;
+
+    if (pendingStreamTimer) {
+        return;
+    }
+
+    pendingStreamTimer =
+        setTimeout(
+            () => {
+                pendingStreamTimer = null;
+                void flushStreamSnapshot();
+            },
+            STREAM_FLUSH_MS,
+        );
+}
+
+async function flushStreamSnapshot() {
+    if (
+        streamInFlight ||
+        !latestStreamSnapshot ||
+        !currentState?.generation
+    ) {
+        return;
+    }
+
+    const snapshot =
+        latestStreamSnapshot;
+
+    const reason =
+        latestStreamReason;
+
+    latestStreamSnapshot =
+        null;
+
+    latestStreamReason =
+        null;
+
+    streamInFlight =
+        true;
+
+    const generation =
+        currentState.generation;
+
+    const streamSeq =
+        Number(
+            generation.streamSeq || 0,
+        ) + 1;
+
+    try {
+        const result =
+            await api('/event', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        currentScope,
+
+                    opId:
+                        randomId(),
+
+                    type:
+                        'generation_stream',
+
+                    baseRevision:
+                        currentState.serverRevision,
+
+                    generationId:
+                        generation.id,
+
+                    streamSeq,
+
+                    payload: {
+                        reason,
+                    },
+
+                    snapshot,
+                }),
+            });
+
+        if (result.state) {
+            applyServerMeta(
+                result.state,
+            );
+
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    result.state.snapshot ||
+                    snapshot,
+                );
+
+            if (
+                result.state.generation
+            ) {
+                currentState.generation =
+                    clone(
+                        result.state.generation,
+                    );
+            }
+        }
+
+        broadcastLocal({
+            kind: 'stream',
+            scope: currentScope,
+            state: result.state,
+            event: result.event,
+        });
+    } catch (error) {
+        if (
+            error.code === 'generation_stale' ||
+            error.code === 'generation_not_owner' ||
+            error.code === 'generation_expired'
+        ) {
+            localGenerationClaimLost =
+                true;
+
+            try {
+                ctx?.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+
+            setStatus(
+                'Generation ended',
+                'Ownership lost; local generation stopped',
+            );
+        } else if (
+            error.code === 'stale_revision' &&
+            error.state?.snapshot
+        ) {
+            currentState.serverRevision =
+                Number(
+                    error.state.revision,
+                ) || 0;
+
+            currentState.serverSeq =
+                Number(
+                    error.state.seq,
+                ) || 0;
+
+            currentState.serverEpoch =
+                error.state.epoch ||
+                currentState.serverEpoch;
+
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    error.state.snapshot,
+                );
+
+            currentState.generation =
+                error.state.generation ||
+                null;
+
+            setStatus(
+                'Generating',
+                'Stream revision changed; state will resync',
+            );
+        } else {
+            log(
+                'Stream update failed',
+                error,
+            );
+        }
+    } finally {
+        streamInFlight =
+            false;
+
+        if (latestStreamSnapshot) {
+            void flushStreamSnapshot();
+        }
+    }
+}
+
+async function waitForStreamIdle() {
+    if (latestStreamSnapshot) {
+        await flushStreamSnapshot();
+    }
+
+    while (streamInFlight) {
+        await new Promise(
+            resolve => setTimeout(
+                resolve,
+                20,
+            ),
+        );
+    }
+
+    if (latestStreamSnapshot) {
+        await flushStreamSnapshot();
+    }
+}
+
+async function finishGeneration(
+    status,
+) {
+    if (
+        !currentScope ||
+        !currentState?.generation ||
+        currentState.generation.ownerClientId !==
+            currentClientId ||
+        localGenerationClaimLost
+    ) {
+        return;
+    }
+
+    await waitForStreamIdle();
+
+    /*
+     * Final persistence request before terminal state.
+     */
+    await persistCurrentChat(
+        'generation-terminal',
+    );
+
+    const generation =
+        currentState.generation;
+
+    const snapshot =
+        makeSnapshot();
+
+    if (!snapshot) {
+        return;
+    }
+
+    delete snapshot.idsChanged;
+
+    try {
+        const result =
+            await api('/event', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        currentScope,
+
+                    opId:
+                        randomId(),
+
+                    type:
+                        'generation_terminal',
+
+                    baseRevision:
+                        currentState.serverRevision,
+
+                    generationId:
+                        generation.id,
+
+                    status,
+
+                    payload: {},
+
+                    snapshot,
+                }),
+            });
+
+        if (result.state) {
+            applyServerMeta(
+                result.state,
+            );
+
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    result.state.snapshot ||
+                    snapshot,
+                );
+
+            currentState.generation =
+                result.state.generation ||
+                null;
+        }
+
+        lastGenerationStatus =
+            status;
+
+        broadcastLocal({
+            kind: 'generation_terminal',
+            scope: currentScope,
+            status,
+            state: result.state,
+        });
+
+        setStatus(
+            'Synced',
+            `${status}; rev ${currentState.serverRevision}`,
+        );
+    } catch (error) {
+        if (
+            error.code === 'stale_revision' &&
+            error.state?.snapshot
+        ) {
+            currentState.serverRevision =
+                Number(
+                    error.state.revision,
+                ) || 0;
+
+            currentState.serverSeq =
+                Number(
+                    error.state.seq,
+                ) || 0;
+
+            currentState.serverEpoch =
+                error.state.epoch ||
+                currentState.serverEpoch;
+
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    error.state.snapshot,
+                );
+
+            currentState.generation =
+                error.state.generation ||
+                null;
+
+            if (
+                currentState.generation?.ownerClientId ===
+                currentClientId
+            ) {
+                setTimeout(
+                    () => void finishGeneration(status),
+                    0,
+                );
+            }
+        } else {
+            warn(
+                'Generation terminal update failed',
+                error,
+            );
+        }
+    } finally {
+        generationCandidate =
+            null;
+
+        localStopIssued =
+            false;
+    }
+}
+
+async function requestRemoteStop(
+    retry = false,
+) {
+    if (
+        !currentState?.generation ||
+        !currentScope
+    ) {
+        return false;
+    }
+
+    const generationId =
+        currentState.generation.id;
+
+    try {
+        const result =
+            await api('/event', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        currentScope,
+
+                    opId:
+                        randomId(),
+
+                    type:
+                        'generation_stop_request',
+
+                    baseRevision:
+                        currentState.serverRevision,
+
+                    generationId,
+
+                    payload: {},
+                }),
+            });
+
+        if (result.state) {
+            applyServerMeta(
+                result.state,
+            );
+        }
+
+        setStatus(
+            'Stop requested',
+            `generation ${generationId.slice(0, 8)}`,
+        );
+
+        return true;
+    } catch (error) {
+        if (
+            error.code === 'stale_revision' &&
+            error.state
+        ) {
+            applyServerMeta(
+                error.state,
+            );
+
+            if (
+                error.state.snapshot
+            ) {
+                await applyAuthoritativeSnapshot(
+                    error.state.snapshot,
+                    {
+                        serverState:
+                            error.state,
+
+                        persist:
+                            false,
+
+                        reason:
+                            'stop-request-resync',
+                    },
+                );
+            }
+
+            if (
+                currentState?.generation?.id ===
+                    generationId &&
+                !retry
+            ) {
+                return requestRemoteStop(
+                    true,
+                );
+            }
+        }
+
+        warn(
+            'Remote stop request failed',
+            error,
+        );
+
+        return false;
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* SSE event handling                                                          */
+/* -------------------------------------------------------------------------- */
+
+async function handleSseEvent(data) {
+    if (!data) {
+        return;
+    }
+
+    if (
+        data.protocolVersion &&
+        data.protocolVersion !==
+            PROTOCOL_VERSION
+    ) {
+        setStatus(
+            'Protocol mismatch',
+            `server=${data.protocolVersion}, client=${PROTOCOL_VERSION}`,
+        );
+
+        closeSse();
+        return;
+    }
+
+    if (
+        data.type === 'shutdown'
+    ) {
+        closeSse();
+        scheduleReconnect(
+            'server shutdown',
+        );
+        return;
+    }
+
+    if (
+        data.type ===
+            'generation_stop_requested'
+    ) {
+        applyServerMeta(
+            data.state || {},
+        );
+
+        if (
+            currentState?.generation?.ownerClientId ===
+                currentClientId &&
+            currentState.generation.id ===
+                data.generation?.id
+        ) {
+            try {
+                ctx?.stopGeneration?.();
+            } catch (error) {
+                warn(
+                    'Failed to execute remote stop',
+                    error,
+                );
+            }
+        }
+
+        setStatus(
+            'Stop requested',
+            'owner is stopping generation',
+        );
+
+        return;
+    }
+
+    if (
+        data.type ===
+            'generation_claimed'
+    ) {
+        applyServerMeta(
+            data.state || {},
+        );
+
+        if (
+            data.generation?.ownerClientId !==
+                currentClientId
+        ) {
+            if (
+                generationCandidate &&
+                !localGenerationClaimLost
+            ) {
+                localGenerationClaimLost =
+                    true;
+
+                try {
+                    ctx?.stopGeneration?.();
+                } catch {
+                    // ignored
+                }
+            }
+
+            setStatus(
+                'Remote generation',
+                'another client is generating',
+            );
+        }
+
+        return;
+    }
+
+    if (
+        data.type ===
+            'generation_abandoned'
+    ) {
+        applyServerMeta(
+            data.state || {},
+        );
+
+        currentState.generation =
+            null;
+
+        if (
+            generationCandidate &&
+            !localGenerationClaimLost
+        ) {
+            localGenerationClaimLost =
+                true;
+
+            try {
+                ctx?.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+        }
+
+        setStatus(
+            'Generation released',
+            'owner lost/lease expired',
+        );
+
+        return;
+    }
+
+    if (
+        data.type ===
+            'generation_terminal'
+    ) {
+        applyServerMeta(
+            data.state || {},
+        );
+
+        if (data.snapshot) {
+            await applyAuthoritativeSnapshot(
+                data.snapshot,
+                {
+                    serverState:
+                        data.state,
+
+                    persist:
+                        true,
+
+                    reason:
+                        `remote ${
+                            data.payload?.status
+                            || 'generation terminal'
+                        }`,
+                },
+            );
+        }
+
+        currentState.generation =
+            null;
+
+        return;
+    }
+
+    if (data.state) {
+        applyServerMeta(
+            data.state,
+        );
+    }
+
+    const incomingSnapshot =
+        data.snapshot ||
+        data.event?.snapshot;
+
+    if (!incomingSnapshot) {
+        const incomingType =
+            data.type ||
+            data.event?.type ||
+            'remote update';
+
+        if (
+            incomingType ===
+                'generation_stream'
+        ) {
+            try {
+                const state =
+                    await api(
+                        `/state?clientId=${
+                            encodeURIComponent(
+                                currentClientId,
+                            )
+                        }&scope=${
+                            encodeURIComponent(
+                                JSON.stringify(
+                                    currentScope,
+                                ),
+                            )
+                        }`,
+                    );
+
+                if (
+                    state.state?.snapshot
+                ) {
+                    await applyAuthoritativeSnapshot(
+                        state.state.snapshot,
+                        {
+                            serverState:
+                                state.state,
+
+                            persist:
+                                !state.state.generation,
+
+                            reason:
+                                'stream-recovery',
+                        },
+                    );
+                }
+            } catch (error) {
+                warn(
+                    'Stream recovery state fetch failed',
+                    error,
+                );
+            }
+        }
+
+        return;
+    }
+
+    const sourceClientId =
+        data.sourceClientId ??
+        data.event?.sourceClientId;
+
+    if (
+        sourceClientId ===
+        currentClientId
+    ) {
+        currentState.serverSnapshot =
+            normalizeSnapshot(
+                incomingSnapshot,
+            );
+
+        return;
+    }
+
+    if (
+        !currentScope ||
+        !currentState
+    ) {
+        return;
+    }
+
+    if (
+        !sameScope(
+            incomingSnapshot,
+            currentScope,
+        ) &&
+        incomingSnapshot.scopeType
+    ) {
+        return;
+    }
+
+    const incomingType =
+        data.type ||
+        data.event?.type ||
+        'remote update';
+
+    const isStream =
+        incomingType ===
+            'generation_stream';
+
+    await applyAuthoritativeSnapshot(
+        incomingSnapshot,
+        {
+            serverState:
+                data.state,
+
+            persist:
+                !isStream,
+
+            reason:
+                incomingType,
+        },
+    );
+}
+
+function connectSse() {
+    closeSse();
+
+    if (
+        !currentScope ||
+        destroyed ||
         !getSettings().enabled
     ) {
         return;
     }
 
-    reconnectChatKey =
-        expectedChatKey;
-
-    reconnectTimer =
-        window.setTimeout(() => {
-            reconnectTimer = null;
-
-            if (
-                !getSettings().enabled
-            ) {
-                return;
-            }
-
-            if (
-                expectedGeneration !==
-                connectionGeneration
-            ) {
-                return;
-            }
-
-            if (
-                !isCurrentChatKey(
-                    expectedChatKey,
-                )
-            ) {
-                return;
-            }
-
-            reconnectDelay =
-                Math.min(
-                    reconnectDelay * 2,
-                    MAX_RECONNECT_DELAY_MS,
-                );
-
-            void syncJoinCurrentChat({
-                expectedChatKey,
-                expectedGeneration,
-                force: true,
-            });
-        }, reconnectDelay);
-}
-
-async function syncJoinCurrentChat(
-    options = {},
-) {
-    const settings =
-        getSettings();
-
-    if (!settings.enabled) {
-        return false;
-    }
-
-    const ident =
-        getChatIdentity();
-
-    if (!ident.chatId) {
-        return false;
-    }
-
-    const expectedChatKey =
-        options.expectedChatKey ||
-        buildChatKey(ident);
-
-    if (
-        getCurrentDesiredChatKey() !==
-        expectedChatKey
-    ) {
-        return false;
-    }
-
-    if (
-        !options.force &&
-        currentChatKey ===
-            expectedChatKey &&
-        sseConnection &&
-        isConnected
-    ) {
-        return true;
-    }
-
-    const token =
-        options.expectedGeneration ??
-        ++connectionGeneration;
-
-    if (
-        token !== connectionGeneration
-    ) {
-        return false;
-    }
-
-    const ok =
-        await joinGroup(
-            ident,
-            token,
-            options,
+    const scope =
+        encodeURIComponent(
+            JSON.stringify(
+                currentScope,
+            ),
         );
 
-    if (!ok) {
-        if (
-            getSettings().enabled &&
-            isCurrentChatKey(
-                expectedChatKey,
-            )
-        ) {
+    const url =
+        `${location.origin}${PLUGIN_BASE}/events`
+        + `?clientId=${encodeURIComponent(currentClientId)}`
+        + `&deviceId=${encodeURIComponent(currentDeviceId)}`
+        + `&scope=${scope}`;
+
+    try {
+        eventSource =
+            new EventSource(
+                url,
+                {
+                    withCredentials: true,
+                },
+            );
+    } catch (error) {
+        warn(
+            'EventSource creation failed',
+            error,
+        );
+
+        scheduleReconnect(
+            'SSE creation failed',
+        );
+
+        return;
+    }
+
+    eventSource.addEventListener(
+        'hello',
+        event => {
+            try {
+                const data =
+                    JSON.parse(
+                        event.data,
+                    );
+
+                if (
+                    data.epoch &&
+                    currentState.serverEpoch &&
+                    data.epoch !==
+                        currentState.serverEpoch
+                ) {
+                    void resyncCurrentScope(
+                        'server epoch changed',
+                    );
+                }
+
+                applyServerMeta(
+                    data,
+                );
+
+                reconnectAttempt =
+                    0;
+
+                setStatus(
+                    'Live',
+                    `rev ${currentState.serverRevision}`,
+                );
+            } catch (error) {
+                log(
+                    'Invalid SSE hello',
+                    error,
+                );
+            }
+        },
+    );
+
+    eventSource.addEventListener(
+        'sync',
+        event => {
+            try {
+                const data =
+                    JSON.parse(
+                        event.data,
+                    );
+
+                void handleSseEvent(
+                    data,
+                );
+            } catch (error) {
+                warn(
+                    'Invalid SSE sync event',
+                    error,
+                );
+            }
+        },
+    );
+
+    eventSource.addEventListener(
+        'resync_required',
+        event => {
+            try {
+                const data =
+                    JSON.parse(
+                        event.data,
+                    );
+
+                void resyncCurrentScope(
+                    data.reason ||
+                    'server requested resync',
+                );
+            } catch (error) {
+                warn(
+                    'Invalid SSE resync event',
+                    error,
+                );
+
+                void resyncCurrentScope(
+                    'malformed resync event',
+                );
+            }
+        },
+    );
+
+    eventSource.addEventListener(
+        'shutdown',
+        () => {
+            closeSse();
+
             scheduleReconnect(
-                expectedChatKey,
-                token,
+                'server shutdown',
             );
-        }
-
-        return false;
-    }
-
-    if (
-        token !==
-            connectionGeneration ||
-        !isCurrentChatKey(
-            expectedChatKey,
-        )
-    ) {
-        return false;
-    }
-
-    connectSSE(
-        expectedChatKey,
-        token,
+        },
     );
 
-    startHeartbeat(
-        expectedChatKey,
-        token,
-    );
+    eventSource.onerror = () => {
+        closeSse();
 
-    return true;
+        scheduleReconnect(
+            'SSE disconnected',
+        );
+    };
 }
 
-function publishOwnerReleaseBestEffort(
-    chatKey,
-    generation,
+
+/* -------------------------------------------------------------------------- */
+/* Server state/reconnect                                                       */
+/* -------------------------------------------------------------------------- */
+
+async function resyncCurrentScope(
+    reason = 'manual',
 ) {
     if (
-        !chatKey ||
-        !generation?.generationId
+        !currentScope ||
+        !currentState
     ) {
         return;
     }
 
-    const event = {
-        eventId:
-            `${CLIENT_ID}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        clientId: CLIENT_ID,
-        deviceId: DEVICE_ID,
-        userId: getUserId(),
-        chatKey,
-        type: 'GENERATION_OWNER_RELEASED',
-        generationId:
-            generation.generationId,
-        timestamp: Date.now(),
-        payload: {
-            ownerId: CLIENT_ID,
-            ownerDevice: DEVICE_ID,
-            reason: 'client-leave',
-        },
-    };
-
     try {
-        fetch(
-            '/api/multi-client-sync/event',
-            {
-                method: 'POST',
-                headers: {
-                    ...getRequestHeaders(),
-                    'Content-Type':
-                        'application/json',
-                },
-                body: JSON.stringify({
-                    clientId:
-                        CLIENT_ID,
-                    deviceId:
-                        DEVICE_ID,
-                    userId:
-                        getUserId(),
-                    chatKey,
-                    event,
-                }),
-                keepalive: true,
-            },
-        ).catch(() => {});
-    } catch {
-        // best effort only
+        const response =
+            await api(
+                `/state?clientId=${
+                    encodeURIComponent(
+                        currentClientId,
+                    )
+                }&scope=${
+                    encodeURIComponent(
+                        JSON.stringify(
+                            currentScope,
+                        ),
+                    )
+                }`,
+            );
+
+        if (response.state) {
+            applyServerMeta(
+                response.state,
+            );
+
+            if (
+                response.state.snapshot
+            ) {
+                await applyAuthoritativeSnapshot(
+                    response.state.snapshot,
+                    {
+                        serverState:
+                            response.state,
+
+                        reason,
+                    },
+                );
+            }
+        }
+
+        const pending =
+            await loadPending(
+                currentScope,
+            );
+
+        currentState.pending =
+            pending;
+
+        if (pending) {
+            await sendPending(
+                pending,
+            );
+        }
+
+        connectSse();
+
+        reconnectAttempt =
+            0;
+    } catch (error) {
+        warn(
+            'Resync failed',
+            error,
+        );
+
+        scheduleReconnect(
+            error.code ||
+            'resync_failed',
+        );
     }
 }
 
-function leaveGroup() {
-    const oldChatKey =
-        currentChatKey;
-
-    const oldGeneration =
-        activeGeneration;
-
-    connectionGeneration++;
-    chatChangeGeneration++;
-
-    if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-    }
-
-    reconnectChatKey = null;
-
-    if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-    }
-
-    clearChatSaveTimer();
-
+async function joinAndConnect(
+    scope,
+    {
+        reconnect = false,
+    } = {},
+) {
     if (
-        oldGeneration &&
-        isGenerationOwner &&
-        oldChatKey
+        !scope ||
+        destroyed ||
+        !getSettings().enabled
     ) {
-        publishOwnerReleaseBestEffort(
-            oldChatKey,
-            oldGeneration,
-        );
+        return;
     }
 
-    if (sseConnection) {
-        try {
-            sseConnection.close();
-        } catch {
-            // ignore
-        }
+    const thisEpoch =
+        scopeEpoch;
 
-        sseConnection = null;
-    }
+    const response =
+        await api('/join', {
+            method: 'POST',
 
-    if (oldChatKey) {
-        apiPost(
-            '/leave',
-            {
+            body: JSON.stringify({
+                protocolVersion:
+                    PROTOCOL_VERSION,
+
                 clientId:
-                    CLIENT_ID,
-                userId:
-                    getUserId(),
-                chatKey:
-                    oldChatKey,
-            },
-        ).catch(() => {});
-    }
+                    currentClientId,
 
-    currentChatKey = null;
-    isConnected = false;
-    lastSequence = 0;
-    knownServerHeadSequence = 0;
+                deviceId:
+                    currentDeviceId,
 
-    activeGeneration = null;
-    isGenerationOwner = false;
+                scope,
+            }),
+        });
 
-    pendingSequenceEvents.clear();
-    pendingGenerationConflicts.clear();
-    pendingRemoteGenerationAfterLocalStop =
-        null;
-
-    streamStates.clear();
-
-    updateStatusUI();
-}
-
-function startHeartbeat(
-    expectedChatKey = currentChatKey,
-    expectedGeneration =
-        connectionGeneration,
-) {
-    if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-    }
-
-    if (!expectedChatKey) {
+    if (
+        thisEpoch !== scopeEpoch ||
+        !sameScope(
+            scope,
+            currentScope,
+        )
+    ) {
         return;
     }
 
-    heartbeatTimer =
-        window.setInterval(() => {
-            if (
-                expectedGeneration !==
-                connectionGeneration
-            ) {
-                return;
-            }
+    const serverState =
+        response.state;
 
-            if (
-                !isCurrentChatKey(
-                    expectedChatKey,
-                )
-            ) {
-                return;
-            }
+    if (!currentState) {
+        currentState = {
+            serverRevision:
+                Number(
+                    serverState?.revision,
+                ) || 0,
 
-            apiPost(
-                '/heartbeat',
-                {
-                    clientId:
-                        CLIENT_ID,
-                    userId:
-                        getUserId(),
-                    chatKey:
-                        expectedChatKey,
-                },
-            ).catch(() => {});
-        }, HEARTBEAT_INTERVAL_MS);
-}
+            serverSeq:
+                Number(
+                    serverState?.seq,
+                ) || 0,
 
-// ---------------------------------------------------------------------------
-// Event Publishing
-// ---------------------------------------------------------------------------
+            serverEpoch:
+                serverState?.epoch ||
+                null,
 
-async function publishEvent(
-    type,
-    payload,
-    extra = {},
-) {
-    const settings =
-        getSettings();
+            serverSnapshot:
+                serverState?.snapshot
+                    ? normalizeSnapshot(
+                        serverState.snapshot,
+                    )
+                    : null,
 
-    if (
-        !settings.enabled ||
-        !currentChatKey
-    ) {
-        return null;
+            snapshotHash:
+                serverState?.snapshotHash
+                || null,
+
+            generation:
+                serverState?.generation
+                    ? clone(
+                        serverState.generation,
+                    )
+                    : null,
+
+            pending:
+                null,
+
+            suppressLocalEvents:
+                false,
+
+            conflictCount:
+                0,
+        };
+    } else {
+        applyServerMeta(
+            serverState || {},
+        );
+
+        if (
+            serverState?.snapshot
+        ) {
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    serverState.snapshot,
+                );
+        }
     }
 
-    const chatKey =
-        currentChatKey;
+    /*
+     * If the server already has canonical state, use it on initial join unless
+     * there is a durable local pending mutation.
+     */
+    if (serverState?.snapshot) {
+        const localSnapshot =
+            makeSnapshot();
 
-    const event = {
-        eventId:
-            `${CLIENT_ID}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        clientId:
-            CLIENT_ID,
-        deviceId:
-            DEVICE_ID,
-        userId:
-            getUserId(),
-        chatKey,
-        type,
-        payload:
-            safeClone(payload),
-        timestamp:
-            Date.now(),
-        ...extra,
-    };
+        if (
+            !currentState.serverSnapshot
+        ) {
+            currentState.serverSnapshot =
+                normalizeSnapshot(
+                    serverState.snapshot,
+                );
+        }
+
+        const localHash =
+            localSnapshot
+                ? await snapshotHash(
+                    localSnapshot,
+                )
+                : null;
+
+        const remoteHash =
+            serverState.snapshotHash;
+
+        if (
+            remoteHash &&
+            localHash &&
+            remoteHash !== localHash &&
+            !reconnect
+        ) {
+            const pending =
+                await loadPending(
+                    scope,
+                );
+
+            if (!pending) {
+                await applyAuthoritativeSnapshot(
+                    serverState.snapshot,
+                    {
+                        serverState,
+                        reason:
+                            'initial authoritative state',
+                    },
+                );
+            }
+        }
+    } else {
+        /*
+         * First client for this scope bootstraps canonical server state.
+         */
+        const snapshot =
+            makeSnapshot();
+
+        if (snapshot) {
+            const idsChanged =
+                snapshot.idsChanged;
+
+            delete snapshot.idsChanged;
+
+            currentState.pending = {
+                scope:
+                    clone(scope),
+
+                opId:
+                    randomId(),
+
+                type:
+                    'snapshot_bootstrap',
+
+                payload: {
+                    bootstrap:
+                        true,
+                },
+
+                baseRevision:
+                    0,
+
+                baseSnapshot:
+                    clone(snapshot),
+
+                snapshot,
+
+                conflicts: [],
+            };
+
+            await savePending(
+                currentState.pending,
+            );
+
+            if (idsChanged) {
+                await persistCurrentChat(
+                    'bootstrap-message-ids',
+                );
+            }
+
+            await sendPending(
+                currentState.pending,
+            );
+        }
+    }
+
+    const pending =
+        await loadPending(
+            scope,
+        );
+
+    currentState.pending =
+        pending;
+
+    if (pending) {
+        await sendPending(
+            pending,
+        );
+    }
+
+    connectSse();
+    startHeartbeat();
+
+    if (reconnect) {
+        setStatus(
+            'Live',
+            `reconnected; rev ${currentState.serverRevision}`,
+        );
+    }
+}
+
+async function switchScope(
+    nextScope,
+) {
+    const previousScope =
+        currentScope;
+
+    scopeEpoch += 1;
+
+    const myEpoch =
+        scopeEpoch;
+
+    clearReconnectTimer();
+    closeSse();
+    clearHeartbeat();
+
+    latestStreamSnapshot =
+        null;
+
+    latestStreamReason =
+        null;
+
+    if (pendingStreamTimer) {
+        clearTimeout(
+            pendingStreamTimer,
+        );
+    }
+
+    pendingStreamTimer =
+        null;
+
+    currentScope =
+        nextScope
+            ? clone(nextScope)
+            : null;
+
+    currentState =
+        null;
+
+    generationCandidate =
+        null;
+
+    localGenerationClaimLost =
+        false;
+
+    lastGenerationStatus =
+        null;
+
+    if (previousScope) {
+        try {
+            await api('/leave', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        previousScope,
+                }),
+            });
+        } catch (error) {
+            log(
+                'Leave failed',
+                error,
+            );
+        }
+    }
+
+    if (
+        myEpoch !== scopeEpoch ||
+        !currentScope ||
+        destroyed ||
+        !getSettings().enabled
+    ) {
+        return;
+    }
+
+    const repairedBranchIntegrity =
+        repairBranchIntegrity();
+
+    if (repairedBranchIntegrity) {
+        await persistCurrentChat(
+            'branch-integrity-repair',
+        );
+    }
 
     try {
-        const result =
-            await apiPost(
-                '/event',
-                {
-                    clientId:
-                        CLIENT_ID,
-                    deviceId:
-                        DEVICE_ID,
-                    userId:
-                        getUserId(),
-                    chatKey,
-                    event,
-                },
-            );
-
-        if (!result?.success) {
-            warn(
-                'publish rejected',
-                type,
-                result?.error ||
-                    result,
-            );
-
-            return null;
-        }
-
-        const acceptedEvent =
-            safeClone(
-                result.event || event,
-            );
-
-        acceptedEvent.clientId ??=
-            CLIENT_ID;
-
-        acceptedEvent.deviceId ??=
-            DEVICE_ID;
-
-        acceptedEvent.userId ??=
-            getUserId();
-
-        acceptedEvent.chatKey ??=
-            chatKey;
-
-        acceptedEvent.type ??=
-            type;
-
-        acceptedEvent.payload ??=
-            safeClone(payload);
-
-        acceptedEvent.timestamp ??=
-            event.timestamp;
-
-        if (
-            !getEventSequence(
-                acceptedEvent,
-            ) &&
-            Number.isSafeInteger(
-                Number(result.sequence),
-            )
-        ) {
-            acceptedEvent.sequence =
-                Number(result.sequence);
-        }
-
-        const sequence =
-            getEventSequence(
-                acceptedEvent,
-            );
-
-        if (!sequence) {
-            warn(
-                'Server accepted event without sequence',
-                acceptedEvent,
-            );
-
-            return null;
-        }
-
-        knownServerHeadSequence =
-            Math.max(
-                knownServerHeadSequence,
-                sequence,
-            );
-
-        /*
-         * Feed our own acknowledged event through
-         * the exact same ordering pipeline as remote
-         * events. The SillyTavern local action has
-         * already happened, so handlers must be
-         * idempotent.
-         */
-        acceptSequencedEvent(
-            acceptedEvent,
-            'local-ack',
-            true,
-            true,
+        await joinAndConnect(
+            currentScope,
         );
-
-        /*
-         * Only broadcast once the server has given the
-         * event its authoritative sequence.
-         */
-        bcBroadcast(
-            acceptedEvent,
-            chatKey,
-        );
-
-        return {
-            ...result,
-            event:
-                acceptedEvent,
-            sequence,
-        };
-    } catch (e) {
+    } catch (error) {
         warn(
-            'publishEvent failed',
+            'Scope join failed',
+            error,
+        );
+
+        setStatus(
+            'Offline',
+            error.message ||
+            error.code ||
+            'join failed',
+        );
+
+        scheduleReconnect(
+            error.code ||
+            'join failed',
+        );
+    }
+}
+
+async function syncCurrentScope(
+    {
+        force = false,
+    } = {},
+) {
+    if (
+        !ctx ||
+        !getSettings().enabled
+    ) {
+        return;
+    }
+
+    const nextScope =
+        getScope();
+
+    if (
+        !force &&
+        sameScope(
+            nextScope,
+            currentScope,
+        ) &&
+        currentState
+    ) {
+        return;
+    }
+
+    await switchScope(
+        nextScope,
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* ST event handling                                                           */
+/* -------------------------------------------------------------------------- */
+
+function eventMessageId(args) {
+    const first =
+        args?.[0];
+
+    if (
+        typeof first === 'number' &&
+        Number.isInteger(first)
+    ) {
+        return first;
+    }
+
+    if (
+        typeof first === 'string' &&
+        /^\d+$/.test(first)
+    ) {
+        return Number(first);
+    }
+
+    if (
+        first &&
+        typeof first.messageId === 'number'
+    ) {
+        return first.messageId;
+    }
+
+    return null;
+}
+
+function onMessageMutation(
+    type,
+    ...args
+) {
+    if (
+        !currentScope ||
+        !currentState ||
+        currentState.suppressLocalEvents
+    ) {
+        return;
+    }
+
+    const owner =
+        currentState.generation?.ownerClientId ===
+            currentClientId &&
+        !localGenerationClaimLost;
+
+    /*
+     * During a local generation, message updates are stream state rather than
+     * ordinary mutations, preventing concurrent revision races.
+     */
+    if (
+        currentState.generation &&
+        owner
+    ) {
+        void queueStreamSnapshot(
             type,
-            e,
         );
 
-        return null;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Remote Message Application
-// ---------------------------------------------------------------------------
-
-function getInsertAnchors(
-    ctx,
-    index,
-) {
-    return {
-        beforeKey:
-            index >= 0 &&
-            index < ctx.chat.length
-                ? getMessageKey(
-                    ctx.chat[index],
-                    index,
-                )
-                : null,
-
-        afterKey:
-            index > 0 &&
-            index - 1 < ctx.chat.length
-                ? getMessageKey(
-                    ctx.chat[index - 1],
-                    index - 1,
-                )
-                : null,
-    };
-}
-
-function resolveInsertionIndex(
-    ctx,
-    payload,
-) {
-    if (payload?.afterMessageKey) {
-        const afterIndex =
-            findMessageIndexByKey(
-                payload.afterMessageKey,
-            );
-
-        if (afterIndex >= 0) {
-            return afterIndex + 1;
-        }
-    }
-
-    if (payload?.beforeMessageKey) {
-        const beforeIndex =
-            findMessageIndexByKey(
-                payload.beforeMessageKey,
-            );
-
-        if (beforeIndex >= 0) {
-            return beforeIndex;
-        }
-    }
-
-    if (
-        Number.isInteger(
-            payload?.insertAt,
-        )
-    ) {
-        return Math.max(
-            0,
-            Math.min(
-                payload.insertAt,
-                ctx.chat.length,
-            ),
-        );
-    }
-
-    return ctx.chat.length;
-}
-
-function refreshVisibleMessageIds() {
-    const nodes =
-        Array.from(
-            document.querySelectorAll(
-                '#chat .mes',
-            ),
-        );
-
-    if (nodes.length === 0) {
         return;
     }
 
-    let firstId =
-        Number(
-            nodes[0].getAttribute(
-                'mesid',
-            ),
-        );
-
-    if (!Number.isFinite(firstId)) {
-        firstId = 0;
+    /*
+     * A remote generation owns the mutation lock.
+     */
+    if (currentState.generation) {
+        return;
     }
 
-    nodes.forEach(
-        (
-            node,
-            offset,
-        ) => {
-            const id =
-                firstId + offset;
+    const messageId =
+        eventMessageId(
+            args,
+        );
 
-            node.setAttribute(
-                'mesid',
-                String(id),
-            );
-
-            const display =
-                node.querySelector(
-                    '.mesIDDisplay',
-                );
-
-            if (display) {
-                display.textContent =
-                    `#${id}`;
-            }
-        },
+    enqueueSnapshotMutationSoon(
+        type,
+        messageId === null
+            ? {}
+            : { messageId },
     );
 }
 
-function applyRemoteMessageInserted(
-    event,
-) {
-    const payload =
-        event.payload;
-
-    const message =
-        payload?.message;
-
-    if (!message) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const messageKey =
-        payload.messageKey ||
-        getMessageKey(
-            message,
-            payload.insertAt,
-        );
-
-    const sequence =
-        getEventSequence(event);
-
-    if (messageKey) {
-        const existingIndex =
-            findMessageIndexByKey(
-                messageKey,
-            );
-
-        const tombstone =
-            messageTombstones.get(
-                messageKey,
-            ) ?? 0;
-
-        if (existingIndex >= 0) {
-            return;
-        }
-
-        if (
-            tombstone > 0 &&
-            sequence &&
-            sequence <= tombstone
-        ) {
-            return;
-        }
-    }
-
-    const insertIndex =
-        resolveInsertionIndex(
-            ctx,
-            payload,
-        );
-
-    const clonedMessage =
-        safeClone(message);
-
-    ctx.chat.splice(
-        insertIndex,
-        0,
-        clonedMessage,
-    );
-
+async function onGenerationStarted() {
     if (
-        typeof ctx.addOneMessage ===
-        'function'
-    ) {
-        const options = {
-            scroll: false,
-            forceId:
-                insertIndex,
-        };
-
-        if (insertIndex > 0) {
-            options.insertAfter =
-                insertIndex - 1;
-        } else if (
-            ctx.chat.length > 1
-        ) {
-            options.insertBefore =
-                1;
-        }
-
-        ctx.addOneMessage(
-            clonedMessage,
-            options,
-        );
-    }
-
-    refreshVisibleMessageIds();
-
-    if (messageKey && sequence) {
-        messageRevisions.set(
-            messageKey,
-            sequence,
-        );
-    }
-
-    scheduleChatSave();
-}
-
-function applyRemoteMessageEdited(
-    event,
-) {
-    const payload =
-        event.payload;
-
-    const sequence =
-        getEventSequence(event);
-
-    if (
-        !payload ||
-        sequence === null
+        !currentScope ||
+        !currentState ||
+        !getSettings().enabled
     ) {
         return;
     }
 
+    /*
+     * If a remote owner already exists, stop the local ST generation immediately.
+     * The server remains the final race arbiter.
+     */
     if (
-        isStaleMessageMutation(
-            payload,
-            sequence,
-        )
+        currentState.generation &&
+        currentState.generation.ownerClientId !==
+            currentClientId
     ) {
-        return;
-    }
+        localGenerationClaimLost =
+            true;
 
-    const messageIndex =
-        findMessageIndex(
-            payload,
-        );
-
-    if (messageIndex < 0) {
-        warn(
-            'remote edit target not found',
-            payload,
-        );
-
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const msg =
-        ctx.chat[messageIndex];
-
-    if (!msg) {
-        return;
-    }
-
-    if (
-        payload.mes !== undefined
-    ) {
-        msg.mes =
-            payload.mes;
-    }
-
-    if (
-        payload.swipes !== undefined
-    ) {
-        msg.swipes =
-            safeClone(
-                payload.swipes,
-            );
-    }
-
-    if (
-        payload.swipe_id !== undefined
-    ) {
-        msg.swipe_id =
-            payload.swipe_id;
-    }
-
-    if (
-        payload.extra !== undefined
-    ) {
-        msg.extra =
-            safeClone(
-                payload.extra,
-            );
-    }
-
-    ctx.updateMessageBlock(
-        messageIndex,
-        msg,
-    );
-
-    recordMessageRevision(
-        payload,
-        sequence,
-    );
-
-    scheduleChatSave();
-}
-
-function applyRemoteMessageDeleted(
-    event,
-) {
-    const payload =
-        event.payload;
-
-    const sequence =
-        getEventSequence(event);
-
-    if (
-        !payload ||
-        sequence === null
-    ) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const indices =
-        new Set();
-
-    const keys =
-        Array.isArray(
-            payload.deletedMessageKeys,
-        )
-            ? payload.deletedMessageKeys
-            : [];
-
-    for (const key of keys) {
-        recordMessageTombstone(
-            key,
-            sequence,
-        );
-
-        const idx =
-            findMessageIndexByKey(
-                key,
-            );
-
-        if (idx >= 0) {
-            indices.add(idx);
-        }
-    }
-
-    const ids =
-        Array.isArray(
-            payload.deletedIds,
-        )
-            ? payload.deletedIds
-            : [];
-
-    for (const id of ids) {
-        if (
-            Number.isInteger(id) &&
-            id >= 0 &&
-            id < ctx.chat.length
-        ) {
-            const key =
-                getMessageKey(
-                    ctx.chat[id],
-                    id,
-                );
-
-            if (key) {
-                recordMessageTombstone(
-                    key,
-                    sequence,
-                );
-            }
-
-            indices.add(id);
-        }
-    }
-
-    const sorted =
-        [...indices].sort(
-            (a, b) => b - a,
-        );
-
-    for (
-        const messageIndex of sorted
-    ) {
         try {
-            if (!ctx.chat[messageIndex]) {
-                continue;
-            }
-
-            const node =
-                document.querySelector(
-                    `#chat .mes[mesid="${messageIndex}"]`,
-                );
-
-            if (node) {
-                node.remove();
-            }
-
-            ctx.chat.splice(
-                messageIndex,
-                1,
-            );
-        } catch (e) {
-            warn(
-                'remote delete failed',
-                messageIndex,
-                e,
-            );
+            ctx?.stopGeneration?.();
+        } catch {
+            // ignored
         }
-    }
 
-    refreshVisibleMessageIds();
-    scheduleChatSave();
-}
-
-function applyRemoteMessageSwiped(
-    event,
-) {
-    const payload =
-        event.payload;
-
-    const sequence =
-        getEventSequence(event);
-
-    if (
-        !payload ||
-        sequence === null
-    ) {
-        return;
-    }
-
-    if (
-        isStaleMessageMutation(
-            payload,
-            sequence,
-        )
-    ) {
-        return;
-    }
-
-    const messageIndex =
-        findMessageIndex(
-            payload,
-        );
-
-    if (messageIndex < 0) {
-        warn(
-            'remote swipe target not found',
-            payload,
+        setStatus(
+            'Generation busy',
+            'Remote client owns generation',
         );
 
         return;
     }
 
-    const ctx =
-        getContext();
+    const claimed =
+        await claimGeneration();
 
-    const msg =
-        ctx.chat[messageIndex];
-
-    if (!msg) {
+    if (!claimed) {
         return;
     }
 
-    if (
-        payload.swipes !== undefined
-    ) {
-        msg.swipes =
-            safeClone(
-                payload.swipes,
-            );
-    }
-
-    if (
-        payload.swipe_id !== undefined
-    ) {
-        msg.swipe_id =
-            payload.swipe_id;
-
-        if (
-            Array.isArray(msg.swipes) &&
-            msg.swipes[
-                msg.swipe_id
-            ] !== undefined
-        ) {
-            msg.mes =
-                msg.swipes[
-                    msg.swipe_id
-                ];
-        }
-    }
-
-    ctx.updateMessageBlock(
-        messageIndex,
-        msg,
-    );
-
-    recordMessageRevision(
-        payload,
-        sequence,
-    );
-
-    scheduleChatSave();
-}
-
-// ---------------------------------------------------------------------------
-// Generation / streaming helpers
-// ---------------------------------------------------------------------------
-
-function getGenerationStreamState(
-    generationId,
-) {
-    if (!generationId) {
-        return null;
-    }
-
-    let state =
-        streamStates.get(
-            generationId,
-        );
-
-    if (!state) {
-        state = {
-            nextExpected: 1,
-            pending: new Map(),
-        };
-
-        streamStates.set(
-            generationId,
-            state,
-        );
-    }
-
-    return state;
-}
-
-function scheduleStreamRender(
-    generationId,
-    messageKey,
-) {
-    const existing =
-        streamRenderTimers.get(
-            generationId,
-        );
-
-    if (existing) {
-        return;
-    }
-
-    const timer =
-        window.setTimeout(
-            () => {
-                streamRenderTimers.delete(
-                    generationId,
-                );
-
-                flushStreamRender(
-                    generationId,
-                    messageKey,
-                );
-            },
-            STREAM_RENDER_DEBOUNCE_MS,
-        );
-
-    streamRenderTimers.set(
-        generationId,
-        {
-            timer,
-            messageKey:
-                messageKey || null,
-        },
+    await queueStreamSnapshot(
+        'generation_started',
     );
 }
 
-function flushStreamRender(
-    generationId,
-    messageKey = null,
-) {
-    const target =
-        messageKey ||
-        activeGeneration?.messageKey ||
+function onStreamToken() {
+    if (
+        !currentState?.generation ||
+        currentState.generation.ownerClientId !==
+            currentClientId ||
+        localGenerationClaimLost
+    ) {
+        return;
+    }
+
+    void queueStreamSnapshot(
+        'token',
+    );
+}
+
+async function onGenerationStopped() {
+    if (!currentState?.generation) {
+        return;
+    }
+
+    if (
+        currentState.generation.ownerClientId !==
+            currentClientId ||
+        localGenerationClaimLost
+    ) {
+        return;
+    }
+
+    localStopIssued =
+        true;
+
+    clearTimeout(
+        finalizeTimer,
+    );
+
+    finalizeTimer =
         null;
 
-    const ctx =
-        getContext();
-
-    let messageIndex =
-        target
-            ? findMessageIndexByKey(
-                target,
-            )
-            : -1;
-
-    if (
-        messageIndex < 0 &&
-        Number.isInteger(
-            activeGeneration?.messageIndex,
-        )
-    ) {
-        messageIndex =
-            activeGeneration.messageIndex;
-    }
-
-    if (messageIndex < 0) {
-        for (
-            let i =
-                ctx.chat.length - 1;
-            i >= 0;
-            i--
-        ) {
-            if (
-                ctx.chat[i] &&
-                !ctx.chat[i].is_user &&
-                !ctx.chat[i].is_system
-            ) {
-                messageIndex = i;
-                break;
-            }
-        }
-    }
-
-    if (
-        messageIndex < 0 ||
-        !ctx.chat[messageIndex]
-    ) {
-        return;
-    }
-
-    ctx.updateMessageBlock(
-        messageIndex,
-        ctx.chat[messageIndex],
+    await finishGeneration(
+        'stopped',
     );
 }
 
-function clearStreamRenderTimer(
-    generationId,
-) {
-    const current =
-        streamRenderTimers.get(
-            generationId,
-        );
+async function onGenerationEnded() {
+    if (!currentState?.generation) {
+        return;
+    }
 
-    if (!current) {
+    if (
+        currentState.generation.ownerClientId !==
+            currentClientId ||
+        localGenerationClaimLost
+    ) {
         return;
     }
 
     clearTimeout(
-        current.timer,
+        finalizeTimer,
     );
 
-    streamRenderTimers.delete(
-        generationId,
-    );
+    finalizeTimer =
+        setTimeout(
+            async () => {
+                finalizeTimer =
+                    null;
+
+                await finishGeneration(
+                    localStopIssued
+                        ? 'stopped'
+                        : 'completed',
+                );
+            },
+            FINALIZE_DELAY_MS,
+        );
 }
 
-function findGenerationMessageIndex(
-    generation,
-    payload = {},
-) {
-    const ctx =
-        getContext();
+function onChatChanged() {
+    void syncCurrentScope({
+        force: true,
+    });
+}
 
-    if (payload.messageKey) {
-        const idx =
-            findMessageIndexByKey(
-                payload.messageKey,
+async function onChatLifecycle(
+    type,
+) {
+    /*
+     * Event arguments differ across ST versions, so reconciliation is based on
+     * the actual live context rather than trusting an event payload.
+     */
+    if (
+        type === 'chat_deleted' ||
+        type === 'group_chat_deleted'
+    ) {
+        const active =
+            getScope();
+
+        if (
+            !active &&
+            currentScope
+        ) {
+            setStatus(
+                'Chat changed',
+                'Active chat no longer exists',
             );
 
-        if (idx >= 0) {
-            return idx;
+            closeSse();
+            clearHeartbeat();
+
+            return;
         }
     }
 
-    if (generation?.messageKey) {
-        const idx =
-            findMessageIndexByKey(
-                generation.messageKey,
-            );
+    await syncCurrentScope({
+        force: true,
+    });
+}
 
-        if (idx >= 0) {
-            return idx;
-        }
+
+/* -------------------------------------------------------------------------- */
+/* Same-browser transport                                                      */
+/* -------------------------------------------------------------------------- */
+
+async function onRemoteBroadcast(
+    message,
+) {
+    if (
+        !message ||
+        message.protocolVersion !==
+            PROTOCOL_VERSION
+    ) {
+        return;
     }
 
     if (
-        Number.isInteger(
-            payload.messageId,
-        ) &&
-        payload.messageId >= 0 &&
-        payload.messageId <
-            ctx.chat.length
+        message.sourceClientId ===
+        currentClientId
     ) {
-        return payload.messageId;
+        return;
     }
 
     if (
-        Number.isInteger(
-            generation?.messageIndex,
-        ) &&
-        generation.messageIndex >= 0 &&
-        generation.messageIndex <
-            ctx.chat.length
+        !sameScope(
+            message.scope,
+            currentScope,
+        )
     ) {
-        return generation.messageIndex;
+        return;
     }
 
-    for (
-        let i =
-            ctx.chat.length - 1;
-        i >= 0;
-        i--
+    if (
+        message.kind ===
+            'generation_owner' ||
+        message.kind ===
+            'accepted' ||
+        message.kind ===
+            'generation_terminal'
     ) {
-        if (
-            ctx.chat[i] &&
-            !ctx.chat[i].is_user &&
-            !ctx.chat[i].is_system
-        ) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-function initializeGenerationMessage(
-    event,
-    generation,
-) {
-    const payload =
-        event.payload || {};
-
-    const ctx =
-        getContext();
-
-    if (payload.message) {
-        const messageKey =
-            payload.messageKey ||
-            getMessageKey(
-                payload.message,
-                payload.messageId,
-            );
-
-        const existingIndex =
-            messageKey
-                ? findMessageIndexByKey(
-                    messageKey,
-                )
-                : -1;
-
-        if (existingIndex >= 0) {
-            generation.messageIndex =
-                existingIndex;
-
-            generation.messageKey =
-                messageKey;
-
-            return existingIndex;
-        }
-
-        const insertAt =
-            Number.isInteger(
-                payload.insertAt,
-            )
-                ? Math.max(
-                    0,
-                    Math.min(
-                        payload.insertAt,
-                        ctx.chat.length,
-                    ),
-                )
-                : ctx.chat.length;
-
-        ctx.chat.splice(
-            insertAt,
-            0,
-            safeClone(
-                payload.message,
-            ),
-        );
-
-        if (
-            typeof ctx.addOneMessage ===
-            'function'
-        ) {
-            const options = {
-                scroll: false,
-                forceId: insertAt,
-            };
-
-            if (insertAt > 0) {
-                options.insertAfter =
-                    insertAt - 1;
-            } else if (
-                ctx.chat.length > 1
-            ) {
-                options.insertBefore =
-                    1;
-            }
-
-            ctx.addOneMessage(
-                ctx.chat[insertAt],
-                options,
+        if (message.state) {
+            applyServerMeta(
+                message.state,
             );
         }
-
-        refreshVisibleMessageIds();
-
-        generation.messageIndex =
-            insertAt;
-
-        generation.messageKey =
-            messageKey ||
-            getMessageKey(
-                ctx.chat[insertAt],
-                insertAt,
-            );
-
-        scheduleChatSave(
-            STREAM_SAVE_DEBOUNCE_MS,
-        );
-
-        return insertAt;
-    }
-
-    const idx =
-        findGenerationMessageIndex(
-            generation,
-            payload,
-        );
-
-    if (idx >= 0) {
-        generation.messageIndex =
-            idx;
-
-        generation.messageKey =
-            generation.messageKey ||
-            getMessageKey(
-                ctx.chat[idx],
-                idx,
-            );
-    }
-
-    return idx;
-}
-
-function restoreGenerationState(
-    serverGeneration,
-) {
-    if (!serverGeneration) {
-        if (
-            activeGeneration &&
-            activeGeneration.status ===
-                'active'
-        ) {
-            log(
-                'server reports no active generation; clearing stale local generation',
-            );
-        }
-
-        activeGeneration = null;
-        isGenerationOwner = false;
-        updateStatusUI();
 
         return;
     }
 
-    activeGeneration = {
-        ...safeClone(
-            serverGeneration,
-        ),
-
-        streamSeqApplied:
-            Number(
-                serverGeneration.streamSeqApplied ??
-                serverGeneration.streamSeq ??
-                serverGeneration.lastStreamSeq ??
-                0,
-            ),
-
-        streamSeq:
-            Number(
-                serverGeneration.streamSeq ??
-                serverGeneration.streamSeqApplied ??
-                serverGeneration.lastStreamSeq ??
-                0,
-            ),
-    };
-
-    isGenerationOwner =
-        activeGeneration.ownerId ===
-        CLIENT_ID;
-
-    const streamState =
-        getGenerationStreamState(
-            activeGeneration.generationId,
-        );
-
-    streamState.nextExpected =
-        Math.max(
-            1,
-            activeGeneration.streamSeqApplied +
-                1,
-        );
-
-    streamState.pending.clear();
-
-    const currentText =
-        activeGeneration.currentText ??
-        activeGeneration.text;
-
     if (
-        currentText !== undefined
+        message.kind ===
+            'local_pending'
     ) {
-        const idx =
-            findGenerationMessageIndex(
-                activeGeneration,
-                {},
-            );
-
-        if (idx >= 0) {
-            const ctx =
-                getContext();
-
-            ctx.chat[idx].mes =
-                currentText;
-
-            activeGeneration.messageIndex =
-                idx;
-
-            activeGeneration.messageKey =
-                activeGeneration.messageKey ||
-                getMessageKey(
-                    ctx.chat[idx],
-                    idx,
-                );
-
-            ctx.updateMessageBlock(
-                idx,
-                ctx.chat[idx],
+        /*
+         * A same-browser peer changed the scope. Let the server/SSE state remain
+         * authoritative; a cheap state refresh catches the change even before
+         * the SSE delivery reaches us.
+         */
+        if (
+            message.type &&
+            currentState
+        ) {
+            void resyncCurrentScope(
+                'same-browser peer pending',
             );
         }
     }
-
-    updateStatusUI();
 }
 
-function resolveGenerationConflict(
-    remoteEvent,
+
+/* -------------------------------------------------------------------------- */
+/* Listener lifecycle                                                          */
+/* -------------------------------------------------------------------------- */
+
+function bindEvent(
+    name,
+    handler,
 ) {
-    const localGeneration =
-        activeGeneration;
+    const source =
+        ctx?.eventSource;
 
     if (
-        !localGeneration ||
-        !remoteEvent?.generationId
+        !source ||
+        !name
     ) {
-        return false;
+        return;
     }
 
-    if (
-        localGeneration.generationId ===
-        remoteEvent.generationId
-    ) {
-        return true;
+    source.on(
+        name,
+        handler,
+    );
+
+    listeners.push([
+        name,
+        handler,
+    ]);
+}
+
+function bindEvents() {
+    const eventTypes =
+        ctx?.eventTypes ||
+        ctx?.event_types;
+
+    if (!eventTypes) {
+        return;
     }
 
-    const localSequence =
-        Number(
-            localGeneration.serverSequence,
-        );
+    bindEvent(
+        eventTypes.MESSAGE_SENT,
+        (...args) =>
+            onMessageMutation(
+                'message_sent',
+                ...args,
+            ),
+    );
 
-    const remoteSequence =
-        getEventSequence(
-            remoteEvent,
-        );
+    bindEvent(
+        eventTypes.MESSAGE_RECEIVED,
+        (...args) =>
+            onMessageMutation(
+                'message_received',
+                ...args,
+            ),
+    );
 
-    if (
-        !Number.isSafeInteger(
-            localSequence,
-        ) ||
-        !Number.isSafeInteger(
-            remoteSequence,
-        )
-    ) {
-        pendingGenerationConflicts.set(
-            remoteEvent.generationId,
-            remoteEvent,
+    bindEvent(
+        eventTypes.MESSAGE_EDITED,
+        (...args) =>
+            onMessageMutation(
+                'message_edited',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_DELETED,
+        (...args) =>
+            onMessageMutation(
+                'message_deleted',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_UPDATED,
+        (...args) =>
+            onMessageMutation(
+                'message_updated',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_SWIPED,
+        (...args) =>
+            onMessageMutation(
+                'message_swiped',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_SWIPE_DELETED,
+        (...args) =>
+            onMessageMutation(
+                'message_swipe_deleted',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_FILE_EMBEDDED,
+        (...args) =>
+            onMessageMutation(
+                'message_file_embedded',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_REASONING_EDITED,
+        (...args) =>
+            onMessageMutation(
+                'message_reasoning_edited',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MESSAGE_REASONING_DELETED,
+        (...args) =>
+            onMessageMutation(
+                'message_reasoning_deleted',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.TOOL_CALLS_PERFORMED,
+        (...args) =>
+            onMessageMutation(
+                'tool_calls_performed',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.MEDIA_ATTACHMENT_DELETED,
+        (...args) =>
+            onMessageMutation(
+                'media_attachment_deleted',
+                ...args,
+            ),
+    );
+
+    bindEvent(
+        eventTypes.CHAT_CHANGED,
+        onChatChanged,
+    );
+
+    bindEvent(
+        eventTypes.CHAT_CREATED,
+        () =>
+            void onChatLifecycle(
+                'chat_created',
+            ),
+    );
+
+    bindEvent(
+        eventTypes.CHAT_DELETED,
+        () =>
+            void onChatLifecycle(
+                'chat_deleted',
+            ),
+    );
+
+    bindEvent(
+        eventTypes.CHAT_RENAMED,
+        () =>
+            void onChatLifecycle(
+                'chat_renamed',
+            ),
+    );
+
+    bindEvent(
+        eventTypes.GROUP_CHAT_CREATED,
+        () =>
+            void onChatLifecycle(
+                'group_chat_created',
+            ),
+    );
+
+    bindEvent(
+        eventTypes.GROUP_CHAT_DELETED,
+        () =>
+            void onChatLifecycle(
+                'group_chat_deleted',
+            ),
+    );
+
+    bindEvent(
+        eventTypes.GROUP_UPDATED,
+        () =>
+            void onChatLifecycle(
+                'group_updated',
+            ),
+    );
+
+    bindEvent(
+        eventTypes.GENERATION_STARTED,
+        onGenerationStarted,
+    );
+
+    /*
+     * Current ST has STREAM_TOKEN_RECEIVED and a deprecated alias.
+     * Bind only one if available.
+     */
+    bindEvent(
+        eventTypes.STREAM_TOKEN_RECEIVED ||
+            eventTypes.SMOOTH_STREAM_TOKEN_RECEIVED,
+        onStreamToken,
+    );
+
+    /*
+     * A message_received can be the final generated message after the stream.
+     */
+    bindEvent(
+        eventTypes.GENERATION_STOPPED,
+        onGenerationStopped,
+    );
+
+    bindEvent(
+        eventTypes.GENERATION_ENDED,
+        onGenerationEnded,
+    );
+}
+
+function unbindEvents() {
+    if (!ctx?.eventSource) {
+        return;
+    }
+
+    for (const [
+        name,
+        handler,
+    ] of listeners) {
+        try {
+            ctx.eventSource.removeListener(
+                name,
+                handler,
+            );
+        } catch {
+            // ignored
+        }
+    }
+
+    listeners = [];
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Startup/shutdown                                                            */
+/* -------------------------------------------------------------------------- */
+
+function initBroadcastChannel() {
+    try {
+        broadcastChannel =
+            new BroadcastChannel(
+                CHANNEL_NAME,
+            );
+
+        broadcastChannel.addEventListener(
+            'message',
+            event =>
+                void onRemoteBroadcast(
+                    event.data,
+                ),
         );
+    } catch (error) {
+        broadcastChannel = null;
 
         log(
-            'deferring generation conflict until server sequence is known',
+            'BroadcastChannel unavailable; server-only transport',
+            error,
         );
-
-        return true;
     }
-
-    if (
-        remoteSequence < localSequence
-    ) {
-        pendingRemoteGenerationAfterLocalStop =
-            remoteEvent;
-
-        const localGenerationId =
-            localGeneration.generationId;
-
-        suppressedGenerationStopPublishes.delete(
-            localGenerationId,
-        );
-
-        try {
-            const ctx =
-                getContext();
-
-            if (
-                typeof ctx.stopGeneration ===
-                'function'
-            ) {
-                Promise.resolve(
-                    ctx.stopGeneration(),
-                ).catch((e) =>
-                    warn(
-                        'failed to stop losing local generation',
-                        e,
-                    ),
-                );
-            }
-        } catch (e) {
-            warn(
-                'failed to stop losing local generation',
-                e,
-            );
-        }
-
-        activeGeneration = null;
-        isGenerationOwner = false;
-
-        activateRemoteGeneration(
-            remoteEvent,
-        );
-
-        return true;
-    }
-
-    void requestRemoteStopForGeneration(
-        remoteEvent.generationId,
-    );
-
-    return true;
 }
 
-function activateRemoteGeneration(
-    event,
-) {
+async function start() {
     if (
-        activeGeneration?.generationId &&
-        activeGeneration.generationId !==
-            event.generationId
+        initialized &&
+        !destroyed
     ) {
-        clearStreamRenderTimer(
-            activeGeneration.generationId,
-        );
-    }
-
-    activeGeneration = {
-        generationId:
-            event.generationId,
-
-        ownerId:
-            event.clientId,
-
-        ownerDevice:
-            event.deviceId,
-
-        status:
-            'active',
-
-        startedAt:
-            event.timestamp ||
-            Date.now(),
-
-        serverSequence:
-            getEventSequence(event),
-
-        streamSeqApplied:
-            0,
-
-        streamSeq:
-            0,
-    };
-
-    initializeGenerationMessage(
-        event,
-        activeGeneration,
-    );
-
-    isGenerationOwner =
-        event.clientId ===
-        CLIENT_ID;
-
-    const streamState =
-        getGenerationStreamState(
-            activeGeneration.generationId,
-        );
-
-    streamState.nextExpected = 1;
-    streamState.pending.clear();
-
-    updateStatusUI();
-
-    log(
-        'generation started by',
-        event.clientId,
-        event.generationId,
-    );
-}
-
-function applyRemoteGenerationStarted(
-    event,
-) {
-    if (!event.generationId) {
-        return;
-    }
-
-    if (
-        activeGeneration?.generationId ===
-        event.generationId
-    ) {
-        if (
-            Number.isSafeInteger(
-                getEventSequence(event),
-            )
-        ) {
-            activeGeneration.serverSequence =
-                getEventSequence(event);
+        if (!currentScope) {
+            await syncCurrentScope({
+                force: true,
+            });
         }
-
-        initializeGenerationMessage(
-            event,
-            activeGeneration,
-        );
 
         return;
     }
 
-    if (
-        activeGeneration &&
-        activeGeneration.status ===
-            'active' &&
-        activeGeneration.ownerId ===
-            CLIENT_ID
-    ) {
-        if (
-            resolveGenerationConflict(
-                event,
-            )
-        ) {
-            return;
-        }
-    } else if (
-        activeGeneration &&
-        activeGeneration.status ===
-            'active'
-    ) {
-        const existingSequence =
-            Number(
-                activeGeneration.serverSequence,
-            );
+    ctx =
+        safeGetContext();
 
-        const remoteSequence =
-            getEventSequence(event);
-
-        if (
-            Number.isSafeInteger(
-                existingSequence,
-            ) &&
-            Number.isSafeInteger(
-                remoteSequence,
-            )
-        ) {
-            if (
-                remoteSequence <
-                existingSequence
-            ) {
-                activateRemoteGeneration(
-                    event,
-                );
-            } else if (
-                remoteSequence >
-                existingSequence
-            ) {
-                void requestRemoteStopForGeneration(
-                    event.generationId,
-                );
-            }
-
-            return;
-        }
+    if (!ctx) {
+        return;
     }
 
-    const deferred =
-        pendingGenerationConflicts.get(
-            event.generationId,
-        );
+    destroyed =
+        false;
 
-    if (deferred) {
-        pendingGenerationConflicts.delete(
-            event.generationId,
+    loadIdentity();
+
+    getSettings();
+
+    renderUi();
+
+    setStatus(
+        'Starting',
+        'initializing sync',
+    );
+
+    initBroadcastChannel();
+    bindEvents();
+
+    initialized =
+        true;
+
+    await syncCurrentScope({
+        force: true,
+    });
+}
+
+async function stop() {
+    destroyed =
+        true;
+
+    clearReconnectTimer();
+    clearHeartbeat();
+    closeSse();
+
+    clearTimeout(
+        localMutationTimer,
+    );
+
+    clearTimeout(
+        finalizeTimer,
+    );
+
+    if (pendingStreamTimer) {
+        clearTimeout(
+            pendingStreamTimer,
         );
     }
 
-    activateRemoteGeneration(
-        event,
+    localMutationTimer = null;
+    finalizeTimer = null;
+    pendingStreamTimer = null;
+
+    try {
+        if (currentScope) {
+            await api('/leave', {
+                method: 'POST',
+
+                body: JSON.stringify({
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    clientId:
+                        currentClientId,
+
+                    deviceId:
+                        currentDeviceId,
+
+                    scope:
+                        currentScope,
+                }),
+            });
+        }
+    } catch {
+        // best effort during teardown
+    }
+
+    unbindEvents();
+
+    try {
+        broadcastChannel?.close();
+    } catch {
+        // ignored
+    }
+
+    broadcastChannel =
+        null;
+
+    currentScope =
+        null;
+
+    currentState =
+        null;
+
+    initialized =
+        false;
+
+    setStatus(
+        'Disabled',
+        'synchronization stopped',
     );
 }
 
-function applyRemoteGenerationStream(
-    event,
-) {
-    if (
-        !activeGeneration ||
-        activeGeneration.generationId !==
-            event.generationId
-    ) {
+
+/* -------------------------------------------------------------------------- */
+/* Lifecycle hooks                                                             */
+/* -------------------------------------------------------------------------- */
+
+export async function onInstall() {
+    const c =
+        safeGetContext();
+
+    if (!c) {
         return;
     }
 
-    const streamSeq =
-        Number(event.streamSeq);
+    ctx = c;
 
-    if (
-        !Number.isSafeInteger(
-            streamSeq,
-        ) ||
-        streamSeq <= 0
-    ) {
-        warn(
-            'Ignoring generation stream event without valid stream sequence',
-            event,
-        );
+    const settingsRoot =
+        c.extensionSettings || {};
 
-        return;
-    }
-
-    if (
-        streamSeq <=
-        Number(
-            activeGeneration.streamSeqApplied ||
-                0,
-        )
-    ) {
-        return;
-    }
-
-    const streamState =
-        getGenerationStreamState(
-            event.generationId,
-        );
-
-    const expected =
-        Number(
-            activeGeneration.streamSeqApplied ||
-                0,
-        ) + 1;
-
-    if (streamSeq > expected) {
-        if (
-            !streamState.pending.has(
-                streamSeq,
-            )
-        ) {
-            streamState.pending.set(
-                streamSeq,
-                event,
+    if (!settingsRoot[MODULE]) {
+        settingsRoot[MODULE] =
+            structuredClone(
+                DEFAULTS,
             );
-        }
 
-        warn(
-            'stream sequence gap detected',
-            {
-                generationId:
-                    event.generationId,
-                expected,
-                received:
-                    streamSeq,
+        c.saveSettingsDebounced?.();
+    }
+}
+
+export async function onActivate() {
+    await start();
+}
+
+export async function onEnable() {
+    getSettings().enabled =
+        true;
+
+    await start();
+}
+
+export async function onDisable() {
+    getSettings().enabled =
+        false;
+
+    ctx?.saveSettingsDebounced?.();
+
+    await stop();
+}
+
+export async function onDelete() {
+    await stop();
+}
+
+export async function onClean() {
+    try {
+        const db =
+            await openDb();
+
+        await new Promise(
+            (resolve, reject) => {
+                const tx =
+                    db.transaction(
+                        'kv',
+                        'readwrite',
+                    );
+
+                tx.objectStore(
+                    'kv',
+                ).clear();
+
+                tx.oncomplete =
+                    resolve;
+
+                tx.onerror =
+                    () => reject(
+                        tx.error,
+                    );
             },
         );
 
-        requestSequenceRecovery(
-            getEventSequence(event) || 0,
-        ).catch((e) =>
-            warn(
-                'stream recovery failed',
-                e,
-            ),
+        db.close();
+    } catch (error) {
+        log(
+            'Clean extension data failed',
+            error,
         );
-
-        return;
     }
+}
 
-    const applyChunk =
-        (streamEvent) => {
-            const seq =
-                Number(
-                    streamEvent.streamSeq,
-                );
 
-            if (
-                seq <=
-                Number(
-                    activeGeneration.streamSeqApplied ||
-                        0,
-                )
-            ) {
-                return true;
-            }
+/* -------------------------------------------------------------------------- */
+/* Compatibility bootstrap                                                     */
+/* -------------------------------------------------------------------------- */
 
-            const payload =
-                streamEvent.payload ||
-                {};
+/*
+ * Also works when the existing manifest does not yet declare lifecycle hooks.
+ * If the manifest later maps activate/enable/disable/etc. to the exported
+ * hooks above, initialization remains idempotent.
+ */
+void (async () => {
+    try {
+        const waitForApp = () => {
+            const c =
+                safeGetContext();
 
-            const ctx =
-                getContext();
-
-            let messageIndex =
-                findGenerationMessageIndex(
-                    activeGeneration,
-                    payload,
-                );
-
-            if (
-                messageIndex < 0 &&
-                payload.message
-            ) {
-                messageIndex =
-                    initializeGenerationMessage(
-                        streamEvent,
-                        activeGeneration,
-                    );
-            }
-
-            if (messageIndex < 0) {
-                warn(
-                    'stream message target not found; waiting for message event',
-                    streamEvent,
-                );
-
+            if (!c) {
                 return false;
             }
 
-            const message =
-                ctx.chat[messageIndex];
-
-            if (!message) {
-                return false;
-            }
+            const eventTypes =
+                c.eventTypes ||
+                c.event_types;
 
             if (
-                payload.messageKey
+                eventTypes?.APP_READY
             ) {
-                activeGeneration.messageKey =
-                    payload.messageKey;
-            }
-
-            activeGeneration.messageIndex =
-                messageIndex;
-
-            activeGeneration.streamSeqApplied =
-                seq;
-
-            activeGeneration.streamSeq =
-                Math.max(
-                    Number(
-                        activeGeneration.streamSeq ||
-                            0,
-                    ),
-                    seq,
+                c.eventSource.once(
+                    eventTypes.APP_READY,
+                    () => void start(),
                 );
-
-            const chunk =
-                String(
-                    payload.chunk ??
-                        '',
-                );
-
-            if (chunk) {
-                message.mes =
-                    `${message.mes || ''}${chunk}`;
-
-                scheduleStreamRender(
-                    event.generationId,
-                    activeGeneration.messageKey,
-                );
-
-                scheduleChatSave(
-                    STREAM_SAVE_DEBOUNCE_MS,
-                );
+            } else {
+                void start();
             }
 
             return true;
         };
 
-    if (!applyChunk(event)) {
-        return;
-    }
-
-    streamState.nextExpected =
-        Number(
-            activeGeneration.streamSeqApplied ||
-                0,
-        ) + 1;
-
-    while (
-        streamState.pending.has(
-            streamState.nextExpected,
-        )
-    ) {
-        const nextEvent =
-            streamState.pending.get(
-                streamState.nextExpected,
-            );
-
-        streamState.pending.delete(
-            streamState.nextExpected,
-        );
-
-        if (!applyChunk(nextEvent)) {
-            break;
-        }
-
-        streamState.nextExpected =
-            Number(
-                activeGeneration.streamSeqApplied ||
-                    0,
-            ) + 1;
-    }
-}
-
-function activatePendingRemoteGenerationAfterLocalStop(
-    localGenerationId,
-) {
-    const pending =
-        pendingRemoteGenerationAfterLocalStop;
-
-    if (!pending) {
-        return;
-    }
-
-    if (
-        activeGeneration?.generationId ===
-        localGenerationId
-    ) {
-        return;
-    }
-
-    pendingRemoteGenerationAfterLocalStop =
-        null;
-
-    activateRemoteGeneration(
-        pending,
-    );
-}
-
-function applyRemoteGenerationStopRequested(
-    event,
-) {
-    if (!activeGeneration) {
-        return;
-    }
-
-    if (
-        activeGeneration.generationId !==
-        event.generationId
-    ) {
-        return;
-    }
-
-    if (!isGenerationOwner) {
-        return;
-    }
-
-    try {
-        const ctx =
-            getContext();
-
-        if (
-            typeof ctx.stopGeneration !==
-            'function'
-        ) {
-            warn(
-                'SillyTavern stopGeneration API is unavailable',
-            );
-
-            return;
-        }
-
-        log(
-            'remote stop requested by',
-            event.clientId,
-        );
-
-        Promise.resolve(
-            ctx.stopGeneration(),
-        ).catch((e) =>
-            warn(
-                'remote stop failed',
-                e,
-            ),
-        );
-    } catch (e) {
-        warn(
-            'remote stop request handling failed',
-            e,
-        );
-    }
-}
-
-function applyRemoteGenerationStopped(
-    event,
-) {
-    if (
-        !activeGeneration ||
-        activeGeneration.generationId !==
-            event.generationId
-    ) {
-        return;
-    }
-
-    flushStreamRender(
-        event.generationId,
-        activeGeneration.messageKey,
-    );
-
-    clearStreamRenderTimer(
-        event.generationId,
-    );
-
-    const localGenerationId =
-        activeGeneration.generationId;
-
-    activeGeneration.status =
-        'stopped';
-
-    activeGeneration.endedAt =
-        event.timestamp ||
-        Date.now();
-
-    isGenerationOwner = false;
-
-    finishedGenerationIds.add(
-        localGenerationId,
-    );
-
-    if (
-        finishedGenerationIds.size > 1000
-    ) {
-        const first =
-            finishedGenerationIds
-                .values()
-                .next();
-
-        if (!first.done) {
-            finishedGenerationIds.delete(
-                first.value,
-            );
-        }
-    }
-
-    scheduleChatSave();
-    updateStatusUI();
-
-    if (
-        pendingRemoteGenerationAfterLocalStop
-            ?.generationId
-    ) {
-        const pending =
-            pendingRemoteGenerationAfterLocalStop;
-
-        pendingRemoteGenerationAfterLocalStop =
-            null;
-
-        activateRemoteGeneration(
-            pending,
-        );
-    } else {
-        activeGeneration = null;
-        isGenerationOwner = false;
-    }
-
-    updateStatusUI();
-
-    log(
-        'generation stopped',
-        localGenerationId,
-    );
-}
-
-function applyRemoteGenerationCompleted(
-    event,
-) {
-    if (
-        !activeGeneration ||
-        activeGeneration.generationId !==
-            event.generationId
-    ) {
-        return;
-    }
-
-    flushStreamRender(
-        event.generationId,
-        activeGeneration.messageKey,
-    );
-
-    clearStreamRenderTimer(
-        event.generationId,
-    );
-
-    activeGeneration.status =
-        'completed';
-
-    activeGeneration.endedAt =
-        event.timestamp ||
-        Date.now();
-
-    isGenerationOwner = false;
-
-    finishedGenerationIds.add(
-        activeGeneration.generationId,
-    );
-
-    scheduleChatSave();
-    updateStatusUI();
-
-    activeGeneration = null;
-    isGenerationOwner = false;
-
-    updateStatusUI();
-
-    log(
-        'generation completed',
-        event.generationId,
-    );
-}
-
-function applyRemoteGenerationFailed(
-    event,
-) {
-    if (
-        !activeGeneration ||
-        activeGeneration.generationId !==
-            event.generationId
-    ) {
-        return;
-    }
-
-    flushStreamRender(
-        event.generationId,
-        activeGeneration.messageKey,
-    );
-
-    clearStreamRenderTimer(
-        event.generationId,
-    );
-
-    activeGeneration.status =
-        'failed';
-
-    activeGeneration.endedAt =
-        event.timestamp ||
-        Date.now();
-
-    isGenerationOwner = false;
-
-    finishedGenerationIds.add(
-        activeGeneration.generationId,
-    );
-
-    scheduleChatSave();
-    updateStatusUI();
-
-    activeGeneration = null;
-    isGenerationOwner = false;
-
-    updateStatusUI();
-
-    log(
-        'generation failed',
-        event.generationId,
-    );
-}
-
-function applyRemoteOwnerReleased(
-    event,
-) {
-    if (!activeGeneration) {
-        return;
-    }
-
-    if (
-        activeGeneration.generationId !==
-        event.generationId
-    ) {
-        return;
-    }
-
-    if (
-        activeGeneration.ownerId !==
-        event.payload?.ownerId
-    ) {
-        return;
-    }
-
-    activeGeneration.status =
-        'orphaned';
-
-    activeGeneration.orphanedAt =
-        event.timestamp ||
-        Date.now();
-
-    isGenerationOwner = false;
-
-    updateStatusUI();
-
-    log(
-        'generation owner released',
-        event.generationId,
-    );
-}
-
-function applyRemoteChatReloaded(
-    payload,
-) {
-    const ctx =
-        getContext();
-
-    if (
-        !payload?.chatId ||
-        String(payload.chatId) !==
-            String(ctx.chatId)
-    ) {
-        return;
-    }
-
-    if (
-        typeof ctx.reloadCurrentChat ===
-        'function'
-    ) {
-        isReconcilingChat = true;
-
-        Promise.resolve(
-            ctx.reloadCurrentChat(),
-        )
-            .catch((e) =>
-                warn(
-                    'CHAT_RELOADED reconciliation failed',
-                    e,
-                ),
-            )
-            .finally(() => {
-                isReconcilingChat = false;
-                updateStatusUI();
-            });
-    }
-}
-
-async function requestRemoteStopForGeneration(
-    generationId,
-) {
-    if (
-        !generationId ||
-        !currentChatKey
-    ) {
-        return null;
-    }
-
-    return publishEvent(
-        'GENERATION_STOP_REQUESTED',
-        {
-            requestedBy:
-                CLIENT_ID,
-            requestedAt:
-                Date.now(),
-        },
-        {
-            generationId,
-        },
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Generation publishing queue
-// ---------------------------------------------------------------------------
-
-function enqueueGenerationPublish(
-    generationId,
-    action,
-) {
-    const previous =
-        generationPublishChains.get(
-            generationId,
-        ) ||
-        Promise.resolve();
-
-    const next =
-        previous
-            .catch(() => {})
-            .then(action);
-
-    generationPublishChains.set(
-        generationId,
-        next,
-    );
-
-    next.finally(() => {
-        if (
-            generationPublishChains.get(
-                generationId,
-            ) === next
-        ) {
-            generationPublishChains.delete(
-                generationId,
-            );
-        }
-    }).catch(() => {});
-
-    return next;
-}
-
-// ---------------------------------------------------------------------------
-// Local Event Hooks
-// ---------------------------------------------------------------------------
-
-function onMessageSent(
-    messageId,
-) {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const msg =
-        ctx.chat[messageId];
-
-    if (!msg) {
-        return;
-    }
-
-    const key =
-        getMessageKey(
-            msg,
-            messageId,
-        );
-
-    const anchors =
-        getInsertAnchors(
-            ctx,
-            messageId,
-        );
-
-    void publishEvent(
-        'MESSAGE_SENT',
-        {
-            message:
-                safeClone(msg),
-
-            messageId,
-
-            messageKey:
-                key,
-
-            insertAt:
-                messageId,
-
-            beforeMessageKey:
-                anchors.beforeKey,
-
-            afterMessageKey:
-                anchors.afterKey,
-        },
-    );
-}
-
-function onMessageReceived(
-    messageId,
-) {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const msg =
-        ctx.chat[messageId];
-
-    if (!msg) {
-        return;
-    }
-
-    const key =
-        getMessageKey(
-            msg,
-            messageId,
-        );
-
-    const anchors =
-        getInsertAnchors(
-            ctx,
-            messageId,
-        );
-
-    void publishEvent(
-        'MESSAGE_RECEIVED',
-        {
-            message:
-                safeClone(msg),
-
-            messageId,
-
-            messageKey:
-                key,
-
-            insertAt:
-                messageId,
-
-            beforeMessageKey:
-                anchors.beforeKey,
-
-            afterMessageKey:
-                anchors.afterKey,
-        },
-    );
-}
-
-function onMessageEdited(
-    messageId,
-) {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const msg =
-        ctx.chat[messageId];
-
-    if (!msg) {
-        return;
-    }
-
-    void publishEvent(
-        'MESSAGE_EDITED',
-        {
-            messageId,
-
-            messageKey:
-                getMessageKey(
-                    msg,
-                    messageId,
-                ),
-
-            mes:
-                msg.mes,
-
-            swipes:
-                safeClone(
-                    msg.swipes,
-                ),
-
-            swipe_id:
-                msg.swipe_id,
-
-            extra:
-                safeClone(
-                    msg.extra,
-                ),
-        },
-    );
-}
-
-function onMessageDeleted(
-    arg1,
-    arg2,
-) {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const deletedIds =
-        Array.isArray(arg2)
-            ? arg2.filter(
-                Number.isInteger,
-            )
-            : (
-                Number.isInteger(
-                    arg1,
-                )
-                    ? [arg1]
-                    : []
-            );
-
-    const deletedMessageKeys =
-        [];
-
-    for (
-        const id of deletedIds
-    ) {
-        const msg =
-            ctx.chat[id];
-
-        const key =
-            getMessageKey(
-                msg,
-                id,
-            );
-
-        if (key) {
-            deletedMessageKeys.push(
-                key,
-            );
-        }
-    }
-
-    void publishEvent(
-        'MESSAGE_DELETED',
-        {
-            deletedIds,
-            deletedMessageKeys,
-            newLength:
-                Number.isInteger(
-                    arg1,
-                )
-                    ? arg1
-                    : ctx.chat.length,
-        },
-    );
-}
-
-function onMessageSwiped(
-    messageId,
-) {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    const ctx =
-        getContext();
-
-    const msg =
-        ctx.chat[messageId];
-
-    if (!msg) {
-        return;
-    }
-
-    void publishEvent(
-        'MESSAGE_SWIPED',
-        {
-            messageId,
-
-            messageKey:
-                getMessageKey(
-                    msg,
-                    messageId,
-                ),
-
-            swipe_id:
-                msg.swipe_id,
-
-            swipes:
-                safeClone(
-                    msg.swipes,
-                ),
-        },
-    );
-}
-
-function onChatChanged() {
-    if (isReconcilingChat) {
-        return;
-    }
-
-    const generation =
-        ++chatChangeGeneration;
-
-    leaveGroup();
-
-    window.setTimeout(
-        () => {
+        if (!waitForApp()) {
             if (
-                generation !==
-                chatChangeGeneration
+                document.readyState ===
+                    'loading'
             ) {
-                return;
-            }
-
-            if (
-                !getSettings()
-                    .enabled
-            ) {
-                return;
-            }
-
-            void syncJoinCurrentChat();
-        },
-        CHAT_SWITCH_JOIN_DELAY_MS,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Generation Hooks
-// ---------------------------------------------------------------------------
-
-const GENERATION_ID = () =>
-    `${CLIENT_ID}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-function createLocalGenerationState(
-    id,
-) {
-    return {
-        generationId:
-            id,
-
-        ownerId:
-            CLIENT_ID,
-
-        ownerDevice:
-            DEVICE_ID,
-
-        status:
-            'active',
-
-        startedAt:
-            Date.now(),
-
-        streamSeq:
-            0,
-
-        streamSeqApplied:
-            0,
-
-        serverSequence:
-            null,
-    };
-}
-
-function resolvePendingGenerationConflictForLocalGeneration(
-    generationId,
-    publishResult,
-) {
-    if (
-        !activeGeneration ||
-        activeGeneration.generationId !==
-            generationId
-    ) {
-        return;
-    }
-
-    if (publishResult?.sequence) {
-        activeGeneration.serverSequence =
-            publishResult.sequence;
-    }
-
-    for (
-        const [
-            remoteId,
-            remoteEvent,
-        ] of pendingGenerationConflicts
-    ) {
-        pendingGenerationConflicts.delete(
-            remoteId,
-        );
-
-        if (
-            remoteEvent.generationId ===
-            generationId
-        ) {
-            continue;
-        }
-
-        resolveGenerationConflict(
-            remoteEvent,
-        );
-    }
-}
-
-function onGenerationStarted() {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    const id =
-        GENERATION_ID();
-
-    const generation =
-        createLocalGenerationState(
-            id,
-        );
-
-    activeGeneration =
-        generation;
-
-    isGenerationOwner = true;
-    generationRequestTime =
-        Date.now();
-
-    const ctx =
-        getContext();
-
-    const possibleMessageIndex =
-        ctx.chat.length - 1;
-
-    if (
-        possibleMessageIndex >= 0 &&
-        ctx.chat[
-            possibleMessageIndex
-        ] &&
-        !ctx.chat[
-            possibleMessageIndex
-        ].is_user
-    ) {
-        generation.messageIndex =
-            possibleMessageIndex;
-
-        generation.messageKey =
-            getMessageKey(
-                ctx.chat[
-                    possibleMessageIndex
-                ],
-                possibleMessageIndex,
-            );
-    }
-
-    updateStatusUI();
-
-    void enqueueGenerationPublish(
-        id,
-        async () => {
-            const result =
-                await publishEvent(
-                    'GENERATION_STARTED',
-                    {
-                        messageIndex:
-                            generation.messageIndex,
-
-                        messageKey:
-                            generation.messageKey,
-
-                        message:
-                            generation.messageIndex !==
-                            undefined
-                                ? safeClone(
-                                    ctx.chat[
-                                        generation
-                                            .messageIndex
-                                    ],
-                                )
-                                : null,
+                document.addEventListener(
+                    'DOMContentLoaded',
+                    () => {
+                        void waitForApp();
                     },
-                    {
-                        generationId:
-                            id,
-                    },
+                    { once: true },
                 );
-
-            if (
-                activeGeneration?.generationId ===
-                id
-            ) {
-                activeGeneration.serverSequence =
-                    result?.sequence ??
-                    null;
-
-                resolvePendingGenerationConflictForLocalGeneration(
-                    id,
-                    result,
-                );
-            }
-        },
-    );
-}
-
-async function finalizeLocalGeneration(
-    id,
-    finalType,
-) {
-    if (
-        finishedGenerationIds.has(id)
-    ) {
-        return;
-    }
-
-    const generation =
-        activeGeneration;
-
-    if (
-        !generation ||
-        generation.generationId !== id
-    ) {
-        return;
-    }
-
-    generation.status =
-        finalType ===
-            'GENERATION_COMPLETED'
-            ? 'completing'
-            : 'stopping';
-
-    updateStatusUI();
-
-    await (
-        generationPublishChains.get(
-            id,
-        ) ||
-        Promise.resolve()
-    ).catch(() => {});
-
-    if (
-        !activeGeneration ||
-        activeGeneration.generationId !==
-            id
-    ) {
-        return;
-    }
-
-    const result =
-        await publishEvent(
-            finalType,
-            {},
-            {
-                generationId:
-                    id,
-            },
-        );
-
-    if (!result) {
-        warn(
-            'generation lifecycle event could not be published',
-            finalType,
-            id,
-        );
-    }
-
-    finishedGenerationIds.add(
-        id,
-    );
-
-    clearStreamRenderTimer(
-        id,
-    );
-
-    flushStreamRender(
-        id,
-        generation.messageKey,
-    );
-
-    scheduleChatSave();
-
-    activeGeneration = null;
-    isGenerationOwner = false;
-
-    activatePendingRemoteGenerationAfterLocalStop(
-        id,
-    );
-
-    updateStatusUI();
-}
-
-function onGenerationStopped() {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    if (!activeGeneration) {
-        return;
-    }
-
-    const id =
-        activeGeneration.generationId;
-
-    if (
-        finishedGenerationIds.has(id)
-    ) {
-        activeGeneration = null;
-        isGenerationOwner = false;
-
-        activatePendingRemoteGenerationAfterLocalStop(
-            id,
-        );
-
-        updateStatusUI();
-
-        return;
-    }
-
-    void finalizeLocalGeneration(
-        id,
-        'GENERATION_STOPPED',
-    );
-}
-
-function onGenerationEnded() {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    if (!activeGeneration) {
-        return;
-    }
-
-    const id =
-        activeGeneration.generationId;
-
-    if (
-        finishedGenerationIds.has(id)
-    ) {
-        activeGeneration = null;
-        isGenerationOwner = false;
-
-        activatePendingRemoteGenerationAfterLocalStop(
-            id,
-        );
-
-        updateStatusUI();
-
-        return;
-    }
-
-    void finalizeLocalGeneration(
-        id,
-        'GENERATION_COMPLETED',
-    );
-}
-
-function onStreamTokenReceived(
-    token,
-) {
-    if (
-        isApplyingRemote ||
-        isReconcilingChat
-    ) {
-        return;
-    }
-
-    if (
-        !activeGeneration ||
-        !isGenerationOwner ||
-        activeGeneration.status !==
-            'active'
-    ) {
-        return;
-    }
-
-    const generationId =
-        activeGeneration.generationId;
-
-    const ctx =
-        getContext();
-
-    let messageIndex =
-        findGenerationMessageIndex(
-            activeGeneration,
-            {},
-        );
-
-    let message =
-        messageIndex >= 0
-            ? ctx.chat[messageIndex]
-            : null;
-
-    const streamSeq =
-        Number(
-            activeGeneration.streamSeq ||
-                0,
-        ) + 1;
-
-    activeGeneration.streamSeq =
-        streamSeq;
-
-    activeGeneration.streamSeqApplied =
-        streamSeq;
-
-    if (
-        messageIndex >= 0 &&
-        message
-    ) {
-        activeGeneration.messageIndex =
-            messageIndex;
-
-        activeGeneration.messageKey =
-            activeGeneration.messageKey ||
-            getMessageKey(
-                message,
-                messageIndex,
-            );
-    }
-
-    const payload = {
-        chunk:
-            String(token ?? ''),
-
-        messageId:
-            messageIndex >= 0
-                ? messageIndex
-                : null,
-
-        messageKey:
-            activeGeneration.messageKey ||
-            null,
-
-        message:
-            messageIndex >= 0 &&
-            message
-                ? safeClone(
-                    message,
-                )
-                : null,
-
-        insertAt:
-            messageIndex >= 0
-                ? messageIndex
-                : null,
-    };
-
-    void enqueueGenerationPublish(
-        generationId,
-        () =>
-            publishEvent(
-                'GENERATION_STREAM',
-                payload,
-                {
-                    generationId,
-                    streamSeq,
-                },
-            ),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Event Source Wiring
-// ---------------------------------------------------------------------------
-
-function wireEvents() {
-    if (
-        event_types.MESSAGE_SENT
-    ) {
-        eventSource.on(
-            event_types.MESSAGE_SENT,
-            onMessageSent,
-        );
-    }
-
-    if (
-        event_types.MESSAGE_RECEIVED
-    ) {
-        eventSource.on(
-            event_types.MESSAGE_RECEIVED,
-            onMessageReceived,
-        );
-    }
-
-    if (
-        event_types.MESSAGE_EDITED
-    ) {
-        eventSource.on(
-            event_types.MESSAGE_EDITED,
-            onMessageEdited,
-        );
-    }
-
-    if (
-        event_types.MESSAGE_DELETED
-    ) {
-        eventSource.on(
-            event_types.MESSAGE_DELETED,
-            onMessageDeleted,
-        );
-    }
-
-    if (
-        event_types.MESSAGE_SWIPED
-    ) {
-        eventSource.on(
-            event_types.MESSAGE_SWIPED,
-            onMessageSwiped,
-        );
-    }
-
-    if (
-        event_types.CHAT_CHANGED
-    ) {
-        eventSource.on(
-            event_types.CHAT_CHANGED,
-            onChatChanged,
-        );
-    }
-
-    if (
-        event_types.GENERATION_STARTED
-    ) {
-        eventSource.on(
-            event_types.GENERATION_STARTED,
-            onGenerationStarted,
-        );
-    }
-
-    if (
-        event_types.GENERATION_STOPPED
-    ) {
-        eventSource.on(
-            event_types.GENERATION_STOPPED,
-            onGenerationStopped,
-        );
-    }
-
-    if (
-        event_types.GENERATION_ENDED
-    ) {
-        eventSource.on(
-            event_types.GENERATION_ENDED,
-            onGenerationEnded,
-        );
-    }
-
-    if (
-        event_types.STREAM_TOKEN_RECEIVED
-    ) {
-        eventSource.on(
-            event_types.STREAM_TOKEN_RECEIVED,
-            onStreamTokenReceived,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// UI
-// ---------------------------------------------------------------------------
-
-function createStatusUI() {
-    const container =
-        document.getElementById(
-            'top-bar',
-        ) ||
-        document.getElementById(
-            'top-settings-holder',
-        ) ||
-        document.body;
-
-    if (!container) {
-        return;
-    }
-
-    const existing =
-        document.getElementById(
-            'mcs-status',
-        );
-
-    if (existing) {
-        existing.remove();
-    }
-
-    const el =
-        document.createElement(
-            'div',
-        );
-
-    el.id =
-        'mcs-status';
-
-    el.className =
-        'mcs-status mcs-disconnected';
-
-    el.title =
-        'Multi-Client Sync';
-
-    el.tabIndex = 0;
-
-    el.setAttribute(
-        'role',
-        'button',
-    );
-
-    el.setAttribute(
-        'aria-label',
-        'Multi-Client Sync status',
-    );
-
-    el.textContent = '●';
-
-    const stopRemote =
-        () => {
-            if (
-                !activeGeneration ||
-                isGenerationOwner
-            ) {
-                return;
-            }
-
-            void requestRemoteStopForGeneration(
-                activeGeneration.generationId,
-            );
-        };
-
-    el.addEventListener(
-        'click',
-        stopRemote,
-    );
-
-    el.addEventListener(
-        'keydown',
-        (event) => {
-            if (
-                event.key === 'Enter' ||
-                event.key === ' '
-            ) {
-                event.preventDefault();
-                stopRemote();
-            }
-        },
-    );
-
-    container.appendChild(el);
-
-    updateStatusUI();
-}
-
-function updateStatusUI() {
-    const el =
-        document.getElementById(
-            'mcs-status',
-        );
-
-    if (!el) {
-        return;
-    }
-
-    const settings =
-        getSettings();
-
-    if (
-        !settings.showStatusIndicator
-    ) {
-        el.style.display =
-            'none';
-
-        return;
-    }
-
-    el.style.display = '';
-    el.style.cursor =
-        'default';
-
-    let statusClass =
-        'mcs-disconnected';
-
-    const text =
-        '●';
-
-    let title =
-        'Sync: disconnected';
-
-    if (!settings.enabled) {
-        statusClass =
-            'mcs-disabled';
-
-        title =
-            'Sync: disabled';
-    } else if (isConnected) {
-        if (activeGeneration) {
-            if (isGenerationOwner) {
-                statusClass =
-                    'mcs-owner';
-
-                title =
-                    'Sync: generating (owner)';
-            } else if (
-                activeGeneration.status ===
-                'orphaned'
-            ) {
-                statusClass =
-                    'mcs-streaming';
-
-                title =
-                    'Sync: generation owner released; click to request stop/cleanup';
             } else {
-                statusClass =
-                    'mcs-streaming';
-
-                title =
-                    'Sync: streaming (remote) — click to stop remote generation';
-
-                el.style.cursor =
-                    'pointer';
+                setTimeout(
+                    () => {
+                        void waitForApp();
+                    },
+                    0,
+                );
             }
-        } else {
-            statusClass =
-                'mcs-connected';
-
-            title =
-                'Sync: connected';
         }
+    } catch (error) {
+        console.error(
+            '[MultiClientSync] startup failed',
+            error,
+        );
     }
-
-    el.className =
-        `mcs-status ${statusClass}`;
-
-    el.textContent =
-        text;
-
-    el.title =
-        title;
-
-    el.setAttribute(
-        'aria-label',
-        title,
-    );
-}
-
-function createSettingsUI() {
-    const settings =
-        getSettings();
-
-    const container =
-        document.getElementById(
-            'extensions_settings',
-        );
-
-    if (!container) {
-        return;
-    }
-
-    const existing =
-        container.querySelector(
-            `#${EXTENSION_NAME}-settings`,
-        );
-
-    if (existing) {
-        existing.remove();
-    }
-
-    const wrapper =
-        document.createElement(
-            'div',
-        );
-
-    wrapper.id =
-        `${EXTENSION_NAME}-settings`;
-
-    wrapper.innerHTML = `
-    <div class="mcs-settings">
-        <h3>${t('Multi-Client Sync')}</h3>
-
-        <label class="checkbox_label">
-            <input
-                type="checkbox"
-                id="mcs-enabled"
-                ${settings.enabled ? 'checked' : ''}
-            >
-            <span>
-                ${t('Enable synchronization')}
-            </span>
-        </label>
-
-        <label class="checkbox_label">
-            <input
-                type="checkbox"
-                id="mcs-debug"
-                ${settings.debugLogging ? 'checked' : ''}
-            >
-            <span>
-                ${t('Debug logging')}
-            </span>
-        </label>
-
-        <label class="checkbox_label">
-            <input
-                type="checkbox"
-                id="mcs-indicator"
-                ${settings.showStatusIndicator ? 'checked' : ''}
-            >
-            <span>
-                ${t('Show status indicator')}
-            </span>
-        </label>
-
-        <div class="mcs-info">
-            <small>
-                Client:
-                <code>
-                    ${escapeHtml(
-                        CLIENT_ID.slice(
-                            0,
-                            12,
-                        ),
-                    )}…
-                </code>
-
-                |
-                Device:
-                <code>
-                    ${escapeHtml(
-                        DEVICE_ID,
-                    )}
-                </code>
-            </small>
-        </div>
-    </div>`;
-
-    container.appendChild(
-        wrapper,
-    );
-
-    wrapper
-        .querySelector(
-            '#mcs-enabled',
-        )
-        ?.addEventListener(
-            'change',
-            (event) => {
-                settings.enabled =
-                    event.target.checked;
-
-                if (settings.enabled) {
-                    ++connectionGeneration;
-
-                    void syncJoinCurrentChat(
-                        {
-                            force: true,
-                        },
-                    );
-                } else {
-                    leaveGroup();
-                }
-
-                updateStatusUI();
-            },
-        );
-
-    wrapper
-        .querySelector(
-            '#mcs-debug',
-        )
-        ?.addEventListener(
-            'change',
-            (event) => {
-                settings.debugLogging =
-                    event.target.checked;
-            },
-        );
-
-    wrapper
-        .querySelector(
-            '#mcs-indicator',
-        )
-        ?.addEventListener(
-            'change',
-            (event) => {
-                settings.showStatusIndicator =
-                    event.target.checked;
-
-                updateStatusUI();
-            },
-        );
-}
-
-// ---------------------------------------------------------------------------
-// Init / lifecycle
-// ---------------------------------------------------------------------------
-
-jQuery(() => {
-    initBroadcastChannel();
-    wireEvents();
-    createStatusUI();
-    createSettingsUI();
-
-    window.setTimeout(
-        () => {
-            if (
-                getSettings().enabled
-            ) {
-                void syncJoinCurrentChat(
-                    {
-                        force: true,
-                    },
-                );
-            }
-        },
-        INITIAL_JOIN_DELAY_MS,
-    );
-
-    window.addEventListener(
-        'beforeunload',
-        () => {
-            /*
-             * Best-effort owner release +
-             * membership cleanup.
-             *
-             * The server heartbeat still needs
-             * to be the hard fallback for crashes
-             * and suspended clients.
-             */
-            leaveGroup();
-        },
-    );
-
-    document.addEventListener(
-        'visibilitychange',
-        () => {
-            if (
-                document.visibilityState !==
-                'visible'
-            ) {
-                return;
-            }
-
-            if (
-                !getSettings().enabled
-            ) {
-                return;
-            }
-
-            const desiredChatKey =
-                getCurrentDesiredChatKey();
-
-            if (!desiredChatKey) {
-                return;
-            }
-
-            if (
-                !isCurrentChatKey(
-                    desiredChatKey,
-                ) ||
-                !isConnected
-            ) {
-                ++connectionGeneration;
-
-                void syncJoinCurrentChat(
-                    {
-                        force: true,
-                        expectedChatKey:
-                            desiredChatKey,
-                    },
-                );
-            }
-        },
-    );
-});
+})();
