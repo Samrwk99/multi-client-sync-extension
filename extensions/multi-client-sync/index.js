@@ -77,6 +77,7 @@ let generationInputOpId = null;
 let scopeTransitionChain = Promise.resolve();
 let coordinatedSendInProgress = false;
 let coordinatedNativeSendDepth = 0;
+let membershipRecoveryPromise = null;
 
 function getContext() { return SillyTavern.getContext(); }
 function log(...args) { if (settings?.debug) console.debug(`[${EXTENSION_ID}]`, ...args); }
@@ -462,6 +463,39 @@ async function api(route, options = {}) {
         throw error;
     }
     return data;
+}
+async function recoverCurrentMembership(expectedScope = currentScope) {
+    const target = getCurrentScope() || expectedScope;
+    if (!target || !settings?.enabled || !serverCompatible) return false;
+    if (!sameScope(target, currentScope)) {
+        await switchScope(target);
+        return sameScope(target, currentScope) && !!currentState?.subscriptionToken;
+    }
+    if (membershipRecoveryPromise) return membershipRecoveryPromise;
+    membershipRecoveryPromise = (async () => {
+        const expectedEpoch = scopeEpoch;
+        const expectedTarget = clone(target);
+        try {
+            closeSse();
+            stopHeartbeat();
+            const joined = await joinScope(expectedTarget, expectedEpoch);
+            if (joined && scopeIsCurrent(expectedEpoch, expectedTarget)) {
+                lastError = '';
+                updateUi();
+                updateInfo();
+                return true;
+            }
+            return false;
+        } catch (error) {
+            lastError = error.message || 'Scope membership recovery failed';
+            updateUi();
+            updateInfo();
+            return false;
+        }
+    })().finally(() => {
+        membershipRecoveryPromise = null;
+    });
+    return membershipRecoveryPromise;
 }
 function eventBody(type, extra = {}, scope = currentScope) {
     return { protocol: PROTOCOL, schema: SCHEMA, type, clientId, deviceId, scope: clone(scope), ...extra };
@@ -1127,12 +1161,20 @@ async function refreshServerState(expectedEpoch) {
     const scopeAtStart = clone(currentScope);
     if (!scopeAtStart || !scopeIsCurrent(expectedEpoch, scopeAtStart)) return null;
     try {
-        const data = await api('/state', { method: 'POST', body: JSON.stringify({ scope: scopeAtStart, clientId, deviceId }) });
+        const data = await api('/state', { method: 'POST', body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope: scopeAtStart, clientId, deviceId }) });
         if (!scopeIsCurrent(expectedEpoch, scopeAtStart)) return null;
         await setServerState(data.state, data.cursor);
         await applyActiveGenerationPreview(data.state?.generation, expectedEpoch, 'refresh-generation-preview', data.state?.chatMetadata);
         return data.state;
-    } catch (error) { lastError = error.message; updateInfo(); return null; }
+    } catch (error) {
+        if (error.code === 'not_member') {
+            const recovered = await recoverCurrentMembership(scopeAtStart);
+            if (recovered && scopeIsCurrent(expectedEpoch, scopeAtStart)) {
+                return refreshServerState(expectedEpoch);
+            }
+        }
+        lastError = error.message; updateInfo(); return null;
+    }
 }
 
 async function flushQueue(expectedEpoch = scopeEpoch) {
@@ -1185,7 +1227,11 @@ async function flushQueue(expectedEpoch = scopeEpoch) {
                     await putOperation(operation);
                     continue;
                 }
-                if (error.code === 'not_member' || error.code === 'unauthenticated') { await reconnectCurrentScope(); break; }
+                if (error.code === 'not_member' || error.code === 'unauthenticated') {
+                    const recovered = await recoverCurrentMembership(currentScope);
+                    if (recovered) continue;
+                    break;
+                }
                 if (error.code === 'generation_active') break;
                 if (error.code === 'branch_host_missing') break;
                 warn('queue flush failed', error);
@@ -1514,7 +1560,13 @@ async function resyncCurrentScope(options = {}) {
         if (serverState.generation && currentGenerationIsRemote()) await applyActiveGenerationPreview(serverState.generation, expectedEpoch, 'resync-generation-preview', serverState.chatMetadata);
         await flushQueue(expectedEpoch);
         return true;
-    } catch (error) { lastError = error.message; updateInfo(); return false; }
+    } catch (error) {
+        if (error.code === 'not_member') {
+            const recovered = await recoverCurrentMembership(expectedScope);
+            if (recovered) return resyncCurrentScope(options);
+        }
+        lastError = error.message; updateInfo(); return false;
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1708,7 +1760,13 @@ async function joinScope(scope, expectedEpoch) {
 
 async function leaveScope(scope) {
     if (!scope || !serverCompatible) return;
-    try { await api('/leave', { method: 'POST', body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope, clientId, deviceId }) }); } catch {}
+    const subscriptionToken = sameScope(scope, currentScope) ? String(currentState?.subscriptionToken || '') : '';
+    try {
+        await api('/leave', {
+            method: 'POST',
+            body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope, clientId, deviceId, ...(subscriptionToken ? { subscriptionToken } : {}) }),
+        });
+    } catch {}
 }
 async function switchScope(nextScope) {
     const previousScope = clone(currentScope);
@@ -1832,7 +1890,11 @@ async function sendHeartbeat() {
         }
 
         updateUi();
-    } catch {
+    } catch (error) {
+        if (error.code === 'not_member') {
+            await recoverCurrentMembership(expectedScope);
+            return;
+        }
         scheduleReconnect(expectedEpoch);
     }
 }
@@ -2061,6 +2123,10 @@ async function sendGenerationInput(expectedEpoch = scopeEpoch, expectedScope = c
             await setServerState(result.state, { epoch: result.epoch, revision: result.revision, lastEventId: result.eventId });
             return true;
         } catch (error) {
+            if (error.code === 'not_member') {
+                const recovered = await recoverCurrentMembership(expectedScope);
+                if (recovered) continue;
+            }
             if (error.code === 'revision_conflict' || error.code === 'stale_host' || error.code === 'stale_host_metadata') {
                 await refreshServerState(expectedEpoch);
                 continue;
@@ -2107,6 +2173,10 @@ async function claimGeneration(generationType = 'normal') {
                 await resyncCurrentScope({ discardLocal: true });
                 return false;
             }
+            if (error.code === 'not_member') {
+                const recovered = await recoverCurrentMembership(scopeAtStart);
+                if (recovered) continue;
+            }
             if (attempt < 2 && (!error.status || error.status >= 500)) { await sleep(150 * (attempt + 1)); continue; }
             warn('generation claim failed', error);
             return false;
@@ -2127,6 +2197,10 @@ async function acknowledgeGenerationStarted(type) {
             updateUi(); updateInfo();
             return true;
         } catch (error) {
+            if (error.code === 'not_member') {
+                const recovered = await recoverCurrentMembership(scopeAtStart);
+                if (recovered) continue;
+            }
             if (['generation_mismatch', 'no_generation', 'not_generation_owner'].includes(error.code)) {
                 await stopLostGeneration();
                 return false;
@@ -2290,6 +2364,10 @@ async function sendGenerationStream(message, expectedEpoch = scopeEpoch, expecte
             updateUi();
             return true;
         } catch (error) {
+            if (error.code === 'not_member') {
+                const recovered = await recoverCurrentMembership(expectedScope);
+                if (recovered) continue;
+            }
             if (['generation_mismatch', 'not_generation_owner', 'no_generation'].includes(error.code)) { await stopLostGeneration(); return false; }
             if (error.code === 'stream_sequence_gap') {
                 await refreshServerState(expectedEpoch);
@@ -2424,6 +2502,10 @@ async function requestSharedGenerationStop() {
         });
         toast('success', 'Stopping the synchronized generation.');
     } catch (error) {
+        if (error.code === 'not_member') {
+            const recovered = await recoverCurrentMembership(currentScope);
+            if (recovered) return requestSharedGenerationStop();
+        }
         warn('shared generation stop request failed', error);
     }
 }
@@ -2543,6 +2625,10 @@ async function sendChatLifecycleEvent(type, scope, extra = {}) {
         }, scope)) });
         return true;
     } catch (error) {
+        if (error.code === 'not_member') {
+            const recovered = await recoverCurrentMembership(scope);
+            if (recovered) return sendChatLifecycleEvent(type, scope, extra);
+        }
         warn(`${type} synchronization failed`, error);
         return false;
     }
