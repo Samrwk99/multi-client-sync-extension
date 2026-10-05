@@ -1,14 +1,43 @@
+.mcs-settings {
+    padding: 10px;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 8px;
+    margin-top: 10px;
+}
+
+.mcs-settings h3 {
+    margin: 0 0 10px;
+    font-size: 14px;
+}
+
+.mcs-status-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 20px;
+    margin-bottom: 8px;
+}
+
 .mcs-status {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 12px;
     height: 12px;
+    flex: 0 0 auto;
     border-radius: 50%;
-    margin-left: 8px;
-    font-size: 10px;
     cursor: default;
-    transition: background-color 0.3s ease;
+    transition:
+        background-color 0.2s ease,
+        box-shadow 0.2s ease,
+        opacity 0.2s ease;
+}
+
+.mcs-state-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .mcs-connected {
@@ -38,22 +67,9 @@
     animation: mcs-pulse 1.5s infinite;
 }
 
-@keyframes mcs-pulse {
-    0% { opacity: 1; }
-    50% { opacity: 0.5; }
-    100% { opacity: 1; }
-}
-
-.mcs-settings {
-    padding: 10px;
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    border-radius: 8px;
-    margin-top: 10px;
-}
-
-.mcs-settings h3 {
-    margin: 0 0 10px 0;
-    font-size: 14px;
+.mcs-warning {
+    background-color: #ffc107;
+    box-shadow: 0 0 6px #ffc107;
 }
 
 .mcs-settings .checkbox_label {
@@ -65,6 +81,40 @@
 }
 
 .mcs-info {
-    margin-top: 8px;
+    margin: 8px 0;
     color: var(--SmartThemeBodyColor, #aaa);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.mcs-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.mcs-actions button {
+    margin: 0;
+}
+
+@keyframes mcs-pulse {
+    0% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+
+    100% {
+        opacity: 1;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mcs-owner,
+    .mcs-streaming {
+        animation: none;
+    }
 }

@@ -1,574 +1,217 @@
-/**
- * Multi-Client Sync — SillyTavern UI extension
- *
- * The extension is intentionally dependency-soft:
- *
- *   plugin present + compatible -> synchronization enabled
- *   plugin missing             -> show "Server plugin required", do nothing
- *   plugin incompatible        -> show "Plugin incompatible", do nothing
- *
- * Ordinary SillyTavern continues functioning in all of those cases.
- *
- * Uses:
- * - SillyTavern.getContext()
- * - ST public event API
- * - ST public save path
- * - ST public generation interceptor
- * - SSE for authoritative live transport
- * - BroadcastChannel as an optimization only
- * - IndexedDB for durable pending local operations
- *
- * The server is authoritative for:
- * - user
- * - scope
- * - revision
- * - event sequence
- * - generation ownership
- * - generation lease
- *
- * The browser remains authoritative only for its own unacknowledged local
- * changes until the server accepts/rebases them.
- */
-
-const EXTENSION_ID =
-    'multi-client-sync';
+const EXTENSION_ID = 'multi-client-sync';
 
 const PLUGIN_BASE =
     '/api/plugins/multi-client-sync';
 
-const PROTOCOL_VERSION =
-    4;
+const PROTOCOL = 6;
+const SCHEMA = 6;
 
 const DB_NAME =
-    'multi-client-sync-v4';
+    'multi-client-sync';
 
-const DB_VERSION =
-    2;
+const DB_VERSION = 6;
 
-const MESSAGE_NAMESPACE =
-    'multi_client_sync';
+const DEVICE_STORAGE_KEY =
+    `${EXTENSION_ID}:device-id`;
 
-const MAX_LOCAL_QUEUE =
-    200;
+const CLIENT_STORAGE_KEY =
+    `${EXTENSION_ID}:client-id`;
 
-const MAX_PENDING_BYTES =
-    64 * 1024 * 1024;
+const MAX_QUEUE = 1_000;
 
-const HEARTBEAT_MS =
-    10_000;
+const SNAPSHOT_CAPTURE_DELAY = 100;
 
-const STREAM_FLUSH_MS =
-    160;
+const REMOTE_APPLY_TIMEOUT =
+    15_000;
 
-const RESYNC_DELAY_MS =
-    120;
+const defaultSettings = Object.freeze({
+    enabled: true,
+    autoConnect: true,
 
-const PLUGIN_RETRY_MS =
-    30_000;
+    syncMessages: true,
+    syncMetadata: true,
+    syncSwipes: true,
 
-const MAX_RECONNECT_MS =
-    30_000;
+    syncGroupSettings: true,
+    syncBranches: true,
 
-const DEFAULT_SETTINGS =
-    Object.freeze({
-        enabled:
-            true,
+    coordinateGeneration: true,
+    remoteStop: true,
 
-        debug:
-            false,
-    });
-
-
-/* -------------------------------------------------------------------------- */
-/* Runtime                                                                    */
-/* -------------------------------------------------------------------------- */
+    notifications: true,
+    debug: false,
+});
 
 let ctx = null;
+let settings = null;
 
-let startPromise =
-    null;
+let started = false;
+let startPromise = null;
 
-let started =
-    false;
+let serverAvailable = false;
+let serverCompatible = false;
+let serverUserId = null;
 
-let stopping =
-    false;
+let currentScope = null;
+let currentState = null;
 
-let pluginAvailable =
-    false;
+let scopeEpoch = 0;
 
-let principalKey =
-    null;
-
-let subscriptionToken =
-    null;
-
-let currentScope =
-    null;
-
-let currentState =
-    null;
-
-let scopeEpoch =
-    0;
-
-let reconnectTimer =
-    null;
-
-let pluginRetryTimer =
-    null;
-
-let heartbeatTimer =
-    null;
-
-let resyncTimer =
-    null;
-
-let streamTimer =
-    null;
-
-let finalizationTimer =
-    null;
-
-let eventSource =
-    null;
-
-let broadcastChannel =
-    null;
-
-let reconnectAttempt =
-    0;
-
-let applyingRemoteDepth =
-    0;
-
-let queueDrainPromise =
-    null;
-
-let resyncPromise =
-    null;
-
-let saveChain =
+let sse = null;
+let sseReconnectTimer = null;
+let reconnectAttempt = 0;
+let sseEventChain =
     Promise.resolve();
 
+let heartbeatTimer = null;
+let generationHeartbeatTimer = null;
+
+let localGeneration = null;
+let localGenerationLost = false;
+
+let finishingGeneration = false;
+
+let applyingRemoteDepth = 0;
+let hostMessageIdsDirty = false;
+
+let captureTimer = null;
+let captureScheduled = false;
+
+let streamTimer = null;
 let streamFlushPromise =
-    null;
+    Promise.resolve();
 
-let latestStreamSnapshot =
-    null;
+let pendingStreamMessage = null;
 
-let latestStreamReason =
-    null;
+let uiRoot = null;
 
-let localGenerationId =
-    null;
+let listenerBindings = [];
+let browserBindings = [];
 
-let localGenerationLost =
-    false;
+let broadcastChannel = null;
 
-let localStopRequested =
-    false;
+let dbPromise = null;
 
-let generationTerminalizing =
-    new Set();
+let lastError = '';
 
-let lastEventId =
-    null;
+function getContext() {
+    return SillyTavern.getContext();
+}
 
-let lastEpoch =
-    null;
-
-let lastSeq =
-    0;
-
-let lastRevision =
-    0;
-
-let localSequence =
-    0;
-
-let browserListeners =
-    [];
-
-let stListeners =
-    [];
-
-let uiRoot =
-    null;
-
-
-/* -------------------------------------------------------------------------- */
-/* Basic utilities                                                            */
-/* -------------------------------------------------------------------------- */
-
-function log(
-    ...args
-) {
-    if (
-        getSettings().debug
-    ) {
+function log(...args) {
+    if (settings?.debug) {
         console.debug(
-            '[MultiClientSync]',
+            `[${EXTENSION_ID}]`,
             ...args,
         );
     }
 }
 
-function warn(
-    ...args
-) {
+function warn(...args) {
     console.warn(
-        '[MultiClientSync]',
+        `[${EXTENSION_ID}]`,
         ...args,
     );
 }
 
-function clone(
-    value,
+function toast(
+    type,
+    message,
 ) {
-    if (
-        value === undefined
-    ) {
+    if (!settings?.notifications) {
+        return;
+    }
+
+    try {
+        toastr[type]?.(
+            message,
+            'Multi-Client Sync',
+        );
+    } catch {}
+}
+
+function clone(value) {
+    if (value === undefined) {
         return undefined;
     }
 
-    if (
-        typeof structuredClone ===
-        'function'
-    ) {
-        try {
-            return structuredClone(
-                value,
-            );
-        } catch {
-            // fallback
-        }
-    }
-
-    return JSON.parse(
-        JSON.stringify(
-            value,
-        ),
-    );
+    return structuredClone(value);
 }
 
-function stableStringify(
-    value,
+function now() {
+    return Date.now();
+}
+
+function randomId(
+    prefix = '',
 ) {
     if (
-        value === null ||
-        typeof value !==
-            'object'
+        globalThis.crypto
+        ?.randomUUID
     ) {
-        return JSON.stringify(
-            value,
+        return (
+            prefix
+            + globalThis.crypto
+                .randomUUID()
+                .replaceAll(
+                    '-',
+                    '',
+                )
         );
     }
 
-    if (
-        Array.isArray(value)
-    ) {
-        return `[${value.map(
-            stableStringify,
-        ).join(',')}]`;
-    }
-
-    return `{${Object.keys(value)
-        .sort()
-        .map(
-            key =>
-                `${JSON.stringify(
-                    key,
-                )}:${stableStringify(
-                    value[key],
-                )}`,
-        )
-        .join(',')}}`;
+    return (
+        prefix
+        + Date.now().toString(36)
+        + Math.random()
+            .toString(36)
+            .slice(2)
+        + Math.random()
+            .toString(36)
+            .slice(2)
+    );
 }
 
 async function sha256(
     value,
 ) {
-    const stringValue =
-        typeof value ===
-            'string'
-            ? value
-            : stableStringify(
-                value,
-            );
-
     const bytes =
         new TextEncoder().encode(
-            stringValue,
+            String(value),
         );
 
-    const digest =
-        await crypto.subtle.digest(
-            'SHA-256',
-            bytes,
-        );
-
-    return Array
-        .from(
-            new Uint8Array(
-                digest,
-            ),
-        )
-        .map(
-            byte =>
-                byte
-                    .toString(16)
-                    .padStart(
-                        2,
-                        '0',
-                    ),
-        )
-        .join('');
-}
-
-function uuid() {
     if (
-        crypto.randomUUID
+        globalThis.crypto
+            ?.subtle
     ) {
-        return crypto.randomUUID();
-    }
-
-    return (
-        `${Date.now()
-            .toString(36)}-` +
-        `${Math.random()
-            .toString(36)
-            .slice(2)}-` +
-        `${Math.random()
-            .toString(36)
-            .slice(2)}`
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Client/device identity                                                     */
-/* -------------------------------------------------------------------------- */
-
-function loadIdentity() {
-    let storedDeviceId =
-        localStorage.getItem(
-            `${EXTENSION_ID}:deviceId`,
-        );
-
-    if (!storedDeviceId) {
-        storedDeviceId =
-            uuid();
-
-        try {
-            localStorage.setItem(
-                `${EXTENSION_ID}:deviceId`,
-                storedDeviceId,
-            );
-        } catch {
-            // storage unavailable
-        }
-    }
-
-    let storedClientId =
-        sessionStorage.getItem(
-            `${EXTENSION_ID}:clientId`,
-        );
-
-    if (!storedClientId) {
-        storedClientId =
-            uuid();
-
-        try {
-            sessionStorage.setItem(
-                `${EXTENSION_ID}:clientId`,
-                storedClientId,
-            );
-        } catch {
-            // storage unavailable
-        }
-    }
-
-    return {
-        deviceId:
-            storedDeviceId,
-
-        clientId:
-            storedClientId,
-    };
-}
-
-const identity =
-    loadIdentity();
-
-const deviceId =
-    identity.deviceId;
-
-const clientId =
-    identity.clientId;
-
-
-/* -------------------------------------------------------------------------- */
-/* Settings                                                                   */
-/* -------------------------------------------------------------------------- */
-
-function getSettings() {
-    const settings =
-        ctx?.extensionSettings || {};
-
-    if (
-        !settings[
-            EXTENSION_ID
-        ]
-    ) {
-        settings[
-            EXTENSION_ID
-        ] =
-            structuredClone(
-                DEFAULT_SETTINGS,
-            );
-    }
-
-    for (
-        const [
-            key,
-            value,
-        ] of Object.entries(
-            DEFAULT_SETTINGS,
-        )
-    ) {
-        if (
-            !Object.hasOwn(
-                settings[
-                    EXTENSION_ID
-                ],
-                key,
-            )
-        ) {
-            settings[
-                EXTENSION_ID
-            ][key] =
-                value;
-        }
-    }
-
-    return settings[
-        EXTENSION_ID
-    ];
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Scope                                                                     */
-/* -------------------------------------------------------------------------- */
-
-function getCurrentScope() {
-    if (!ctx) {
-        return null;
-    }
-
-    const chatId =
-        ctx.chatId ??
-        ctx.getCurrentChatId?.();
-
-    if (
-        chatId ==
-            null ||
-        chatId ===
-            ''
-    ) {
-        return null;
-    }
-
-    const groupId =
-        ctx.groupId !=
-            null &&
-        String(
-            ctx.groupId,
-        ) !==
-            ''
-            ? String(
-                ctx.groupId,
-            )
-            : null;
-
-    let characterId =
-        null;
-
-    if (
-        groupId ===
-            null &&
-        ctx.characterId !=
-            null
-    ) {
-        const character =
-            ctx.characters?.[
-                ctx.characterId
-            ];
-
-        if (
-            character?.avatar
-        ) {
-            characterId =
-                String(
-                    character.avatar,
+        const hash =
+            await globalThis.crypto
+                .subtle
+                .digest(
+                    'SHA-256',
+                    bytes,
                 );
-        }
+
+        return [
+            ...new Uint8Array(hash),
+        ]
+            .map(
+                byte =>
+                    byte
+                        .toString(16)
+                        .padStart(
+                            2,
+                            '0',
+                        ),
+            )
+            .join('');
     }
 
-    if (
-        groupId ===
-            null &&
-        !characterId
-    ) {
-        return null;
-    }
-
-    const metadata =
-        ctx.chatMetadata || {};
-
-    const branchId =
-        metadata.main_chat
-            ? (
-                metadata.integrity
-                    ? String(
-                        metadata.integrity,
-                    )
-                    : null
-            )
-            : null;
-
-    const parentChatId =
-        metadata.main_chat
-            ? String(
-                metadata.main_chat,
-            )
-            : null;
-
-    return {
-        scopeType:
-            groupId !==
-                null
-                ? 'group'
-                : 'character',
-
-        characterId:
-            groupId !==
-                null
-                ? null
-                : characterId,
-
-        groupId,
-
-        chatId:
-            String(
-                chatId,
-            ),
-
-        branchId,
-
-        parentChatId,
-    };
+    /*
+     * Modern ST browsers normally expose WebCrypto.
+     * Without it, do not pretend this fallback is SHA-256.
+     */
+    return null;
 }
 
 function sameScope(
@@ -576,626 +219,1175 @@ function sameScope(
     b,
 ) {
     return (
-        Boolean(a) &&
-        Boolean(b) &&
-        stableStringify(
-            a,
-        ) ===
-            stableStringify(
-                b,
-            )
+        !!a
+        && !!b
+        && JSON.stringify(a)
+            === JSON.stringify(b)
     );
 }
 
-function currentEpoch() {
-    return scopeEpoch;
+function scopeKey(
+    scope,
+) {
+    if (!scope) {
+        return '';
+    }
+
+    return [
+        scope.kind,
+        scope.kind === 'character'
+            ? scope.character
+            : scope.groupId,
+        scope.chatId,
+        scope.branchId
+            || 'main',
+    ].join('|');
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* Snapshot handling                                                          */
-/* -------------------------------------------------------------------------- */
-
-function ensureMessageIds(
-    chat,
+function sameScopePrincipal(
+    a,
+    b,
 ) {
-    if (
-        !Array.isArray(chat)
-    ) {
+    return (
+        !!a
+        && !!b
+        && scopeKey(a)
+            === scopeKey(b)
+    );
+}
+
+function isObject(value) {
+    return value !== null
+        && typeof value === 'object'
+        && !Array.isArray(value);
+}
+
+const forbiddenKeys =
+    new Set([
+        '__proto__',
+        'prototype',
+        'constructor',
+    ]);
+
+function validateDataTree(
+    value,
+    depth = 0,
+    seen = new WeakSet(),
+) {
+    if (depth > 40) {
         return false;
     }
 
-    let changed =
-        false;
-
-    /*
-     * chat[0] is the ST chat header. Message IDs start at 1.
-     */
-    for (
-        let index = 1;
-        index <
-            chat.length;
-        index++
-    ) {
-        const message =
-            chat[index];
-
-        if (
-            !message ||
-            typeof message !==
-                'object'
-        ) {
-            continue;
-        }
-
-        if (
-            !message.extra ||
-            typeof message.extra !==
-                'object' ||
-            Array.isArray(
-                message.extra,
-            )
-        ) {
-            message.extra = {};
-            changed = true;
-        }
-
-        if (
-            !message.extra[
-                MESSAGE_NAMESPACE
-            ] ||
-            typeof message.extra[
-                MESSAGE_NAMESPACE
-            ] !==
-                'object' ||
-            Array.isArray(
-                message.extra[
-                    MESSAGE_NAMESPACE
-                ],
-            )
-        ) {
-            message.extra[
-                MESSAGE_NAMESPACE
-            ] = {};
-
-            changed = true;
-        }
-
-        if (
-            !message.extra[
-                MESSAGE_NAMESPACE
-            ].messageId
-        ) {
-            message.extra[
-                MESSAGE_NAMESPACE
-            ].messageId =
-                uuid();
-
-            changed = true;
-        }
-    }
-
-    return changed;
-}
-
-function normalizeSnapshot(
-    raw,
-) {
     if (
-        !raw ||
-        typeof raw !==
-            'object' ||
-        !Array.isArray(
-            raw.chat,
-        )
+        value === null
+        || typeof value === 'string'
+        || typeof value === 'boolean'
     ) {
-        return null;
+        return true;
     }
-
-    const snapshot = {
-        chat:
-            clone(
-                raw.chat,
-            ),
-
-        chatMetadata:
-            clone(
-                raw.chatMetadata ||
-                raw.chat?.[0]
-                    ?.chat_metadata ||
-                {},
-            ),
-    };
-
-    ensureMessageIds(
-        snapshot.chat,
-    );
 
     if (
-        snapshot.chat[0]
+        typeof value === 'number'
     ) {
-        snapshot.chat[0]
-            .chat_metadata =
-            clone(
-                snapshot.chatMetadata,
-            );
-    }
-
-    return snapshot;
-}
-
-function makeLocalSnapshot() {
-    if (
-        !ctx ||
-        !currentScope
-    ) {
-        return null;
-    }
-
-    const snapshot =
-        normalizeSnapshot({
-            chat:
-                ctx.chat,
-
-            chatMetadata:
-                ctx.chatMetadata,
-        });
-
-    return snapshot;
-}
-
-async function hashLocalSnapshot() {
-    const snapshot =
-        makeLocalSnapshot();
-
-    return snapshot
-        ? sha256(
-            snapshot,
-        )
-        : null;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* ST UI application                                                          */
-/* -------------------------------------------------------------------------- */
-
-async function applySnapshotLocally(
-    snapshot,
-    {
-        persist = true,
-        reason = 'apply',
-    } = {},
-) {
-    const normalized =
-        normalizeSnapshot(
-            snapshot,
+        return Number.isFinite(
+            value,
         );
+    }
 
     if (
-        !normalized ||
-        !currentScope
+        typeof value !== 'object'
     ) {
         return false;
     }
 
-    const scopeAtStart =
-        clone(currentScope);
+    if (seen.has(value)) {
+        return false;
+    }
 
-    applyingRemoteDepth += 1;
+    seen.add(value);
 
-    try {
+    if (Array.isArray(value)) {
+        return value.every(
+            child =>
+                validateDataTree(
+                    child,
+                    depth + 1,
+                    seen,
+                ),
+        );
+    }
+
+    for (
+        const [
+            key,
+            child,
+        ]
+        of Object.entries(value)
+    ) {
         if (
-            !sameScope(
-                scopeAtStart,
-                currentScope,
-            )
+            forbiddenKeys.has(key)
         ) {
             return false;
         }
 
         if (
-            Array.isArray(
-                ctx.chat,
+            !validateDataTree(
+                child,
+                depth + 1,
+                seen,
             )
         ) {
-            ctx.chat.splice(
-                0,
-                ctx.chat.length,
-                ...normalized.chat.map(
-                    clone,
-                ),
-            );
+            return false;
         }
-
-        if (
-            normalized.chat[0]
-        ) {
-            normalized.chat[0]
-                .chat_metadata =
-                clone(
-                    normalized.chatMetadata,
-                );
-        }
-
-        /*
-         * Current ST exposes updateChatMetadata as the public metadata mutation
-         * path.
-         */
-        if (
-            typeof ctx.updateChatMetadata ===
-            'function'
-        ) {
-            ctx.updateChatMetadata(
-                clone(
-                    normalized.chatMetadata,
-                ),
-                true,
-            );
-        }
-
-        /*
-         * Current ST exposes printMessages publicly through getContext().
-         */
-        if (
-            typeof ctx.printMessages ===
-            'function'
-        ) {
-            await ctx.printMessages();
-        }
-
-        if (
-            persist
-        ) {
-            const saved =
-                await saveCurrentChat(
-                    `remote:${reason}`,
-                );
-
-            if (
-                !saved
-            ) {
-                setStatus(
-                    'Save pending',
-                    'Remote state is applied in memory but ST did not confirm the save',
-                );
-            }
-        }
-
-        return true;
-    } catch (error) {
-        warn(
-            'Remote snapshot application failed',
-            error,
-        );
-
-        setStatus(
-            'Sync error',
-            'Could not apply authoritative state',
-        );
-
-        return false;
-    } finally {
-        applyingRemoteDepth -= 1;
     }
+
+    return true;
 }
 
-async function applyPatchLocally(
-    patch,
-    {
-        persist = true,
-        reason = 'patch',
-    } = {},
+function stableMessageId(
+    message,
 ) {
+    const id =
+        message
+            ?.extra
+            ?.multi_client_sync
+            ?.messageId;
+
+    return (
+        typeof id === 'string'
+        && id.length > 0
+    )
+        ? id
+        : null;
+}
+
+function ensureMessageIds(
+    snapshot,
+) {
+    const out =
+        clone(
+            Array.isArray(snapshot)
+                ? snapshot
+                : [],
+        );
+
+    const used =
+        new Set();
+
+    for (
+        const message
+        of out
+    ) {
+        if (!isObject(message)) {
+            continue;
+        }
+
+        if (!isObject(message.extra)) {
+            message.extra = {};
+        }
+
+        if (
+            !isObject(
+                message
+                    .extra
+                    .multi_client_sync,
+            )
+        ) {
+            message.extra
+                .multi_client_sync = {};
+        }
+
+        let id =
+            stableMessageId(
+                message,
+            );
+
+        if (
+            !id
+            || id.length > 128
+            || /[\\/\u0000-\u001f]/
+                .test(id)
+            || used.has(id)
+        ) {
+            id =
+                randomId('m_');
+
+            message
+                .extra
+                .multi_client_sync
+                .messageId = id;
+        }
+
+        used.add(id);
+    }
+
+    return out;
+}
+
+function normalizeSnapshot(
+    snapshot,
+) {
+    const out =
+        ensureMessageIds(
+            snapshot,
+        );
+
     if (
-        !patch ||
-        !currentScope
+        !validateDataTree(out)
+    ) {
+        throw new Error(
+            'Chat contains unsupported data.',
+        );
+    }
+
+    return out;
+}
+
+function ensureHostMessageIds() {
+    if (
+        !Array.isArray(
+            ctx?.chat,
+        )
     ) {
         return false;
     }
 
-    if (
-        patch.kind ===
-        'full'
+    const used =
+        new Set();
+
+    let changed =
+        false;
+
+    for (
+        const message
+        of ctx.chat
     ) {
-        return applySnapshotLocally(
-            patch.snapshot,
-            {
-                persist,
-                reason,
-            },
+        if (!isObject(message)) {
+            continue;
+        }
+
+        if (!isObject(message.extra)) {
+            message.extra = {};
+            changed = true;
+        }
+
+        if (
+            !isObject(
+                message
+                    .extra
+                    .multi_client_sync,
+            )
+        ) {
+            message
+                .extra
+                .multi_client_sync = {};
+            changed = true;
+        }
+
+        let id =
+            stableMessageId(
+                message,
+            );
+
+        if (
+            !id
+            || id.length > 128
+            || /[\\/\u0000-\u001f]/
+                .test(id)
+            || used.has(id)
+        ) {
+            id =
+                randomId('m_');
+
+            changed = true;
+        }
+
+        if (
+            message
+                .extra
+                .multi_client_sync
+                .messageId
+            !== id
+        ) {
+            changed = true;
+        }
+
+        message
+            .extra
+            .multi_client_sync
+            .messageId = id;
+
+        used.add(id);
+    }
+
+    if (changed) {
+        hostMessageIdsDirty = true;
+    }
+
+    return changed;
+}
+
+function localSnapshot() {
+    ensureHostMessageIds();
+
+    return normalizeSnapshot(
+        ctx.chat || [],
+    );
+}
+
+function localMetadata() {
+    return isObject(
+        ctx?.chatMetadata,
+    )
+        ? clone(
+            ctx.chatMetadata,
+        )
+        : {};
+}
+
+async function snapshotDigest(
+    snapshot,
+) {
+    const data =
+        JSON.stringify(
+            snapshot,
+        );
+
+    return sha256(data);
+}
+
+function settingsRef() {
+    ctx = getContext();
+
+    if (
+        !isObject(
+            ctx.extensionSettings[
+                EXTENSION_ID
+            ],
+        )
+    ) {
+        ctx.extensionSettings[
+            EXTENSION_ID
+        ] = clone(
+            defaultSettings,
         );
     }
 
-    applyingRemoteDepth += 1;
+    const target =
+        ctx.extensionSettings[
+            EXTENSION_ID
+        ];
 
+    for (
+        const [
+            key,
+            value,
+        ]
+        of Object.entries(
+            defaultSettings,
+        )
+    ) {
+        if (!(key in target)) {
+            target[key] =
+                clone(value);
+        }
+    }
+
+    settings =
+        target;
+
+    return target;
+}
+
+function principalKey() {
+    if (!serverUserId) {
+        return 'unknown-user';
+    }
+
+    return String(
+        serverUserId,
+    );
+}
+
+function deviceIdentifier() {
     try {
-        if (
-            patch.kind ===
-            'append'
-        ) {
-            const messages =
-                Array.isArray(
-                    patch.messages,
-                )
-                    ? patch.messages
-                        .map(
-                            clone,
-                        )
-                    : [];
-
-            ctx.chat.splice(
-                Number(
-                    patch.startIndex,
-                ),
-                0,
-                ...messages,
+        const existing =
+            localStorage.getItem(
+                DEVICE_STORAGE_KEY,
             );
+
+        if (existing) {
+            return existing;
         }
 
-        if (
-            patch.kind ===
-            'patch'
-        ) {
-            for (
-                const change of
-                    patch.changes ||
-                    []
-            ) {
-                const index =
-                    Number(
-                        change.index,
-                    );
+        const value =
+            randomId('d_');
 
-                if (
-                    Number.isInteger(
-                        index,
-                    ) &&
-                    index >= 1 &&
-                    index <
-                        ctx.chat.length
-                ) {
-                    ctx.chat[index] =
-                        clone(
-                            change.message,
-                        );
-                }
-            }
-        }
-
-        if (
-            patch.chatMetadata
-        ) {
-            if (
-                typeof ctx.updateChatMetadata ===
-                'function'
-            ) {
-                ctx.updateChatMetadata(
-                    clone(
-                        patch.chatMetadata,
-                    ),
-                    true,
-                );
-            }
-
-            if (
-                ctx.chat[0]
-            ) {
-                ctx.chat[0]
-                    .chat_metadata =
-                    clone(
-                        patch.chatMetadata,
-                    );
-            }
-        }
-
-        if (
-            typeof ctx.printMessages ===
-            'function'
-        ) {
-            await ctx.printMessages();
-        }
-
-        if (
-            persist
-        ) {
-            await saveCurrentChat(
-                `remote:${reason}`,
-            );
-        }
-
-        return true;
-    } catch (error) {
-        warn(
-            'Remote patch application failed',
-            error,
+        localStorage.setItem(
+            DEVICE_STORAGE_KEY,
+            value,
         );
 
-        return false;
-    } finally {
-        applyingRemoteDepth -= 1;
+        return value;
+    } catch {
+        return randomId('d_');
     }
 }
 
+function clientIdentifier() {
+    try {
+        const existing =
+            sessionStorage.getItem(
+                CLIENT_STORAGE_KEY,
+            );
 
-/* -------------------------------------------------------------------------- */
-/* ST persistence                                                             */
-/* -------------------------------------------------------------------------- */
+        if (existing) {
+            return existing;
+        }
 
-async function saveCurrentChat(
-    reason = 'save',
+        const value =
+            randomId('c_');
+
+        sessionStorage.setItem(
+            CLIENT_STORAGE_KEY,
+            value,
+        );
+
+        return value;
+    } catch {
+        return randomId('c_');
+    }
+}
+
+const deviceId =
+    deviceIdentifier();
+
+const clientId =
+    clientIdentifier();
+
+function getCurrentScope() {
+    ctx =
+        getContext();
+
+    if (
+        ctx.groupId !== undefined
+        && ctx.groupId !== null
+        && String(ctx.groupId)
+    ) {
+        const group =
+            ctx.groups?.find(
+                item =>
+                    String(item.id)
+                    === String(
+                        ctx.groupId,
+                    ),
+            );
+
+        const chatId =
+            ctx.getCurrentChatId?.()
+            || ctx.chatId
+            || group?.chat_id;
+
+        if (!chatId) {
+            return null;
+        }
+
+        return {
+            kind: 'group',
+            groupId:
+                String(
+                    ctx.groupId,
+                ),
+            chatId:
+                String(
+                    chatId,
+                ),
+
+            /*
+             * For the main group chat there may still be an integrity
+             * value, but branchId is intentionally used only for a
+             * branch/checkpoint chat where main_chat is present.
+             */
+            branchId:
+                ctx.chatMetadata
+                    ?.main_chat
+                    && ctx.chatMetadata
+                        ?.integrity
+                    ? String(
+                        ctx.chatMetadata
+                            .integrity,
+                    )
+                    : '',
+
+            parentChatId:
+                ctx.chatMetadata
+                    ?.main_chat
+                    ? String(
+                        ctx.chatMetadata
+                            .main_chat,
+                    )
+                    : '',
+        };
+    }
+
+    if (
+        ctx.characterId === undefined
+        || ctx.characterId === null
+        || String(ctx.characterId)
+            === ''
+    ) {
+        return null;
+    }
+
+    const character =
+        ctx.characters?.[
+            ctx.characterId
+        ];
+
+    const avatar =
+        character?.avatar;
+
+    const chatId =
+        ctx.getCurrentChatId?.()
+        || ctx.chatId
+        || character?.chat;
+
+    if (
+        !avatar
+        || !chatId
+    ) {
+        return null;
+    }
+
+    return {
+        kind: 'character',
+        character:
+            String(avatar),
+        chatId:
+            String(chatId),
+
+        branchId:
+            ctx.chatMetadata
+                ?.main_chat
+                && ctx.chatMetadata
+                    ?.integrity
+                ? String(
+                    ctx.chatMetadata
+                        .integrity,
+                )
+                : '',
+
+        parentChatId:
+            ctx.chatMetadata
+                ?.main_chat
+                ? String(
+                    ctx.chatMetadata
+                        .main_chat,
+                )
+                : '',
+    };
+}
+
+function scopeIsCurrent(
+    expectedEpoch,
+    expectedScope,
 ) {
-    const scopeAtStart =
-        currentScope
-            ? clone(
+    return (
+        expectedEpoch === scopeEpoch
+        && currentScope
+        && (
+            !expectedScope
+            || sameScope(
+                expectedScope,
                 currentScope,
             )
-            : null;
-
-    if (
-        !scopeAtStart ||
-        typeof ctx.saveChat !==
-            'function'
-    ) {
-        return false;
-    }
-
-    saveChain =
-        saveChain.then(
-            async () => {
-                if (
-                    !sameScope(
-                        scopeAtStart,
-                        currentScope,
-                    )
-                ) {
-                    return false;
-                }
-
-                try {
-                    await ctx.saveChat();
-
-                    log(
-                        'ST save completed',
-                        reason,
-                    );
-
-                    return true;
-                } catch (error) {
-                    warn(
-                        'ST save failed',
-                        reason,
-                        error,
-                    );
-
-                    return false;
-                }
-            },
-        );
-
-    return saveChain;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* HTTP                                                                       */
-/* -------------------------------------------------------------------------- */
-
-function requestHeaders(
-    extra = {},
-) {
-    return {
-        Accept:
-            'application/json',
-
-        ...(
-            ctx?.getRequestHeaders?.() ||
-            {}
-        ),
-
-        ...extra,
-    };
+        )
+    );
 }
 
 async function api(
-    path,
-    {
-        method = 'GET',
-        body = undefined,
-    } = {},
+    route,
+    options = {},
 ) {
-    const options = {
-        method,
+    ctx =
+        getContext();
 
-        credentials:
-            'same-origin',
-
-        cache:
-            'no-store',
-
-        headers:
-            requestHeaders(
-                body !== undefined
-                    ? {
-                        'Content-Type':
-                            'application/json',
-                    }
-                    : {},
-            ),
+    const headers = {
+        Accept:
+            'application/json',
+        ...(ctx.getRequestHeaders?.()
+            || {}),
+        ...(options.headers || {}),
     };
 
     if (
-        body !== undefined
+        options.body !== undefined
     ) {
-        options.body =
-            JSON.stringify(
-                body,
-            );
+        headers['Content-Type'] =
+            'application/json';
     }
 
     const response =
         await fetch(
-            `${PLUGIN_BASE}${path}`,
-            options,
+            `${PLUGIN_BASE}${route}`,
+            {
+                credentials:
+                    'same-origin',
+                cache:
+                    'no-store',
+                ...options,
+                headers,
+            },
         );
 
-    let parsed =
-        null;
+    const text =
+        await response.text();
 
-    try {
-        parsed =
-            await response.json();
-    } catch {
-        // non-json
+    let data = null;
+
+    if (text) {
+        try {
+            data =
+                JSON.parse(text);
+        } catch {
+            data = {
+                ok: false,
+                error: {
+                    code:
+                        'invalid_json',
+                    message:
+                        text.slice(
+                            0,
+                            500,
+                        ),
+                },
+            };
+        }
     }
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         const error =
             new Error(
-                parsed?.message ||
-                    `HTTP ${response.status}`,
+                data
+                    ?.error
+                    ?.message
+                || `HTTP ${response.status}`,
             );
 
         error.status =
             response.status;
 
         error.code =
-            parsed?.code ||
-            `http_${response.status}`;
+            data
+                ?.error
+                ?.code
+            || `http_${response.status}`;
 
-        error.state =
-            parsed?.state;
-
-        error.expectedHash =
-            parsed?.expectedHash;
-
-        error.actualHash =
-            parsed?.actualHash;
+        error.data =
+            data;
 
         throw error;
     }
 
-    return parsed || {};
+    return data;
 }
 
+function eventBody(
+    type,
+    extra = {},
+    scope = currentScope,
+) {
+    return {
+        protocol:
+            PROTOCOL,
 
-/* -------------------------------------------------------------------------- */
-/* IndexedDB                                                                  */
-/* -------------------------------------------------------------------------- */
+        schema:
+            SCHEMA,
 
-let databasePromise =
-    null;
+        type,
 
-function openDatabase() {
-    if (
-        databasePromise
-    ) {
-        return databasePromise;
+        clientId,
+        deviceId,
+
+        scope:
+            clone(scope),
+
+        ...extra,
+    };
+}
+
+function setStatus(
+    state,
+    text,
+) {
+    if (!uiRoot) {
+        return;
     }
 
-    databasePromise =
+    const dot =
+        uiRoot.querySelector(
+            '.mcs-status',
+        );
+
+    const label =
+        uiRoot.querySelector(
+            '.mcs-state-text',
+        );
+
+    dot?.classList.remove(
+        'mcs-connected',
+        'mcs-disconnected',
+        'mcs-disabled',
+        'mcs-owner',
+        'mcs-streaming',
+        'mcs-warning',
+    );
+
+    let css;
+
+    switch (state) {
+        case 'owner':
+            css =
+                'mcs-owner';
+            break;
+
+        case 'streaming':
+            css =
+                'mcs-streaming';
+            break;
+
+        case 'warning':
+            css =
+                'mcs-warning';
+            break;
+
+        case 'disabled':
+            css =
+                'mcs-disabled';
+            break;
+
+        case 'connected':
+            css =
+                'mcs-connected';
+            break;
+
+        default:
+            css =
+                'mcs-disconnected';
+            break;
+    }
+
+    dot?.classList.add(
+        css,
+    );
+
+    if (label) {
+        label.textContent =
+            text || state;
+    }
+}
+
+function updateInfo() {
+    if (!uiRoot) {
+        return;
+    }
+
+    const info =
+        uiRoot.querySelector(
+            '[data-mcs-info]',
+        );
+
+    if (!info) {
+        return;
+    }
+
+    const scope =
+        currentScope
+            ? (
+                `${currentScope.kind}:`
+                + `${currentScope.chatId}`
+            )
+            : 'none';
+
+    const generation =
+        currentState
+            ?.generation
+            ? (
+                `generation `
+                + currentState
+                    .generation
+                    .phase
+            )
+            : 'idle';
+
+    const revision =
+        Number(
+            currentState
+                ?.revision
+            || 0,
+        );
+
+    info.textContent =
+        `Scope: ${scope} · `
+        + `revision ${revision} · `
+        + `${generation}`
+        + (
+            lastError
+                ? ` · ${lastError}`
+                : ''
+        );
+}
+
+function updateUi() {
+    if (
+        !settings?.enabled
+    ) {
+        setStatus(
+            'disabled',
+            'disabled',
+        );
+
+        updateInfo();
+
+        return;
+    }
+
+    if (!serverAvailable) {
+        setStatus(
+            'warning',
+            'server plugin required',
+        );
+
+        updateInfo();
+
+        return;
+    }
+
+    if (!serverCompatible) {
+        setStatus(
+            'warning',
+            'plugin incompatible',
+        );
+
+        updateInfo();
+
+        return;
+    }
+
+    if (
+        localGeneration
+        && currentState
+            ?.generation
+            ?.id
+            === localGeneration.id
+    ) {
+        setStatus(
+            currentState
+                .generation
+                .phase
+                === 'streaming'
+                ? 'streaming'
+                : 'owner',
+            currentState
+                .generation
+                .phase,
+        );
+
+        updateInfo();
+
+        return;
+    }
+
+    setStatus(
+        'connected',
+        'synchronized',
+    );
+
+    updateInfo();
+}
+
+function renderUi() {
+    if (
+        uiRoot
+        && uiRoot.isConnected
+    ) {
+        return;
+    }
+
+    const host =
+        document.querySelector(
+            '#extensions_settings2',
+        )
+        || document.querySelector(
+            '#extensions_settings',
+        );
+
+    if (!host) {
+        return;
+    }
+
+    const root =
+        document.createElement(
+            'div',
+        );
+
+    root.className =
+        'mcs-settings';
+
+    root.innerHTML = `
+        <h3>Multi-Client Sync</h3>
+
+        <div class="mcs-status-row">
+            <span class="mcs-status"
+                  title="Multi-client sync status"></span>
+            <span class="mcs-state-text">starting</span>
+        </div>
+
+        <div class="mcs-info"
+             data-mcs-info></div>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="enabled">
+            Enable synchronization
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="autoConnect">
+            Connect automatically
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="syncMessages">
+            Sync messages
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="syncMetadata">
+            Sync chat metadata
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="syncSwipes">
+            Sync swipes/reasoning/tools
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="syncGroupSettings">
+            Sync group settings
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="syncBranches">
+            Sync branches/checkpoints
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="coordinateGeneration">
+            Coordinate generation
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="remoteStop">
+            Allow remote generation stop
+        </label>
+
+        <label class="checkbox_label">
+            <input type="checkbox"
+                   data-mcs="notifications">
+            Notifications
+        </label>
+
+        <div class="mcs-actions">
+            <button type="button"
+                    class="menu_button"
+                    data-mcs-action="reconnect">
+                Reconnect
+            </button>
+
+            <button type="button"
+                    class="menu_button"
+                    data-mcs-action="resync">
+                Resync
+            </button>
+
+            <button type="button"
+                    class="menu_button"
+                    data-mcs-action="branch">
+                Create branch
+            </button>
+
+            <button type="button"
+                    class="menu_button"
+                    data-mcs-action="checkpoint">
+                Create checkpoint
+            </button>
+        </div>
+    `;
+
+    host.append(
+        root,
+    );
+
+    uiRoot = root;
+
+    for (
+        const input
+        of root.querySelectorAll(
+            'input[data-mcs]',
+        )
+    ) {
+        const key =
+            input.getAttribute(
+                'data-mcs',
+            );
+
+        input.checked =
+            !!settings?.[key];
+
+        input.addEventListener(
+            'change',
+            async () => {
+                settings[key] =
+                    input.checked;
+
+                await ctx
+                    .saveSettingsDebounced
+                    ?.();
+
+                if (
+                    key === 'enabled'
+                ) {
+                    if (
+                        input.checked
+                    ) {
+                        await onEnable();
+                    } else {
+                        await onDisable();
+                    }
+
+                    return;
+                }
+
+                if (
+                    key === 'autoConnect'
+                    && input.checked
+                ) {
+                    await reconnectCurrentScope();
+                }
+
+                updateUi();
+            },
+        );
+    }
+
+    root.querySelector(
+        '[data-mcs-action="reconnect"]',
+    )?.addEventListener(
+        'click',
+        () =>
+            void reconnectCurrentScope(),
+    );
+
+    root.querySelector(
+        '[data-mcs-action="resync"]',
+    )?.addEventListener(
+        'click',
+        () =>
+            void resyncCurrentScope(),
+    );
+
+    root.querySelector(
+        '[data-mcs-action="branch"]',
+    )?.addEventListener(
+        'click',
+        () =>
+            void createNativeBranch(),
+    );
+
+    root.querySelector(
+        '[data-mcs-action="checkpoint"]',
+    )?.addEventListener(
+        'click',
+        () =>
+            void createNativeCheckpoint(),
+    );
+
+    updateUi();
+}
+
+async function checkHealth() {
+    try {
+        const result =
+            await api(
+                '/health',
+            );
+
+        serverAvailable =
+            !!result.ok;
+
+        serverCompatible =
+            serverAvailable
+            && Number(
+                result.protocol,
+            )
+                === PROTOCOL
+            && Number(
+                result.schema,
+            )
+                === SCHEMA;
+
+        if (
+            result.userId
+        ) {
+            serverUserId =
+                String(
+                    result.userId,
+                );
+        }
+
+        if (
+            !serverCompatible
+        ) {
+            lastError =
+                'Server plugin version is incompatible.';
+        } else {
+            lastError = '';
+        }
+
+        return serverCompatible;
+    } catch (error) {
+        serverAvailable =
+            false;
+
+        serverCompatible =
+            false;
+
+        lastError =
+            error.message;
+
+        return false;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* IndexedDB                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function openDb() {
+    if (dbPromise) {
+        return dbPromise;
+    }
+
+    dbPromise =
         new Promise(
             (
                 resolve,
@@ -1207,38 +1399,112 @@ function openDatabase() {
                         DB_VERSION,
                     );
 
-                request.onerror =
-                    () =>
-                        reject(
-                            request.error,
-                        );
-
                 request.onupgradeneeded =
                     () => {
                         const db =
                             request.result;
 
+                        const transaction =
+                            request
+                                .transaction;
+
+                        const ops =
+                            db.objectStoreNames
+                                .contains(
+                                    'ops',
+                                )
+                                ? transaction
+                                    .objectStore(
+                                        'ops',
+                                    )
+                                : db.createObjectStore(
+                                    'ops',
+                                    {
+                                        keyPath:
+                                            'key',
+                                    },
+                                );
+
                         if (
-                            !db.objectStoreNames.contains(
-                                'ops',
-                            )
+                            !ops.indexNames
+                                .contains(
+                                    'principalScope',
+                                )
                         ) {
-                            db.createObjectStore(
-                                'ops',
+                            ops.createIndex(
+                                'principalScope',
+                                'principalScope',
                                 {
-                                    keyPath:
-                                        'opId',
+                                    unique:
+                                        false,
                                 },
                             );
                         }
 
                         if (
-                            !db.objectStoreNames.contains(
-                                'meta',
-                            )
+                            !ops.indexNames
+                                .contains(
+                                    'createdAt',
+                                )
                         ) {
-                            db.createObjectStore(
-                                'meta',
+                            ops.createIndex(
+                                'createdAt',
+                                'createdAt',
+                                {
+                                    unique:
+                                        false,
+                                },
+                            );
+                        }
+
+                        if (
+                            ops.indexNames
+                                .contains(
+                                    'scope',
+                                )
+                        ) {
+                            // Existing compatibility index.
+                        } else {
+                            ops.createIndex(
+                                'scope',
+                                'scope',
+                                {
+                                    unique:
+                                        false,
+                                },
+                            );
+                        }
+
+                        const meta =
+                            db.objectStoreNames
+                                .contains(
+                                    'meta',
+                                )
+                                ? transaction
+                                    .objectStore(
+                                        'meta',
+                                    )
+                                : db.createObjectStore(
+                                    'meta',
+                                    {
+                                        keyPath:
+                                            'key',
+                                    },
+                                );
+
+                        if (
+                            !meta.indexNames
+                                .contains(
+                                    'principal',
+                                )
+                        ) {
+                            meta.createIndex(
+                                'principal',
+                                'principal',
+                                {
+                                    unique:
+                                        false,
+                                },
                             );
                         }
                     };
@@ -1248,855 +1514,512 @@ function openDatabase() {
                         resolve(
                             request.result,
                         );
+
+                request.onerror =
+                    () =>
+                        reject(
+                            request.error,
+                        );
             },
         );
 
-    return databasePromise;
+    return dbPromise;
 }
 
-async function dbPutOperation(
-    operation,
+async function idb(
+    storeName,
+    mode,
+    callback,
 ) {
     const db =
-        await openDatabase();
+        await openDb();
 
-    await new Promise(
+    return new Promise(
         (
             resolve,
             reject,
         ) => {
             const tx =
                 db.transaction(
-                    'ops',
-                    'readwrite',
+                    storeName,
+                    mode,
                 );
 
-            tx.objectStore(
-                'ops',
-            ).put(
-                clone(
-                    operation,
-                ),
-            );
+            const store =
+                tx.objectStore(
+                    storeName,
+                );
+
+            let result;
+
+            try {
+                result =
+                    callback(
+                        store,
+                        tx,
+                    );
+            } catch (error) {
+                reject(error);
+                return;
+            }
 
             tx.oncomplete =
-                resolve;
+                () => resolve(
+                    result,
+                );
 
             tx.onerror =
-                () =>
-                    reject(
-                        tx.error,
-                    );
+                () => reject(
+                    tx.error,
+                );
+
+            tx.onabort =
+                () => reject(
+                    tx.error
+                    || new Error(
+                        'IndexedDB transaction aborted.',
+                    ),
+                );
         },
     );
 }
 
-async function dbDeleteOperation(
-    opId,
-) {
-    const db =
-        await openDatabase();
-
-    await new Promise(
-        (
-            resolve,
-            reject,
-        ) => {
-            const tx =
-                db.transaction(
-                    'ops',
-                    'readwrite',
-                );
-
-            tx.objectStore(
-                'ops',
-            ).delete(
-                opId,
-            );
-
-            tx.oncomplete =
-                resolve;
-
-            tx.onerror =
-                () =>
-                    reject(
-                        tx.error,
-                    );
-        },
-    );
-}
-
-async function dbGetOperations(
+function metadataKey(
     scope,
 ) {
-    if (
-        !principalKey
-    ) {
-        return [];
-    }
+    return (
+        `${principalKey()}|`
+        + scopeKey(scope)
+    );
+}
 
-    const db =
-        await openDatabase();
+function operationKey(
+    operation,
+) {
+    return (
+        `${principalKey()}|`
+        + scopeKey(
+            operation.scope,
+        )
+        + '|'
+        + operation.opId
+    );
+}
 
-    return new Promise(
-        (
-            resolve,
-            reject,
-        ) => {
-            const tx =
-                db.transaction(
-                    'ops',
-                    'readonly',
-                );
+function principalScopeKey(
+    scope,
+) {
+    return (
+        `${principalKey()}|`
+        + scopeKey(scope)
+    );
+}
 
-            const request =
-                tx.objectStore(
-                    'ops',
-                ).getAll();
+async function readMeta(
+    scope,
+) {
+    const key =
+        metadataKey(scope);
 
-            request.onerror =
-                () =>
-                    reject(
-                        request.error,
-                    );
+    return idb(
+        'meta',
+        'readonly',
+        store =>
+            new Promise(
+                resolve => {
+                    const request =
+                        store.get(key);
 
-            request.onsuccess =
-                () => {
-                    const values =
-                        request.result
-                            .filter(
-                                operation =>
-                                    operation
-                                        .principalKey ===
-                                        principalKey &&
-                                    sameScope(
-                                        operation.scope,
-                                        scope,
-                                    ),
-                            )
-                            .sort(
-                                (
-                                    a,
-                                    b,
-                                ) =>
-                                    a.localSeq -
-                                    b.localSeq,
+                    request.onsuccess =
+                        () =>
+                            resolve(
+                                request.result
+                                || {
+                                    key,
+                                    principal:
+                                        principalKey(),
+                                    scope:
+                                        scopeKey(
+                                            scope,
+                                        ),
+                                    lastEventId:
+                                        0,
+                                    epoch:
+                                        '',
+                                    revision:
+                                        0,
+                                    localSequence:
+                                        0,
+                                    baseSnapshot:
+                                        [],
+                                    baseMetadata:
+                                        {},
+                                },
                             );
 
-                    resolve(
-                        values,
-                    );
-                };
-        },
-    );
-}
-
-async function dbPutMeta(
-    key,
-    value,
-) {
-    if (
-        !principalKey
-    ) {
-        return;
-    }
-
-    const db =
-        await openDatabase();
-
-    await new Promise(
-        (
-            resolve,
-            reject,
-        ) => {
-            const tx =
-                db.transaction(
-                    'meta',
-                    'readwrite',
-                );
-
-            tx.objectStore(
-                'meta',
-            ).put(
-                clone(
-                    value,
-                ),
-                `${principalKey}:${key}`,
-            );
-
-            tx.oncomplete =
-                resolve;
-
-            tx.onerror =
-                () =>
-                    reject(
-                        tx.error,
-                    );
-        },
-    );
-}
-
-async function dbGetMeta(
-    key,
-) {
-    if (
-        !principalKey
-    ) {
-        return null;
-    }
-
-    const db =
-        await openDatabase();
-
-    return new Promise(
-        (
-            resolve,
-            reject,
-        ) => {
-            const tx =
-                db.transaction(
-                    'meta',
-                    'readonly',
-                );
-
-            const request =
-                tx.objectStore(
-                    'meta',
-                ).get(
-                    `${principalKey}:${key}`,
-                );
-
-            request.onerror =
-                () =>
-                    reject(
-                        request.error,
-                    );
-
-            request.onsuccess =
-                () =>
-                    resolve(
-                        request.result ||
-                            null,
-                    );
-        },
-    );
-}
-
-async function dbClearAll() {
-    const db =
-        await openDatabase();
-
-    await new Promise(
-        (
-            resolve,
-            reject,
-        ) => {
-            const tx =
-                db.transaction(
-                    [
-                        'ops',
-                        'meta',
-                    ],
-                    'readwrite',
-                );
-
-            tx.objectStore(
-                'ops',
-            ).clear();
-
-            tx.objectStore(
-                'meta',
-            ).clear();
-
-            tx.oncomplete =
-                resolve;
-
-            tx.onerror =
-                () =>
-                    reject(
-                        tx.error,
-                    );
-        },
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* UI                                                                         */
-/* -------------------------------------------------------------------------- */
-
-function ensureUi() {
-    if (
-        uiRoot ||
-        !document.body
-    ) {
-        return;
-    }
-
-    uiRoot =
-        document.createElement(
-            'div',
-        );
-
-    uiRoot.id =
-        'multi-client-sync-status';
-
-    uiRoot.innerHTML = `
-        <div data-mcs-title></div>
-        <div data-mcs-detail></div>
-        <div data-mcs-actions></div>
-    `;
-
-    Object.assign(
-        uiRoot.style,
-        {
-            position:
-                'fixed',
-
-            right:
-                '12px',
-
-            bottom:
-                '12px',
-
-            zIndex:
-                '99999',
-
-            minWidth:
-                '230px',
-
-            maxWidth:
-                '360px',
-
-            padding:
-                '9px 11px',
-
-            borderRadius:
-                '8px',
-
-            background:
-                'rgba(20,20,20,.94)',
-
-            color:
-                '#fff',
-
-            fontSize:
-                '12px',
-
-            lineHeight:
-                '1.4',
-
-            boxShadow:
-                '0 3px 18px rgba(0,0,0,.35)',
-        },
-    );
-
-    document.body.appendChild(
-        uiRoot,
-    );
-}
-
-function setStatus(
-    title,
-    detail = '',
-    actions = [],
-) {
-    ensureUi();
-
-    if (!uiRoot) {
-        return;
-    }
-
-    const titleNode =
-        uiRoot.querySelector(
-            '[data-mcs-title]',
-        );
-
-    const detailNode =
-        uiRoot.querySelector(
-            '[data-mcs-detail]',
-        );
-
-    const actionsNode =
-        uiRoot.querySelector(
-            '[data-mcs-actions]',
-        );
-
-    titleNode.textContent =
-        title;
-
-    detailNode.textContent =
-        detail;
-
-    actionsNode.replaceChildren();
-
-    for (
-        const action of
-            actions
-    ) {
-        const button =
-            document.createElement(
-                'button',
-            );
-
-        button.type =
-            'button';
-
-        button.textContent =
-            action.label;
-
-        button.style.margin =
-            '5px 4px 0 0';
-
-        button.addEventListener(
-            'click',
-            action.run,
-        );
-
-        actionsNode.appendChild(
-            button,
-        );
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Server cursor                                                              */
-/* -------------------------------------------------------------------------- */
-
-async function persistCursor() {
-    if (
-        !currentScope
-    ) {
-        return;
-    }
-
-    await dbPutMeta(
-        stableStringify(
-            currentScope,
-        ),
-        {
-            lastEventId,
-            lastEpoch,
-            lastSeq,
-            lastRevision,
-        },
-    );
-}
-
-function applyStateCursor(
-    state,
-) {
-    if (!state) {
-        return;
-    }
-
-    if (
-        state.epoch
-    ) {
-        lastEpoch =
-            String(
-                state.epoch,
-            );
-    }
-
-    if (
-        Number.isSafeInteger(
-            Number(
-                state.seq,
+                    request.onerror =
+                        () =>
+                            resolve(
+                                {
+                                    key,
+                                    principal:
+                                        principalKey(),
+                                    scope:
+                                        scopeKey(
+                                            scope,
+                                        ),
+                                    lastEventId:
+                                        0,
+                                    epoch:
+                                        '',
+                                    revision:
+                                        0,
+                                    localSequence:
+                                        0,
+                                    baseSnapshot:
+                                        [],
+                                    baseMetadata:
+                                        {},
+                                },
+                            );
+                },
             ),
-        )
-    ) {
-        lastSeq =
-            Number(
-                state.seq,
-            );
-    }
-
-    if (
-        Number.isSafeInteger(
-            Number(
-                state.revision,
-            ),
-        )
-    ) {
-        lastRevision =
-            Number(
-                state.revision,
-            );
-    }
-
-    if (
-        state.lastEventId
-    ) {
-        lastEventId =
-            String(
-                state.lastEventId,
-            );
-    } else if (
-        lastEpoch &&
-        lastSeq >
-            0
-    ) {
-        lastEventId =
-            `${lastEpoch}:${lastSeq}`;
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Generation helpers                                                         */
-/* -------------------------------------------------------------------------- */
-
-function isLocalGenerationOwner() {
-    const generation =
-        currentState?.generation;
-
-    return Boolean(
-        generation &&
-        generation.ownerClientId ===
-            clientId &&
-        generation.ownerDeviceId ===
-            deviceId &&
-        localGenerationId ===
-            generation.id &&
-        !localGenerationLost,
     );
 }
 
-function activeGeneration() {
-    return (
-        currentState?.generation ||
-        null
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Generation claim                                                           */
-/* -------------------------------------------------------------------------- */
-
-async function claimGeneration(
-    generationType,
-    targetMessageId = null,
+async function writeMeta(
+    scope,
+    patch,
 ) {
-    if (
-        currentState?.generation
-    ) {
-        return isLocalGenerationOwner();
-    }
+    const current =
+        await readMeta(
+            scope,
+        );
 
-    const expectedScope =
-        currentEpoch();
+    return idb(
+        'meta',
+        'readwrite',
+        store =>
+            store.put({
+                ...current,
+                ...clone(patch),
+                key:
+                    metadataKey(
+                        scope,
+                    ),
+                principal:
+                    principalKey(),
+                scope:
+                    scopeKey(scope),
+                updatedAt:
+                    now(),
+            }),
+    );
+}
 
-    const generationId =
-        uuid();
+async function nextLocalSequence(
+    scope,
+) {
+    const key =
+        metadataKey(scope);
 
-    localGenerationId =
-        generationId;
+    return idb(
+        'meta',
+        'readwrite',
+        store =>
+            new Promise(
+                (
+                    resolve,
+                    reject,
+                ) => {
+                    const request =
+                        store.get(key);
 
-    localGenerationLost =
-        false;
+                    request.onerror =
+                        () =>
+                            reject(
+                                request.error,
+                            );
 
-    localStopRequested =
-        false;
+                    request.onsuccess =
+                        () => {
+                            const existing =
+                                request.result
+                                || {
+                                    key,
+                                    principal:
+                                        principalKey(),
+                                    scope:
+                                        scopeKey(
+                                            scope,
+                                        ),
+                                    lastEventId:
+                                        0,
+                                    epoch:
+                                        '',
+                                    revision:
+                                        0,
+                                    localSequence:
+                                        0,
+                                    baseSnapshot:
+                                        [],
+                                    baseMetadata:
+                                        {},
+                                };
 
-    try {
-        const result =
-            await api(
-                '/event',
-                {
-                    method:
-                        'POST',
+                            const next =
+                                Number(
+                                    existing
+                                        .localSequence
+                                    || 0,
+                                ) + 1;
 
-                    body: {
-                        protocolVersion:
-                            PROTOCOL_VERSION,
+                            const write =
+                                store.put({
+                                    ...existing,
+                                    key,
+                                    principal:
+                                        principalKey(),
+                                    scope:
+                                        scopeKey(
+                                            scope,
+                                        ),
+                                    localSequence:
+                                        next,
+                                    updatedAt:
+                                        now(),
+                                });
 
-                        clientId,
+                            write.onerror =
+                                () =>
+                                    reject(
+                                        write.error,
+                                    );
 
-                        deviceId,
+                            write.onsuccess =
+                                () =>
+                                    resolve(
+                                        next,
+                                    );
+                        };
+                },
+            ),
+    );
+}
 
-                        scope:
-                            currentScope,
+async function listQueuedOps(
+    scope,
+) {
+    const principalScope =
+        principalScopeKey(
+            scope,
+        );
 
-                        opId:
-                            uuid(),
+    return idb(
+        'ops',
+        'readonly',
+        store =>
+            new Promise(
+                resolve => {
+                    const result = [];
 
-                        type:
-                            'generation_claim',
+                    const index =
+                        store.index(
+                            'principalScope',
+                        );
 
-                        generationId,
-
-                        generationType:
-                            String(
-                                generationType ||
-                                    'unknown',
+                    const request =
+                        index.openCursor(
+                            IDBKeyRange.only(
+                                principalScope,
                             ),
+                        );
 
-                        targetMessageId,
+                    request.onsuccess =
+                        () => {
+                            const cursor =
+                                request.result;
 
-                        baseRevision:
-                            lastRevision,
-                    },
+                            if (!cursor) {
+                                result.sort(
+                                    (
+                                        a,
+                                        b,
+                                    ) =>
+                                        (
+                                            Number(
+                                                a.localSequence,
+                                            )
+                                            - Number(
+                                                b.localSequence,
+                                            )
+                                        )
+                                        || (
+                                            Number(
+                                                a.createdAt,
+                                            )
+                                            - Number(
+                                                b.createdAt,
+                                            )
+                                        ),
+                                );
+
+                                resolve(
+                                    result,
+                                );
+
+                                return;
+                            }
+
+                            result.push(
+                                cursor.value,
+                            );
+
+                            cursor.continue();
+                        };
+
+                    request.onerror =
+                        () => resolve(
+                            result,
+                        );
                 },
-            );
-
-        if (
-            expectedScope !==
-            currentEpoch()
-        ) {
-            localGenerationLost =
-                true;
-
-            return false;
-        }
-
-        if (
-            result.state
-        ) {
-            applyStateCursor(
-                result.state,
-            );
-
-            currentState =
-                currentState ||
-                {};
-
-            currentState.generation =
-                result.state
-                    .generation
-                    ? clone(
-                        result.state
-                            .generation,
-                    )
-                    : null;
-        }
-
-        if (
-            result.state
-                ?.generation
-                ?.id !==
-            generationId
-        ) {
-            localGenerationLost =
-                true;
-
-            return false;
-        }
-
-        setStatus(
-            'Generation owner',
-            'This client owns the generation lease',
-        );
-
-        await persistCursor();
-
-        return true;
-    } catch (error) {
-        localGenerationLost =
-            true;
-
-        if (
-            error.code ===
-            'generation_owned'
-        ) {
-            try {
-                ctx.stopGeneration?.();
-            } catch {
-                // ignored
-            }
-
-            setStatus(
-                'Generation busy',
-                'Another client owns generation',
-            );
-        } else if (
-            error.code ===
-            'stale_revision'
-        ) {
-            await resyncCurrentScope(
-                'generation claim conflict',
-            );
-
-            try {
-                ctx.stopGeneration?.();
-            } catch {
-                // ignored
-            }
-        } else {
-            warn(
-                'Generation claim failed',
-                error,
-            );
-        }
-
-        return false;
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Pre-generation interceptor                                                  */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Current ST resolves generate_interceptor by looking up the configured
- * function name on globalThis.
- *
- * Therefore this is deliberately attached to globalThis.
- *
- * IMPORTANT:
- * The manifest still needs:
- *
- * "generate_interceptor": "multiClientSyncGenerateInterceptor"
- *
- * to activate this pre-generation gate.
- */
-async function multiClientSyncGenerateInterceptor(
-    chat,
-    contextSize,
-    abort,
-    type,
-) {
-    if (
-        !getSettings().enabled
-    ) {
-        return;
-    }
-
-    const available =
-        await ensureConnected();
-
-    /*
-     * Missing plugin must never break ordinary Tavern generation.
-     */
-    if (!available) {
-        return;
-    }
-
-    const generation =
-        activeGeneration();
-
-    if (
-        generation &&
-        !isLocalGenerationOwner()
-    ) {
-        abort(
-            true,
-        );
-
-        return;
-    }
-
-    const targetMessageId =
-        getLastMessageSyncId();
-
-    const claimed =
-        await claimGeneration(
-            type,
-            targetMessageId,
-        );
-
-    if (
-        !claimed
-    ) {
-        abort(
-            true,
-        );
-    }
-}
-
-globalThis.multiClientSyncGenerateInterceptor =
-    multiClientSyncGenerateInterceptor;
-
-
-/* -------------------------------------------------------------------------- */
-/* Stable message identity                                                    */
-/* -------------------------------------------------------------------------- */
-
-function getLastMessageSyncId() {
-    const snapshot =
-        makeLocalSnapshot();
-
-    if (
-        !snapshot ||
-        snapshot.chat.length <
-            2
-    ) {
-        return null;
-    }
-
-    for (
-        let index =
-            snapshot.chat.length -
-            1;
-        index >= 1;
-        index--
-    ) {
-        const id =
-            snapshot.chat[index]
-                ?.extra
-                ?.[MESSAGE_NAMESPACE]
-                ?.messageId;
-
-        if (id) {
-            return id;
-        }
-    }
-
-    return null;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Three-way merge                                                            */
-/* -------------------------------------------------------------------------- */
-
-function messageId(
-    message,
-) {
-    return (
-        message
-            ?.extra
-            ?.[MESSAGE_NAMESPACE]
-            ?.messageId ||
-        null
+            ),
     );
 }
 
-function messageMap(
-    chat,
+async function putOperation(
+    operation,
 ) {
-    const result =
-        new Map();
+    return idb(
+        'ops',
+        'readwrite',
+        store =>
+            store.put({
+                ...clone(operation),
+
+                key:
+                    operationKey(
+                        operation,
+                    ),
+
+                principalScope:
+                    principalScopeKey(
+                        operation.scope,
+                    ),
+
+                scope:
+                    scopeKey(
+                        operation.scope,
+                    ),
+            }),
+    );
+}
+
+async function deleteOperation(
+    operation,
+) {
+    return idb(
+        'ops',
+        'readwrite',
+        store =>
+            store.delete(
+                operation.key
+                || operationKey(
+                    operation,
+                ),
+            ),
+    );
+}
+
+async function clearOwnData() {
+    const db =
+        await openDb();
+
+    const principal =
+        principalKey();
 
     for (
-        let index = 1;
-        index < chat.length;
-        index++
+        const storeName
+        of [
+            'ops',
+            'meta',
+        ]
     ) {
-        const id =
-            messageId(
-                chat[index],
-            );
+        await idb(
+            storeName,
+            'readwrite',
+            store =>
+                new Promise(
+                    (
+                        resolve,
+                        reject,
+                    ) => {
+                        const index =
+                            storeName
+                                === 'ops'
+                                ? store.index(
+                                    'principalScope',
+                                )
+                                : store.index(
+                                    'principal',
+                                );
 
-        if (
-            id
-        ) {
-            result.set(
-                id,
-                {
-                    message:
-                        chat[index],
+                        const range =
+                            storeName
+                                === 'ops'
+                                ? IDBKeyRange.bound(
+                                    `${principal}|`,
+                                    `${principal}|\uffff`,
+                                )
+                                : IDBKeyRange.only(
+                                    principal,
+                                );
 
-                    index,
-                },
-            );
-        }
+                        const request =
+                            index.openCursor(
+                                range,
+                            );
+
+                        request.onsuccess =
+                            () => {
+                                const cursor =
+                                    request.result;
+
+                                if (!cursor) {
+                                    resolve();
+                                    return;
+                                }
+
+                                cursor.delete();
+                                cursor.continue();
+                            };
+
+                        request.onerror =
+                            () =>
+                                reject(
+                                    request.error,
+                                );
+                    },
+                ),
+        );
     }
 
-    return result;
+    db.close();
+
+    dbPromise =
+        null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Merge                                                                       */
+/* -------------------------------------------------------------------------- */
+
+function messageEqual(
+    a,
+    b,
+) {
+    return JSON.stringify(a)
+        === JSON.stringify(b);
 }
 
 function mergeSnapshots(
@@ -2104,237 +2027,102 @@ function mergeSnapshots(
     local,
     remote,
 ) {
-    const conflicts =
-        [];
-
-    const baseChat =
-        base?.chat || [];
-
-    const localChat =
-        local?.chat || [];
-
-    const remoteChat =
-        remote?.chat || [];
-
-    const baseMap =
-        messageMap(
-            baseChat,
+    const B =
+        normalizeSnapshot(
+            base || [],
         );
 
-    const localMap =
-        messageMap(
-            localChat,
+    const L =
+        normalizeSnapshot(
+            local || [],
         );
 
-    const remoteMap =
-        messageMap(
-            remoteChat,
+    const R =
+        normalizeSnapshot(
+            remote || [],
         );
 
-    /*
-     * A precise merge is impossible if one side does not have stable IDs.
-     * Use authoritative remote state instead of guessing.
-     */
-    for (
-        const chat of [
-            baseChat,
-            localChat,
-            remoteChat,
-        ]
+    if (
+        messageEqual(
+            L,
+            B,
+        )
     ) {
-        for (
-            let i = 1;
-            i < chat.length;
-            i++
-        ) {
-            if (
-                !messageId(
-                    chat[i],
-                )
-            ) {
-                conflicts.push({
-                    type:
-                        'legacy_message_identity',
-
-                    policy:
-                        'remote_wins',
-                });
-
-                return {
-                    snapshot:
-                        clone(
-                            remote,
-                        ),
-
-                    conflicts,
-                };
-            }
-        }
+        return R;
     }
 
-    const ids =
+    if (
+        messageEqual(
+            R,
+            B,
+        )
+    ) {
+        return L;
+    }
+
+    const mapById =
+        list =>
+            new Map(
+                list.map(
+                    message => [
+                        stableMessageId(
+                            message,
+                        ),
+                        message,
+                    ],
+                ),
+            );
+
+    const bm =
+        mapById(B);
+
+    const lm =
+        mapById(L);
+
+    const rm =
+        mapById(R);
+
+    const allIds =
         new Set([
-            ...baseMap.keys(),
-            ...localMap.keys(),
-            ...remoteMap.keys(),
+            ...bm.keys(),
+            ...lm.keys(),
+            ...rm.keys(),
         ]);
 
-    const mergedById =
+    const chosen =
         new Map();
 
+    /*
+     * Conflict rule:
+     *
+     *   1. Identical => keep it.
+     *   2. One side unchanged from base => take the changed side.
+     *   3. If either side deleted a message that existed in base,
+     *      deletion wins. This prevents resurrection.
+     *   4. Otherwise remote wins same-message content conflict.
+     */
     for (
-        const id of ids
+        const id
+        of allIds
     ) {
         const b =
-            baseMap.get(id)
-                ?.message;
+            bm.get(id);
 
         const l =
-            localMap.get(id)
-                ?.message;
+            lm.get(id);
 
         const r =
-            remoteMap.get(id)
-                ?.message;
-
-        const bExists =
-            Boolean(b);
-
-        const lExists =
-            Boolean(l);
-
-        const rExists =
-            Boolean(r);
+            rm.get(id);
 
         if (
-            !bExists
-        ) {
-            if (
-                lExists &&
-                rExists
-            ) {
-                if (
-                    sameValue(
-                        l,
-                        r,
-                    )
-                ) {
-                    mergedById.set(
-                        id,
-                        clone(l),
-                    );
-                } else {
-                    /*
-                     * Deterministic conflict policy.
-                     */
-                    mergedById.set(
-                        id,
-                        clone(r),
-                    );
-
-                    conflicts.push({
-                        type:
-                            'concurrent_insert',
-
-                        messageId:
-                            id,
-
-                        policy:
-                            'remote_wins',
-                    });
-                }
-            } else if (
-                lExists
-            ) {
-                mergedById.set(
-                    id,
-                    clone(l),
-                );
-            } else if (
-                rExists
-            ) {
-                mergedById.set(
-                    id,
-                    clone(r),
-                );
-            }
-
-            continue;
-        }
-
-        const localChanged =
-            lExists &&
-            !sameValue(
+            l
+            && r
+            && messageEqual(
                 l,
-                b,
-            );
-
-        const remoteChanged =
-            rExists &&
-            !sameValue(
                 r,
-                b,
-            );
-
-        if (
-            !lExists &&
-            !rExists
+            )
         ) {
-            continue;
-        }
-
-        if (
-            !lExists
-        ) {
-            if (
-                remoteChanged
-            ) {
-                conflicts.push({
-                    type:
-                        'delete_vs_change',
-
-                    messageId:
-                        id,
-
-                    policy:
-                        'remote_wins',
-                });
-
-                mergedById.set(
-                    id,
-                    clone(r),
-                );
-            }
-
-            continue;
-        }
-
-        if (
-            !rExists
-        ) {
-            if (
-                localChanged
-            ) {
-                conflicts.push({
-                    type:
-                        'change_vs_delete',
-
-                    messageId:
-                        id,
-
-                    policy:
-                        'remote_wins',
-                });
-            }
-
-            continue;
-        }
-
-        if (
-            localChanged &&
-            !remoteChanged
-        ) {
-            mergedById.set(
+            chosen.set(
                 id,
                 clone(l),
             );
@@ -2342,3606 +2130,2366 @@ function mergeSnapshots(
             continue;
         }
 
-        if (
-            !localChanged &&
-            remoteChanged
-        ) {
-            mergedById.set(
-                id,
-                clone(r),
-            );
+        const localDeleted =
+            !l
+            && !!b;
 
+        const remoteDeleted =
+            !r
+            && !!b;
+
+        if (
+            localDeleted
+            || remoteDeleted
+        ) {
             continue;
         }
 
         if (
-            localChanged &&
-            remoteChanged
+            l
+            && b
+            && messageEqual(
+                l,
+                b,
+            )
         ) {
-            if (
-                sameValue(
-                    l,
-                    r,
-                )
-            ) {
-                mergedById.set(
-                    id,
-                    clone(l),
-                );
-            } else {
-                mergedById.set(
+            if (r) {
+                chosen.set(
                     id,
                     clone(r),
                 );
-
-                conflicts.push({
-                    type:
-                        'concurrent_edit',
-
-                    messageId:
-                        id,
-
-                    policy:
-                        'remote_wins',
-                });
             }
 
             continue;
         }
 
-        mergedById.set(
-            id,
-            clone(b),
-        );
-    }
-
-    /*
-     * Preserve remote ordering for shared messages.
-     */
-    const resultMessages =
-        [];
-
-    const emitted =
-        new Set();
-
-    for (
-        let index = 1;
-        index <
-            remoteChat.length;
-        index++
-    ) {
-        const id =
-            messageId(
-                remoteChat[index],
-            );
-
         if (
-            id &&
-            mergedById.has(
-                id,
+            r
+            && b
+            && messageEqual(
+                r,
+                b,
             )
         ) {
-            resultMessages.push(
-                clone(
-                    mergedById.get(
-                        id,
-                    ),
-                ),
-            );
+            if (l) {
+                chosen.set(
+                    id,
+                    clone(l),
+                );
+            }
 
-            emitted.add(
-                id,
-            );
-        }
-    }
-
-    /*
-     * Insert local-only messages deterministically after their nearest surviving
-     * predecessor.
-     */
-    for (
-        let index = 1;
-        index <
-            localChat.length;
-        index++
-    ) {
-        const id =
-            messageId(
-                localChat[index],
-            );
-
-        if (
-            !id ||
-            emitted.has(id) ||
-            !mergedById.has(id)
-        ) {
             continue;
         }
 
-        let insertAt =
-            resultMessages.length;
+        if (r) {
+            chosen.set(
+                id,
+                clone(r),
+            );
+        } else if (l) {
+            chosen.set(
+                id,
+                clone(l),
+            );
+        }
+    }
+
+    const active =
+        new Set(
+            chosen.keys(),
+        );
+
+    const edges =
+        new Map();
+
+    const indegree =
+        new Map();
+
+    for (
+        const id
+        of active
+    ) {
+        edges.set(
+            id,
+            new Set(),
+        );
+
+        indegree.set(
+            id,
+            0,
+        );
+    }
+
+    function addConstraints(
+        list,
+    ) {
+        let previous = null;
 
         for (
-            let previous =
-                index - 1;
-            previous >= 1;
-            previous--
+            const message
+            of list
         ) {
-            const previousId =
-                messageId(
-                    localChat[previous],
-                );
-
-            const anchor =
-                resultMessages.findIndex(
-                    message =>
-                        messageId(
-                            message,
-                        ) ===
-                        previousId,
+            const id =
+                stableMessageId(
+                    message,
                 );
 
             if (
-                anchor >= 0
+                !id
+                || !active.has(id)
             ) {
-                insertAt =
-                    anchor + 1;
-
-                break;
+                continue;
             }
-        }
 
-        resultMessages.splice(
-            insertAt,
-            0,
-            clone(
-                mergedById.get(
+            if (
+                previous
+                && previous !== id
+                && !edges
+                    .get(
+                        previous,
+                    )
+                    .has(id)
+            ) {
+                edges
+                    .get(
+                        previous,
+                    )
+                    .add(id);
+
+                indegree.set(
                     id,
-                ),
-            ),
-        );
-
-        emitted.add(
-            id,
-        );
-
-        conflicts.push({
-            type:
-                'concurrent_insert_position',
-
-            messageId:
-                id,
-
-            policy:
-                'deterministic_anchor',
-        });
-    }
-
-    /*
-     * Metadata merge.
-     */
-    const mergedMetadata =
-        clone(
-            remote?.chatMetadata ||
-                {},
-        );
-
-    const baseMetadata =
-        base?.chatMetadata ||
-            {};
-
-    const localMetadata =
-        local?.chatMetadata ||
-            {};
-
-    const metadataKeys =
-        new Set([
-            ...Object.keys(
-                baseMetadata,
-            ),
-            ...Object.keys(
-                localMetadata,
-            ),
-            ...Object.keys(
-                remote?.chatMetadata ||
-                    {},
-            ),
-        ]);
-
-    for (
-        const key of
-            metadataKeys
-    ) {
-        const b =
-            baseMetadata[key];
-
-        const l =
-            localMetadata[key];
-
-        const r =
-            remote?.chatMetadata?.[
-                key
-            ];
-
-        const localChanged =
-            !sameValue(
-                l,
-                b,
-            );
-
-        const remoteChanged =
-            !sameValue(
-                r,
-                b,
-            );
-
-        if (
-            localChanged &&
-            !remoteChanged
-        ) {
-            mergedMetadata[key] =
-                clone(l);
-        } else if (
-            localChanged &&
-            remoteChanged &&
-            !sameValue(
-                l,
-                r,
-            )
-        ) {
-            conflicts.push({
-                type:
-                    'metadata_conflict',
-
-                key,
-
-                policy:
-                    'remote_wins',
-            });
-        }
-    }
-
-    return {
-        snapshot: {
-            chat: [
-                clone(
-                    remoteChat[0] ||
-                        {
-                            chat_metadata:
-                                {},
-                        },
-                ),
-                ...resultMessages,
-            ],
-
-            chatMetadata:
-                mergedMetadata,
-        },
-
-        conflicts,
-    };
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Pending queue                                                              */
-/* -------------------------------------------------------------------------- */
-
-const COALESCIBLE_TYPES =
-    new Set([
-        'message_sent',
-        'message_received',
-        'message_edited',
-        'message_updated',
-        'message_swiped',
-        'message_reasoning_edited',
-        'message_reasoning_deleted',
-        'stream_reasoning_done',
-        'tool_calls_performed',
-    ]);
-
-function pendingBytes(
-    operations,
-) {
-    return operations.reduce(
-        (
-            total,
-            operation,
-        ) =>
-            total +
-            JSON.stringify(
-                operation,
-            ).length,
-        0,
-    );
-}
-
-async function enqueueLocalMutation(
-    type,
-    payload = {},
-) {
-    if (
-        applyingRemoteDepth >
-            0 ||
-        !pluginAvailable ||
-        !currentScope ||
-        !currentState ||
-        !getSettings().enabled
-    ) {
-        return;
-    }
-
-    /*
-     * A remote generation owner controls ordinary chat state until its terminal
-     * event. The non-owner must not manufacture conflicting writes.
-     */
-    if (
-        currentState.generation &&
-        !isLocalGenerationOwner()
-    ) {
-        return;
-    }
-
-    const saved =
-        await saveCurrentChat(
-            type,
-        );
-
-    if (
-        !saved
-    ) {
-        setStatus(
-            'Save pending',
-            'SillyTavern did not confirm the current local save',
-        );
-
-        return;
-    }
-
-    const migrated =
-        ensureMessageIds(
-            ctx.chat,
-        );
-
-    if (
-        migrated
-    ) {
-        const idsSaved =
-            await saveCurrentChat(
-                'stable-message-id-migration',
-            );
-
-        if (
-            !idsSaved
-        ) {
-            return;
-        }
-    }
-
-    const snapshot =
-        makeLocalSnapshot();
-
-    if (!snapshot) {
-        return;
-    }
-
-    let operations =
-        await dbGetOperations(
-            currentScope,
-        );
-
-    const serialized =
-        JSON.stringify(
-            snapshot,
-        );
-
-    if (
-        serialized.length >
-            MAX_PENDING_BYTES
-    ) {
-        setStatus(
-            'Chat too large',
-            'Local synchronization snapshot exceeds the client queue limit',
-        );
-
-        return;
-    }
-
-    if (
-        COALESCIBLE_TYPES.has(
-            type,
-        ) &&
-        operations.length
-    ) {
-        const last =
-            operations[
-                operations.length - 1
-            ];
-
-        if (
-            last.coalescible
-        ) {
-            await dbDeleteOperation(
-                last.opId,
-            );
-
-            operations =
-                operations.slice(
-                    0,
-                    -1,
+                    indegree.get(id)
+                        + 1,
                 );
+            }
+
+            previous = id;
         }
     }
 
-    if (
-        operations.length >=
-        MAX_LOCAL_QUEUE
+    addConstraints(B);
+    addConstraints(L);
+    addConstraints(R);
+
+    /*
+     * Deterministic final ordering:
+     * topological order first, then lexicographic message ID.
+     */
+    const result = [];
+
+    const remaining =
+        new Set(active);
+
+    while (
+        remaining.size
     ) {
-        setStatus(
-            'Sync queue full',
-            'Local changes are not being silently discarded',
+        const ready =
+            [...remaining]
+                .filter(
+                    id =>
+                        indegree.get(id)
+                            === 0,
+                )
+                .sort();
+
+        const nextId =
+            ready[0]
+            || [...remaining]
+                .sort()[0];
+
+        result.push(
+            clone(
+                chosen.get(
+                    nextId,
+                ),
+            ),
         );
 
-        return;
-    }
-
-    localSequence +=
-        1;
-
-    const operation = {
-        principalKey,
-
-        opId:
-            uuid(),
-
-        localSeq:
-            localSequence,
-
-        scope:
-            clone(
-                currentScope,
-            ),
-
-        type,
-
-        payload:
-            clone(
-                payload,
-            ),
-
-        snapshot:
-            clone(
-                snapshot,
-            ),
-
-        baseSnapshot:
-            clone(
-                currentState.serverSnapshot ||
-                    snapshot,
-            ),
-
-        baseRevision:
-            lastRevision,
-
-        coalescible:
-            COALESCIBLE_TYPES.has(
-                type,
-            ),
-    };
-
-    operations.push(
-        operation,
-    );
-
-    if (
-        pendingBytes(
-            operations,
-        ) >
-        MAX_PENDING_BYTES
-    ) {
-        setStatus(
-            'Sync queue full',
-            'Durable local queue limit reached',
+        remaining.delete(
+            nextId,
         );
 
-        return;
+        for (
+            const child
+            of edges.get(
+                nextId,
+            ) || []
+        ) {
+            indegree.set(
+                child,
+                Math.max(
+                    0,
+                    indegree.get(
+                        child,
+                    ) - 1,
+                ),
+            );
+        }
     }
 
-    await dbPutOperation(
-        operation,
+    return normalizeSnapshot(
+        result,
     );
-
-    broadcastLocalChange(
-        type,
-    );
-
-    await drainPendingQueue();
 }
 
-async function rebasePendingQueue(
-    remoteSnapshot,
-    remoteRevision,
-) {
-    const operations =
-        await dbGetOperations(
-            currentScope,
-        );
+/* -------------------------------------------------------------------------- */
+/* Local application                                                           */
+/* -------------------------------------------------------------------------- */
 
-    if (
-        !operations.length
-    ) {
-        return null;
-    }
-
-    let baseSnapshot =
-        clone(
-            remoteSnapshot,
-        );
-
-    let baseRevision =
-        Number(
-            remoteRevision,
-        ) || 0;
-
-    for (
-        const operation of
-            operations
-    ) {
-        const merged =
-            mergeSnapshots(
-                operation.baseSnapshot ||
-                    baseSnapshot,
-                operation.snapshot,
-                baseSnapshot,
-            );
-
-        operation.baseSnapshot =
-            clone(
-                baseSnapshot,
-            );
-
-        operation.baseRevision =
-            baseRevision;
-
-        operation.snapshot =
-            clone(
-                merged.snapshot,
-            );
-
-        baseSnapshot =
-            clone(
-                merged.snapshot,
-            );
-
-        /*
-         * The queue is submitted sequentially. Once this operation is accepted,
-         * the next one will be based on the next revision.
-         */
-        baseRevision +=
-            1;
-
-        await dbPutOperation(
-            operation,
-        );
-    }
-
-    return baseSnapshot;
-}
-
-async function sendPendingOperation(
-    operation,
+async function applySnapshotLocally(
+    snapshot,
+    metadata,
+    expectedEpoch,
+    reason,
+    expectedScope,
 ) {
     if (
-        !currentScope ||
-        !pluginAvailable ||
-        !sameScope(
-            currentScope,
-            operation.scope,
+        !scopeIsCurrent(
+            expectedEpoch,
+            expectedScope,
         )
     ) {
         return false;
     }
 
-    try {
-        const result =
-            await api(
-                '/event',
-                {
-                    method:
-                        'POST',
-
-                    body: {
-                        protocolVersion:
-                            PROTOCOL_VERSION,
-
-                        clientId,
-
-                        deviceId,
-
-                        scope:
-                            operation.scope,
-
-                        opId:
-                            operation.opId,
-
-                        type:
-                            operation.type,
-
-                        payload:
-                            operation.payload,
-
-                        snapshot:
-                            operation.snapshot,
-
-                        baseSnapshot:
-                            operation.baseSnapshot,
-
-                        baseRevision:
-                            operation.baseRevision,
-                    },
-                },
-            );
-
-        if (
-            result.state
-        ) {
-            applyStateCursor(
-                result.state,
-            );
-
-            currentState.serverSnapshot =
-                result.state.snapshot
-                    ? normalizeSnapshot(
-                        result.state
-                            .snapshot,
-                    )
-                    : currentState.serverSnapshot;
-
-            currentState.generation =
-                result.state.generation
-                    ? clone(
-                        result.state
-                            .generation,
-                    )
-                    : null;
-        }
-
-        await dbDeleteOperation(
-            operation.opId,
+    const next =
+        normalizeSnapshot(
+            snapshot,
         );
 
-        await persistCursor();
+    const nextMetadata =
+        isObject(metadata)
+            ? clone(metadata)
+            : {};
 
-        return true;
-    } catch (error) {
+    applyingRemoteDepth++;
+
+    try {
         if (
-            error.code ===
-                'st_not_persisted'
-        ) {
-            await saveCurrentChat(
-                'pending-save-retry',
-            );
-
-            operation.snapshot =
-                makeLocalSnapshot();
-
-            operation.opId =
-                uuid();
-
-            await dbPutOperation(
-                operation,
-            );
-
-            return false;
-        }
-
-        if (
-            error.code ===
-            'stale_revision'
-        ) {
-            if (
-                error.state
-                    ?.snapshot
-            ) {
-                const remoteSnapshot =
-                    normalizeSnapshot(
-                        error.state
-                            .snapshot,
-                    );
-
-                const merged =
-                    mergeSnapshots(
-                        operation.baseSnapshot ||
-                            currentState.serverSnapshot ||
-                            remoteSnapshot,
-
-                        operation.snapshot,
-
-                        remoteSnapshot,
-                    );
-
-                applyStateCursor(
-                    error.state,
-                );
-
-                currentState.serverSnapshot =
-                    remoteSnapshot;
-
-                operation.baseSnapshot =
-                    clone(
-                        remoteSnapshot,
-                    );
-
-                operation.baseRevision =
-                    lastRevision;
-
-                operation.snapshot =
-                    clone(
-                        merged.snapshot,
-                    );
-
-                operation.opId =
-                    uuid();
-
-                await applySnapshotLocally(
-                    merged.snapshot,
-                    {
-                        persist:
-                            true,
-
-                        reason:
-                            'stale-revision-rebase',
-                    },
-                );
-
-                await dbPutOperation(
-                    operation,
-                );
-
-                return sendPendingOperation(
-                    operation,
-                );
-            }
-
-            await resyncCurrentScope(
-                'stale revision',
-            );
-
-            return false;
-        }
-
-        if (
-            error.code ===
-            'generation_lock'
-        ) {
-            return false;
-        }
-
-        if (
-            [
-                'not_member',
-                'membership_expired',
-                'scope_not_found',
-            ].includes(
-                error.code,
+            !scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
             )
         ) {
-            await reconnectScope(
-                'membership recovery',
-            );
-
             return false;
         }
 
+        ctx =
+            getContext();
+
+        ctx.chat.splice(
+            0,
+            ctx.chat.length,
+            ...next,
+        );
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
+            )
+        ) {
+            return false;
+        }
+
+        ctx.updateChatMetadata?.(
+            nextMetadata,
+            true,
+        );
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
+            )
+        ) {
+            return false;
+        }
+
+        await ctx.printMessages?.();
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
+            )
+        ) {
+            return false;
+        }
+
+        await ctx.saveChat?.();
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
+            )
+        ) {
+            return false;
+        }
+
+        hostMessageIdsDirty =
+            false;
+
+        log(
+            'remote snapshot applied',
+            reason,
+        );
+
+        return true;
+    } finally {
+        applyingRemoteDepth =
+            Math.max(
+                0,
+                applyingRemoteDepth - 1,
+            );
+    }
+}
+
+async function applyGroupSettings(
+    groupSettings,
+    expectedEpoch,
+) {
+    if (
+        !settings.syncGroupSettings
+        || !currentScope
+        || currentScope.kind
+            !== 'group'
+        || !isObject(
+            groupSettings,
+        )
+        || !scopeIsCurrent(
+            expectedEpoch,
+        )
+    ) {
+        return false;
+    }
+
+    const group =
+        ctx.groups?.find(
+            item =>
+                String(item.id)
+                === String(
+                    currentScope.groupId,
+                ),
+        );
+
+    if (!group) {
+        return false;
+    }
+
+    applyingRemoteDepth++;
+
+    try {
+        const allowedKeys = [
+            'name',
+            'members',
+            'disabled_members',
+            'chat_id',
+            'chats',
+            'generation_mode',
+            'generation_mode_join_prefix',
+            'generation_mode_join_suffix',
+            'activation_strategy',
+            'auto_mode_delay',
+            'allow_self_responses',
+            'avatar_url',
+            'hideMutedSprites',
+            'fav',
+        ];
+
+        for (
+            const key
+            of allowedKeys
+        ) {
+            if (
+                Object.prototype
+                    .hasOwnProperty
+                    .call(
+                        groupSettings,
+                        key,
+                    )
+            ) {
+                group[key] =
+                    clone(
+                        groupSettings[key],
+                    );
+            }
+        }
+
+        const groupModule =
+            await import(
+                '/scripts/group-chats.js'
+            );
+
+        if (
+            typeof groupModule.editGroup
+                === 'function'
+        ) {
+            await groupModule.editGroup(
+                String(
+                    currentScope.groupId,
+                ),
+                true,
+                false,
+            );
+        }
+
+        return scopeIsCurrent(
+            expectedEpoch,
+        );
+    } catch (error) {
         warn(
-            'Pending operation failed',
+            'group settings apply failed',
             error,
         );
 
         return false;
+    } finally {
+        applyingRemoteDepth =
+            Math.max(
+                0,
+                applyingRemoteDepth - 1,
+            );
     }
 }
 
-async function drainPendingQueue() {
-    if (
-        queueDrainPromise
-    ) {
-        return queueDrainPromise;
-    }
-
-    queueDrainPromise =
-        (async () => {
-            try {
-                const operations =
-                    await dbGetOperations(
-                        currentScope,
-                    );
-
-                for (
-                    const operation of
-                        operations
-                ) {
-                    const expectedEpoch =
-                        currentEpoch();
-
-                    const accepted =
-                        await sendPendingOperation(
-                            operation,
-                        );
-
-                    if (
-                        expectedEpoch !==
-                        currentEpoch()
-                    ) {
-                        return;
-                    }
-
-                    if (
-                        !accepted
-                    ) {
-                        break;
-                    }
-                }
-
-                const remaining =
-                    await dbGetOperations(
-                        currentScope,
-                    );
-
-                if (
-                    !remaining.length
-                ) {
-                    currentState.pendingCount =
-                        0;
-                } else {
-                    currentState.pendingCount =
-                        remaining.length;
-                }
-            } finally {
-                queueDrainPromise =
-                    null;
-            }
-        })();
-
-    return queueDrainPromise;
-}
-
-
 /* -------------------------------------------------------------------------- */
-/* Resync                                                                     */
+/* Queue                                                                       */
 /* -------------------------------------------------------------------------- */
 
-async function resyncCurrentScope(
-    reason = 'manual',
+async function coalesceSnapshotOperation(
+    operation,
 ) {
+    const queued =
+        await listQueuedOps(
+            operation.scope,
+        );
+
+    const previous =
+        queued.at(-1);
+
     if (
-        !currentScope ||
-        !pluginAvailable
+        !previous
+        || previous.type
+            !== 'snapshot'
+        || operation.type
+            !== 'snapshot'
+        || previous.inFlight
     ) {
         return false;
     }
 
-    if (
-        resyncPromise
-    ) {
-        return resyncPromise;
-    }
+    previous.snapshot =
+        clone(
+            operation.snapshot,
+        );
 
-    const expectedEpoch =
-        currentEpoch();
+    previous.chatMetadata =
+        operation.chatMetadata
+            !== undefined
+            ? clone(
+                operation.chatMetadata,
+            )
+            : previous.chatMetadata;
 
-    resyncPromise =
-        (async () => {
-            const previousEventSource =
-                eventSource;
+    previous.reason =
+        operation.reason;
 
-            closeSse();
+    previous.localSequence =
+        operation.localSequence;
 
-            try {
-                setStatus(
-                    'Resyncing',
-                    reason,
-                );
+    previous.updatedAt =
+        now();
 
-                const result =
-                    await api(
-                        '/state',
-                        {
-                            method:
-                                'POST',
+    await putOperation(
+        previous,
+    );
 
-                            body: {
-                                protocolVersion:
-                                    PROTOCOL_VERSION,
-
-                                clientId,
-
-                                deviceId,
-
-                                scope:
-                                    currentScope,
-                            },
-                        },
-                    );
-
-                if (
-                    expectedEpoch !==
-                    currentEpoch()
-                ) {
-                    return false;
-                }
-
-                const serverState =
-                    result.state;
-
-                applyStateCursor(
-                    serverState,
-                );
-
-                currentState =
-                    currentState ||
-                    {};
-
-                currentState.generation =
-                    serverState.generation
-                        ? clone(
-                            serverState.generation,
-                        )
-                        : null;
-
-                const serverSnapshot =
-                    serverState.snapshot
-                        ? normalizeSnapshot(
-                            serverState.snapshot,
-                        )
-                        : null;
-
-                currentState.serverSnapshot =
-                    serverSnapshot;
-
-                const pending =
-                    await dbGetOperations(
-                        currentScope,
-                    );
-
-                currentState.pendingCount =
-                    pending.length;
-
-                if (
-                    pending.length
-                ) {
-                    /*
-                     * Preserve the local pending intent, rebase it against the
-                     * authoritative server state, then save the resulting local
-                     * state through ST.
-                     */
-                    const rebased =
-                        await rebasePendingQueue(
-                            serverSnapshot,
-                            lastRevision,
-                        );
-
-                    if (
-                        rebased
-                    ) {
-                        await applySnapshotLocally(
-                            rebased,
-                            {
-                                persist:
-                                    true,
-
-                                reason:
-                                    'pending-rebase',
-                            },
-                        );
-                    }
-
-                    await drainPendingQueue();
-                } else if (
-                    serverSnapshot
-                ) {
-                    /*
-                     * With no pending operation, determine whether the local
-                     * browser state is simply stale or requires an explicit
-                     * out-of-band conflict choice.
-                     */
-                    const localSnapshot =
-                        makeLocalSnapshot();
-
-                    const localHash =
-                        localSnapshot
-                            ? await sha256(
-                                localSnapshot,
-                            )
-                            : null;
-
-                    const priorCursor =
-                        await dbGetMeta(
-                            stableStringify(
-                                currentScope,
-                            ),
-                        );
-
-                    const serverWon =
-                        Boolean(
-                            priorCursor?.epoch &&
-                            priorCursor.epoch ===
-                                serverState.epoch &&
-                            Number(
-                                priorCursor.revision,
-                            ) <
-                                Number(
-                                    serverState.revision,
-                                ),
-                        );
-
-                    if (
-                        localHash !==
-                        serverState.snapshotHash
-                    ) {
-                        if (
-                            serverWon
-                        ) {
-                            await applySnapshotLocally(
-                                serverSnapshot,
-                                {
-                                    persist:
-                                        true,
-
-                                    reason:
-                                        'server-newer',
-                                },
-                            );
-                        } else {
-                            showDivergenceChoice(
-                                localSnapshot,
-                                serverSnapshot,
-                            );
-                        }
-                    }
-                }
-
-                await persistCursor();
-
-                /*
-                 * Reconnect with an explicit fresh cursor now that state and
-                 * revision are known.
-                 */
-                connectSse();
-
-                setStatus(
-                    'Live',
-                    `revision ${lastRevision}`,
-                );
-
-                return true;
-            } catch (error) {
-                warn(
-                    'Resync failed',
-                    error,
-                );
-
-                if (
-                    previousEventSource
-                ) {
-                    // intentionally not reused; a fresh connection is safer
-                }
-
-                scheduleReconnect(
-                    error.code ||
-                        'resync-failed',
-                );
-
-                return false;
-            } finally {
-                resyncPromise =
-                    null;
-            }
-        })();
-
-    return resyncPromise;
+    return true;
 }
 
-function scheduleResync(
+async function enqueueMutation(
     reason,
+    expectedEpoch = scopeEpoch,
 ) {
     if (
-        resyncTimer
+        applyingRemoteDepth > 0
+        || !currentScope
+        || !settings.enabled
+        || !serverCompatible
+        || !scopeIsCurrent(
+            expectedEpoch,
+        )
     ) {
-        clearTimeout(
-            resyncTimer,
+        return;
+    }
+
+    const scopeAtStart =
+        clone(
+            currentScope,
+        );
+
+    const baseState =
+        currentState;
+
+    const messagesEnabled =
+        settings.syncMessages;
+
+    const metadataEnabled =
+        settings.syncMetadata;
+
+    if (
+        !messagesEnabled
+        && !metadataEnabled
+    ) {
+        return;
+    }
+
+    const snapshot =
+        messagesEnabled
+            ? localSnapshot()
+            : clone(
+                baseState
+                    ?.snapshot
+                || [],
+            );
+
+    if (
+        messagesEnabled
+        && hostMessageIdsDirty
+    ) {
+        try {
+            await ctx.saveChat?.();
+            hostMessageIdsDirty =
+                false;
+        } catch (error) {
+            warn(
+                'Could not persist message IDs',
+                error,
+            );
+
+            return;
+        }
+    }
+
+    if (
+        !scopeIsCurrent(
+            expectedEpoch,
+            scopeAtStart,
+        )
+    ) {
+        return;
+    }
+
+    const metadata =
+        metadataEnabled
+            ? localMetadata()
+            : undefined;
+
+    const baseSnapshot =
+        clone(
+            baseState?.snapshot
+            || [],
+        );
+
+    const baseMetadata =
+        clone(
+            baseState
+                ?.chatMetadata
+            || {},
+        );
+
+    if (
+        JSON.stringify(
+            snapshot,
+        )
+            === JSON.stringify(
+                baseSnapshot,
+            )
+        && (
+            !metadataEnabled
+            || JSON.stringify(
+                metadata,
+            )
+                === JSON.stringify(
+                    baseMetadata,
+                )
+        )
+    ) {
+        return;
+    }
+
+    const localSequence =
+        await nextLocalSequence(
+            scopeAtStart,
+        );
+
+    const operation = {
+        opId:
+            randomId('op_'),
+
+        type:
+            metadataEnabled
+            && !messagesEnabled
+                ? 'metadata'
+                : 'snapshot',
+
+        reason,
+
+        createdAt:
+            now(),
+
+        updatedAt:
+            now(),
+
+        localSequence,
+
+        scope:
+            scopeAtStart,
+
+        baseRevision:
+            Number(
+                baseState
+                    ?.revision
+                || 0,
+            ),
+
+        baseSnapshot,
+
+        baseMetadata,
+
+        snapshot,
+
+        ...(metadataEnabled
+            ? {
+                chatMetadata:
+                    metadata,
+            }
+            : {}),
+    };
+
+    const queued =
+        await listQueuedOps(
+            scopeAtStart,
+        );
+
+    if (
+        queued.length
+        >= MAX_QUEUE
+    ) {
+        await deleteOperation(
+            queued[0],
+        );
+
+        toast(
+            'warning',
+            'The synchronization queue was full; the oldest pending operation was dropped.',
         );
     }
 
-    resyncTimer =
-        setTimeout(
-            () => {
-                resyncTimer =
-                    null;
-
-                void resyncCurrentScope(
-                    reason,
-                );
-            },
-            RESYNC_DELAY_MS,
+    if (
+        await coalesceSnapshotOperation(
+            operation,
+        )
+    ) {
+        void flushQueue(
+            expectedEpoch,
         );
-}
 
+        return;
+    }
 
-/* -------------------------------------------------------------------------- */
-/* Divergence choice                                                          */
-/* -------------------------------------------------------------------------- */
+    await putOperation(
+        operation,
+    );
 
-function showDivergenceChoice(
-    localSnapshot,
-    serverSnapshot,
-) {
-    setStatus(
-        'Sync conflict',
-        'The browser and server contain different state',
-        [
-            {
-                label:
-                    'Use server',
-
-                run:
-                    async () => {
-                        await applySnapshotLocally(
-                            serverSnapshot,
-                            {
-                                persist:
-                                    true,
-
-                                reason:
-                                    'user-chose-server',
-                            },
-                        );
-                    },
-            },
-            {
-                label:
-                    'Use current chat',
-
-                run:
-                    async () => {
-                        await reconcileLocalToServer(
-                            localSnapshot,
-                        );
-                    },
-            },
-        ],
+    void flushQueue(
+        expectedEpoch,
     );
 }
 
-async function reconcileLocalToServer(
-    snapshot,
+async function rebaseOperation(
+    operation,
+    serverState,
 ) {
+    const localDesired =
+        mergeSnapshots(
+            operation.baseSnapshot
+                || [],
+            operation.snapshot
+                || [],
+            serverState.snapshot
+                || [],
+        );
+
+    const hasMetadata =
+        Object.prototype
+            .hasOwnProperty
+            .call(
+                operation,
+                'chatMetadata',
+            );
+
+    let mergedMetadata =
+        serverState
+            .chatMetadata
+        || {};
+
+    if (hasMetadata) {
+        const base =
+            operation.baseMetadata
+            || {};
+
+        const local =
+            operation.chatMetadata
+            || {};
+
+        const remote =
+            serverState.chatMetadata
+            || {};
+
+        if (
+            JSON.stringify(local)
+            === JSON.stringify(base)
+        ) {
+            mergedMetadata =
+                clone(remote);
+        } else if (
+            JSON.stringify(remote)
+            === JSON.stringify(base)
+        ) {
+            mergedMetadata =
+                clone(local);
+        } else {
+            mergedMetadata = {
+                ...clone(remote),
+                ...clone(local),
+            };
+        }
+    }
+
+    operation.baseRevision =
+        Number(
+            serverState.revision,
+        );
+
+    operation.baseSnapshot =
+        clone(
+            serverState.snapshot
+            || [],
+        );
+
+    operation.baseMetadata =
+        clone(
+            serverState
+                .chatMetadata
+            || {},
+        );
+
+    operation.snapshot =
+        localDesired;
+
+    if (hasMetadata) {
+        operation.chatMetadata =
+            mergedMetadata;
+    }
+
+    operation.updatedAt =
+        now();
+
+    return operation;
+}
+
+async function applyRebasedOperationLocally(
+    operation,
+    expectedEpoch,
+) {
+    if (
+        !scopeIsCurrent(
+            expectedEpoch,
+            operation.scope,
+        )
+    ) {
+        return;
+    }
+
+    await applySnapshotLocally(
+        operation.snapshot,
+        operation.chatMetadata
+            ?? currentState
+                ?.chatMetadata
+            ?? {},
+        expectedEpoch,
+        'queue-rebase',
+        operation.scope,
+    );
+}
+
+async function refreshServerState(
+    expectedEpoch,
+) {
+    const scopeAtStart =
+        clone(
+            currentScope,
+        );
+
+    if (
+        !scopeAtStart
+        || !scopeIsCurrent(
+            expectedEpoch,
+            scopeAtStart,
+        )
+    ) {
+        return null;
+    }
+
     try {
-        const result =
+        const data =
             await api(
-                '/event',
+                '/state',
                 {
                     method:
                         'POST',
-
-                    body: {
-                        protocolVersion:
-                            PROTOCOL_VERSION,
-
-                        clientId,
-
-                        deviceId,
-
-                        scope:
-                            currentScope,
-
-                        opId:
-                            uuid(),
-
-                        type:
-                            'reconcile_local',
-
-                        baseRevision:
-                            lastRevision,
-
-                        snapshot,
-                    },
+                    body:
+                        JSON.stringify({
+                            scope:
+                                scopeAtStart,
+                            clientId,
+                            deviceId,
+                        }),
                 },
             );
 
         if (
-            result.state
+            !scopeIsCurrent(
+                expectedEpoch,
+                scopeAtStart,
+            )
         ) {
-            applyStateCursor(
-                result.state,
-            );
-
-            currentState.serverSnapshot =
-                result.state.snapshot
-                    ? normalizeSnapshot(
-                        result.state
-                            .snapshot,
-                    )
-                    : currentState
-                        .serverSnapshot;
+            return null;
         }
 
-        setStatus(
-            'Reconciled',
-            'Current SillyTavern chat is now authoritative',
+        await setServerState(
+            data.state,
+            data.cursor,
         );
+
+        return data.state;
     } catch (error) {
-        warn(
-            'Local reconciliation failed',
-            error,
-        );
+        lastError =
+            error.message;
 
-        await resyncCurrentScope(
-            'local reconciliation failed',
-        );
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Plugin dependency                                                           */
-/* -------------------------------------------------------------------------- */
-
-async function checkPlugin() {
-    try {
-        const result =
-            await api(
-                '/health',
-                {
-                    method:
-                        'GET',
-                },
-            );
-
-        if (
-            Number(
-                result.protocolVersion,
-            ) !==
-            PROTOCOL_VERSION
-        ) {
-            throw Object.assign(
-                new Error(
-                    'Protocol mismatch',
-                ),
-                {
-                    code:
-                        'protocol_mismatch',
-                },
-            );
-        }
-
-        principalKey =
-            result.userKey ||
-            null;
-
-        pluginAvailable =
-            true;
-
-        return result;
-    } catch (error) {
-        pluginAvailable =
-            false;
-
-        principalKey =
-            null;
-
-        closeSse();
-
-        clearHeartbeat();
-
-        setStatus(
-            error.code ===
-                'protocol_mismatch'
-                ? 'Plugin incompatible'
-                : 'Server plugin required',
-
-            error.code ===
-                'protocol_mismatch'
-                ? `Expected protocol ${PROTOCOL_VERSION}`
-                : 'Multi-Client Sync server plugin is required',
-        );
-
-        schedulePluginRetry();
+        updateInfo();
 
         return null;
     }
 }
 
-function schedulePluginRetry() {
+async function flushQueue(
+    expectedEpoch = scopeEpoch,
+) {
     if (
-        pluginRetryTimer ||
-        stopping ||
-        !getSettings().enabled
+        !scopeIsCurrent(
+            expectedEpoch,
+        )
+        || flushingQueueFlag
     ) {
         return;
     }
 
-    pluginRetryTimer =
-        setTimeout(
-            async () => {
-                pluginRetryTimer =
-                    null;
+    flushingQueueFlag =
+        true;
+
+    try {
+        while (
+            scopeIsCurrent(
+                expectedEpoch,
+            )
+        ) {
+            const queue =
+                await listQueuedOps(
+                    currentScope,
+                );
+
+            if (!queue.length) {
+                break;
+            }
+
+            const operation =
+                queue[0];
+
+            if (
+                !sameScope(
+                    operation.scope,
+                    currentScope,
+                )
+            ) {
+                await deleteOperation(
+                    operation,
+                );
+
+                continue;
+            }
+
+            operation.inFlight =
+                true;
+
+            await putOperation(
+                operation,
+            );
+
+            try {
+                const payload = {
+                    opId:
+                        operation.opId,
+
+                    baseRevision:
+                        operation.baseRevision,
+                };
 
                 if (
-                    await checkPlugin()
+                    operation.type
+                    === 'snapshot'
                 ) {
-                    const scope =
-                        getCurrentScope();
-
-                    if (
-                        scope
-                    ) {
-                        await switchScope(
-                            scope,
+                    payload.snapshot =
+                        clone(
+                            operation.snapshot,
                         );
+
+                    payload.chatMetadata =
+                        clone(
+                            operation.chatMetadata
+                            ?? operation
+                                .baseMetadata
+                            ?? {},
+                        );
+
+                    const digest =
+                        await snapshotDigest(
+                            localSnapshot(),
+                        );
+
+                    if (digest) {
+                        payload
+                            .hostSnapshotDigest =
+                            digest;
                     }
+                } else if (
+                    operation.type
+                    === 'metadata'
+                ) {
+                    payload.chatMetadata =
+                        clone(
+                            operation.chatMetadata
+                            || {},
+                        );
                 }
-            },
-            PLUGIN_RETRY_MS,
-        );
+
+                const result =
+                    await api(
+                        '/event',
+                        {
+                            method:
+                                'POST',
+                            body:
+                                JSON.stringify(
+                                    eventBody(
+                                        operation.type,
+                                        payload,
+                                    ),
+                                ),
+                        },
+                    );
+
+                if (
+                    !scopeIsCurrent(
+                        expectedEpoch,
+                    )
+                ) {
+                    operation.inFlight =
+                        false;
+
+                    await putOperation(
+                        operation,
+                    );
+
+                    return;
+                }
+
+                await setServerState(
+                    result.state,
+                    {
+                        epoch:
+                            result.epoch,
+                        revision:
+                            result.revision,
+                        lastEventId:
+                            result.eventId,
+                    },
+                );
+
+                await deleteOperation(
+                    operation,
+                );
+
+                broadcastScopeEvent(
+                    'accepted',
+                );
+            } catch (error) {
+                operation.inFlight =
+                    false;
+
+                await putOperation(
+                    operation,
+                );
+
+                if (
+                    error.code
+                        === 'revision_conflict'
+                    || error.code
+                        === 'stale_host'
+                ) {
+                    const state =
+                        await refreshServerState(
+                            expectedEpoch,
+                        );
+
+                    if (!state) {
+                        break;
+                    }
+
+                    await rebaseOperation(
+                        operation,
+                        state,
+                    );
+
+                    await applyRebasedOperationLocally(
+                        operation,
+                        expectedEpoch,
+                    );
+
+                    await putOperation(
+                        operation,
+                    );
+
+                    continue;
+                }
+
+                if (
+                    error.code
+                        === 'not_member'
+                    || error.code
+                        === 'unauthenticated'
+                ) {
+                    await reconnectCurrentScope();
+                    break;
+                }
+
+                if (
+                    error.code
+                        === 'branch_host_missing'
+                ) {
+                    break;
+                }
+
+                warn(
+                    'queue flush failed',
+                    error,
+                );
+
+                break;
+            }
+        }
+    } finally {
+        flushingQueueFlag =
+            false;
+
+        updateUi();
+        updateInfo();
+    }
 }
 
-async function ensureConnected() {
+let flushingQueueFlag =
+    false;
+
+/* -------------------------------------------------------------------------- */
+/* Server state                                                                */
+/* -------------------------------------------------------------------------- */
+
+async function setServerState(
+    state,
+    cursor = {},
+) {
     if (
-        stopping ||
-        !getSettings().enabled
+        !state
+        || !currentScope
+    ) {
+        return;
+    }
+
+    const token =
+        currentState
+            ?.subscriptionToken;
+
+    currentState =
+        clone(
+            state,
+        );
+
+    if (token) {
+        currentState
+            .subscriptionToken =
+            token;
+    }
+
+    await writeMeta(
+        currentScope,
+        {
+            lastEventId:
+                Number(
+                    cursor.lastEventId
+                    ?? cursor.eventId
+                    ?? 0,
+                ),
+
+            epoch:
+                state.epoch,
+
+            revision:
+                Number(
+                    state.revision
+                    || 0,
+                ),
+
+            baseSnapshot:
+                clone(
+                    state.snapshot
+                    || [],
+                ),
+
+            baseMetadata:
+                clone(
+                    state.chatMetadata
+                    || {},
+                ),
+        },
+    );
+
+    updateUi();
+    updateInfo();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Remote event application                                                    */
+/* -------------------------------------------------------------------------- */
+
+async function localDiffersFromBase() {
+    if (!currentState) {
+        return false;
+    }
+
+    const local =
+        settings.syncMessages
+            ? localSnapshot()
+            : null;
+
+    const localMeta =
+        settings.syncMetadata
+            ? localMetadata()
+            : null;
+
+    const remoteBase =
+        currentState.snapshot
+        || [];
+
+    const remoteMeta =
+        currentState.chatMetadata
+        || {};
+
+    return (
+        (
+            settings.syncMessages
+            && JSON.stringify(
+                local,
+            )
+                !== JSON.stringify(
+                    remoteBase,
+                )
+        )
+        || (
+            settings.syncMetadata
+            && JSON.stringify(
+                localMeta,
+            )
+                !== JSON.stringify(
+                    remoteMeta,
+                )
+        )
+    );
+}
+
+async function protectRemoteApply(
+    expectedEpoch,
+    incomingState,
+) {
+    if (
+        !scopeIsCurrent(
+            expectedEpoch,
+        )
     ) {
         return false;
     }
 
     if (
-        pluginAvailable &&
-        currentScope &&
-        currentState
+        applyingRemoteDepth > 0
     ) {
         return true;
     }
 
-    const plugin =
-        await checkPlugin();
-
-    if (
-        !plugin
-    ) {
-        return false;
-    }
-
-    const scope =
-        getCurrentScope();
-
-    if (
-        !scope
-    ) {
-        return false;
-    }
-
-    if (
-        !sameScope(
+    const queue =
+        await listQueuedOps(
             currentScope,
-            scope,
-        ) ||
-        !currentState
-    ) {
-        await switchScope(
-            scope,
         );
+
+    if (queue.length) {
+        await resyncCurrentScope({
+            preferLocal:
+                true,
+            incomingState,
+        });
+
+        return false;
     }
 
-    return Boolean(
-        pluginAvailable &&
-        currentScope &&
-        currentState,
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Heartbeat                                                                  */
-/* -------------------------------------------------------------------------- */
-
-function clearHeartbeat() {
     if (
-        heartbeatTimer
+        await localDiffersFromBase()
     ) {
-        clearInterval(
-            heartbeatTimer,
+        await resyncCurrentScope({
+            preferLocal:
+                true,
+            incomingState,
+        });
+
+        return false;
+    }
+
+    return true;
+}
+
+async function handleRemoteEvent(
+    event,
+    state,
+    expectedEpoch,
+) {
+    if (
+        !event
+        || !scopeIsCurrent(
+            expectedEpoch,
+        )
+    ) {
+        return;
+    }
+
+    if (
+        event.source
+            ?.clientId
+            === clientId
+        && event.source
+            ?.deviceId
+            === deviceId
+    ) {
+        return;
+    }
+
+    if (
+        event.type
+            === 'metadata'
+    ) {
+        if (
+            !settings.syncMetadata
+        ) {
+            return;
+        }
+
+        if (
+            !(await protectRemoteApply(
+                expectedEpoch,
+                state,
+            ))
+        ) {
+            return;
+        }
+
+        const messages =
+            settings.syncMessages
+                ? clone(
+                    currentState
+                        ?.snapshot
+                    || localSnapshot(),
+                )
+                : localSnapshot();
+
+        await applySnapshotLocally(
+            messages,
+            state
+                ?.chatMetadata
+            || event.chatMetadata
+            || {},
+            expectedEpoch,
+            'remote-metadata',
         );
 
-        heartbeatTimer =
-            null;
+        return;
+    }
+
+    if (
+        event.type
+            === 'snapshot'
+        || event.type
+            === 'reconcile_local'
+        || event.type
+            === 'bootstrap'
+    ) {
+        if (
+            !settings.syncMessages
+        ) {
+            return;
+        }
+
+        if (
+            !(await protectRemoteApply(
+                expectedEpoch,
+                state,
+            ))
+        ) {
+            return;
+        }
+
+        await applySnapshotLocally(
+            state
+                ?.snapshot
+            || [],
+            settings.syncMetadata
+                ? (
+                    state
+                        ?.chatMetadata
+                    || {}
+                )
+                : localMetadata(),
+            expectedEpoch,
+            `remote-${event.type}`,
+        );
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'generation_claim'
+        || event.type
+            === 'generation_started'
+        || event.type
+            === 'generation_heartbeat'
+    ) {
+        currentState = {
+            ...(currentState || {}),
+            generation:
+                clone(
+                    event.generation
+                    || state
+                        ?.generation
+                    || null,
+                ),
+        };
+
+        updateUi();
+        updateInfo();
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'generation_stream'
+    ) {
+        if (
+            !settings.syncMessages
+        ) {
+            return;
+        }
+
+        await applyRemoteGenerationStream(
+            event,
+            expectedEpoch,
+        );
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'generation_stop_request'
+    ) {
+        if (
+            settings.remoteStop
+            && currentState
+                ?.generation
+                ?.id
+                === event
+                    .generationId
+        ) {
+            try {
+                ctx.stopGeneration?.();
+            } catch (error) {
+                warn(
+                    'remote stop failed',
+                    error,
+                );
+            }
+        }
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'generation_terminal'
+    ) {
+        if (
+            settings.syncMessages
+            && state?.snapshot
+        ) {
+            const ok =
+                await protectRemoteApply(
+                    expectedEpoch,
+                    state,
+                );
+
+            if (ok) {
+                await applySnapshotLocally(
+                    state.snapshot,
+                    settings.syncMetadata
+                        ? (
+                            state
+                                .chatMetadata
+                            || {}
+                        )
+                        : localMetadata(),
+                    expectedEpoch,
+                    'remote-generation-terminal',
+                );
+            }
+        }
+
+        currentState = {
+            ...(currentState || {}),
+            generation:
+                null,
+        };
+
+        updateUi();
+        updateInfo();
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'generation_recover'
+    ) {
+        currentState = {
+            ...(currentState || {}),
+            generation:
+                null,
+        };
+
+        updateUi();
+        updateInfo();
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'group_settings'
+    ) {
+        await applyGroupSettings(
+            event.groupSettings,
+            expectedEpoch,
+        );
+
+        return;
+    }
+
+    if (
+        event.type
+            === 'branch_announce'
+    ) {
+        /*
+         * Announce only. We deliberately do not silently navigate the user
+         * to another chat. The actual child chat is native ST state.
+         */
+        return;
     }
 }
 
-function startHeartbeat() {
-    clearHeartbeat();
+async function applyRemoteGenerationStream(
+    event,
+    expectedEpoch,
+) {
+    if (
+        !scopeIsCurrent(
+            expectedEpoch,
+        )
+    ) {
+        return;
+    }
 
-    heartbeatTimer =
-        setInterval(
-            async () => {
-                if (
-                    !currentScope ||
-                    !pluginAvailable ||
-                    stopping
-                ) {
-                    return;
-                }
+    const generation =
+        currentState?.generation;
 
-                try {
-                    const result =
-                        await api(
-                            '/heartbeat',
-                            {
-                                method:
-                                    'POST',
+    if (
+        !generation
+        || generation.id
+            !== event.generationId
+    ) {
+        return;
+    }
 
-                                body: {
-                                    protocolVersion:
-                                        PROTOCOL_VERSION,
-
-                                    clientId,
-
-                                    deviceId,
-
-                                    scope:
-                                        currentScope,
-
-                                    generationId:
-                                        isLocalGenerationOwner()
-                                            ? currentState
-                                                .generation
-                                                .id
-                                            : null,
-                                },
-                            },
-                        );
-
-                    if (
-                        result.subscriptionToken
-                    ) {
-                        subscriptionToken =
-                            result.subscriptionToken;
-                    }
-
-                    if (
-                        result.state
-                    ) {
-                        applyStateCursor(
-                            result.state,
-                        );
-
-                        currentState.generation =
-                            result.state
-                                .generation
-                                ? clone(
-                                    result.state
-                                        .generation,
-                                )
-                                : null;
-
-                        /*
-                         * If the server says the generation disappeared while
-                         * this client still thinks ST is generating, fence it.
-                         */
-                        if (
-                            localGenerationId &&
-                            !currentState.generation
-                        ) {
-                            localGenerationLost =
-                                true;
-
-                            try {
-                                ctx.stopGeneration?.();
-                            } catch {
-                                // ignored
-                            }
-                        }
-                    }
-
-                    await persistCursor();
-                } catch (error) {
-                    if (
-                        [
-                            'not_member',
-                            'membership_expired',
-                            'scope_not_found',
-                        ].includes(
-                            error.code,
-                        )
-                    ) {
-                        await reconnectScope(
-                            'heartbeat recovery',
-                        );
-                    }
-                }
-            },
-            HEARTBEAT_MS,
+    const sequence =
+        Number(
+            event.streamSeq,
         );
-}
 
+    if (
+        sequence
+        <= Number(
+            generation.streamSeq
+            || 0,
+        )
+    ) {
+        return;
+    }
+
+    if (
+        sequence
+        !== Number(
+            generation.streamSeq
+            || 0,
+        ) + 1
+    ) {
+        await resyncCurrentScope();
+        return;
+    }
+
+    if (event.message) {
+        const snapshot =
+            localSnapshot();
+
+        const messageId =
+            event.messageId
+            || stableMessageId(
+                event.message,
+            );
+
+        const index =
+            snapshot.findIndex(
+                message =>
+                    stableMessageId(
+                        message,
+                    )
+                    === messageId,
+            );
+
+        if (index >= 0) {
+            snapshot[index] =
+                clone(
+                    event.message,
+                );
+        } else {
+            snapshot.push(
+                clone(
+                    event.message,
+                ),
+            );
+        }
+
+        await applySnapshotLocally(
+            snapshot,
+            localMetadata(),
+            expectedEpoch,
+            'remote-generation-stream',
+        );
+    }
+
+    if (
+        scopeIsCurrent(
+            expectedEpoch,
+        )
+    ) {
+        currentState.generation
+            .streamSeq =
+            sequence;
+    }
+}
 
 /* -------------------------------------------------------------------------- */
 /* SSE                                                                         */
 /* -------------------------------------------------------------------------- */
 
 function closeSse() {
-    if (
-        eventSource
-    ) {
-        try {
-            eventSource.close();
-        } catch {
-            // ignored
-        }
+    if (sseReconnectTimer) {
+        clearTimeout(
+            sseReconnectTimer,
+        );
     }
 
-    eventSource =
+    sseReconnectTimer =
         null;
+
+    if (sse) {
+        try {
+            sse.close();
+        } catch {}
+    }
+
+    sse = null;
 }
 
-function connectSse() {
+function scheduleReconnect(
+    expectedEpoch,
+) {
     if (
-        stopping ||
-        !pluginAvailable ||
-        !currentScope ||
-        !subscriptionToken
+        sseReconnectTimer
+        || !scopeIsCurrent(
+            expectedEpoch,
+        )
+        || !serverCompatible
+        || !settings.enabled
+    ) {
+        return;
+    }
+
+    const delay =
+        Math.min(
+            30_000,
+            750 * (
+                2 ** Math.min(
+                    reconnectAttempt,
+                    6,
+                )
+            ),
+        );
+
+    reconnectAttempt++;
+
+    sseReconnectTimer =
+        setTimeout(
+            () => {
+                sseReconnectTimer =
+                    null;
+
+                if (
+                    !scopeIsCurrent(
+                        expectedEpoch,
+                    )
+                ) {
+                    return;
+                }
+
+                void reconnectCurrentScope();
+            },
+            delay,
+        );
+}
+
+async function connectSse() {
+    if (
+        !currentScope
+        || !serverCompatible
+        || !settings.enabled
     ) {
         return;
     }
 
     closeSse();
 
-    let url =
-        `${location.origin}${PLUGIN_BASE}/events`
-        + `?token=${encodeURIComponent(
-            subscriptionToken,
-        )}`;
+    const expectedEpoch =
+        scopeEpoch;
 
-    if (
-        lastEventId
-    ) {
-        url +=
-            `&since=${encodeURIComponent(
-                lastEventId,
-            )}`;
-    }
-
-    try {
-        eventSource =
-            new EventSource(
-                url,
-                {
-                    withCredentials:
-                        true,
-                },
-            );
-    } catch (error) {
-        warn(
-            'Could not create EventSource',
-            error,
+    const expectedScope =
+        clone(
+            currentScope,
         );
 
+    const token =
+        currentState
+            ?.subscriptionToken;
+
+    if (
+        !token
+        || !scopeIsCurrent(
+            expectedEpoch,
+            expectedScope,
+        )
+    ) {
+        return;
+    }
+
+    const meta =
+        await readMeta(
+            expectedScope,
+        );
+
+    const url =
+        new URL(
+            `${PLUGIN_BASE}/events`,
+            location.origin,
+        );
+
+    url.searchParams.set(
+        'token',
+        token,
+    );
+
+    if (
+        meta.lastEventId
+    ) {
+        url.searchParams.set(
+            'lastEventId',
+            String(
+                meta.lastEventId,
+            ),
+        );
+    }
+
+    const stream =
+        new EventSource(
+            url,
+            {
+                withCredentials:
+                    true,
+            },
+        );
+
+    sse =
+        stream;
+
+    sseEventChain =
+        Promise.resolve();
+
+    stream.onopen = () => {
+        reconnectAttempt = 0;
+
+        lastError = '';
+
+        updateUi();
+        updateInfo();
+    };
+
+    const parseAndQueue =
+        (
+            event,
+            type,
+        ) => {
+            sseEventChain =
+                sseEventChain
+                    .then(
+                        async () => {
+                            let data;
+
+                            try {
+                                data =
+                                    JSON.parse(
+                                        event.data,
+                                    );
+                            } catch {
+                                return;
+                            }
+
+                            if (
+                                !scopeIsCurrent(
+                                    expectedEpoch,
+                                    expectedScope,
+                                )
+                                || sse
+                                    !== stream
+                            ) {
+                                return;
+                            }
+
+                            await handleSseData(
+                                type,
+                                data,
+                                event.lastEventId,
+                                expectedEpoch,
+                                expectedScope,
+                            );
+                        },
+                    )
+                    .catch(
+                        error =>
+                            warn(
+                                'SSE handling failed',
+                                error,
+                            ),
+                    );
+        };
+
+    for (
+        const eventName
+        of [
+            'hello',
+            'replay',
+            'replay_complete',
+            'resync_required',
+            'sync',
+            'shutdown',
+        ]
+    ) {
+        stream.addEventListener(
+            eventName,
+            event =>
+                parseAndQueue(
+                    event,
+                    eventName,
+                ),
+        );
+    }
+
+    stream.onerror = () => {
+        try {
+            stream.close();
+        } catch {}
+
+        if (sse === stream) {
+            sse = null;
+        }
+
         scheduleReconnect(
-            'SSE creation failed',
+            expectedEpoch,
+        );
+
+        updateUi();
+    };
+}
+
+async function handleSseData(
+    type,
+    data,
+    lastEventId,
+    expectedEpoch,
+    expectedScope,
+) {
+    if (
+        !scopeIsCurrent(
+            expectedEpoch,
+            expectedScope,
+        )
+    ) {
+        return;
+    }
+
+    if (
+        type === 'hello'
+    ) {
+        if (
+            currentState?.epoch
+            && data.epoch
+            && currentState.epoch
+                !== data.epoch
+        ) {
+            await writeMeta(
+                expectedScope,
+                {
+                    lastEventId:
+                        0,
+                },
+            );
+
+            await resyncCurrentScope();
+            return;
+        }
+
+        currentState = {
+            ...(currentState || {}),
+            epoch:
+                data.epoch,
+            revision:
+                Math.max(
+                    Number(
+                        currentState
+                            ?.revision
+                        || 0,
+                    ),
+                    Number(
+                        data.revision
+                        || 0,
+                    ),
+                ),
+            generation:
+                clone(
+                    data.generation
+                    || null,
+                ),
+        };
+
+        updateUi();
+
+        return;
+    }
+
+    if (
+        type === 'replay'
+    ) {
+        if (
+            data.epoch
+            && currentState?.epoch
+            && data.epoch
+                !== currentState.epoch
+        ) {
+            return;
+        }
+
+        if (data.event) {
+            await handleRemoteEvent(
+                data.event,
+                currentState,
+                expectedEpoch,
+            );
+        }
+
+        await writeMeta(
+            expectedScope,
+            {
+                lastEventId:
+                    Number(
+                        lastEventId
+                        || data
+                            .event
+                            ?.id
+                        || 0,
+                    ),
+            },
         );
 
         return;
     }
 
-    eventSource.addEventListener(
-        'hello',
-        event => {
-            try {
-                const data =
-                    JSON.parse(
-                        event.data,
-                    );
-
-                if (
-                    data.protocolVersion !==
-                    PROTOCOL_VERSION
-                ) {
-                    pluginAvailable =
-                        false;
-
-                    closeSse();
-
-                    setStatus(
-                        'Plugin incompatible',
-                        `Server protocol ${data.protocolVersion}`,
-                    );
-
-                    schedulePluginRetry();
-
-                    return;
-                }
-
-                if (
-                    lastEpoch &&
-                    data.epoch &&
-                    lastEpoch !==
-                        data.epoch
-                ) {
-                    /*
-                     * Server restart.
-                     */
-                    lastEventId =
-                        null;
-
-                    lastSeq =
-                        0;
-
-                    lastRevision =
-                        0;
-                }
-
-                /*
-                 * If we have an explicit cursor from persistence, preserve it
-                 * so historical replay can happen. Otherwise establish the
-                 * current cursor from hello.
-                 */
-                if (
-                    !lastEventId
-                ) {
-                    lastEpoch =
-                        data.epoch;
-
-                    lastSeq =
-                        Number(
-                            data.seq,
-                        ) || 0;
-
-                    lastRevision =
-                        Number(
-                            data.revision,
-                        ) || 0;
-
-                    lastEventId =
-                        data.lastEventId ||
-                        (
-                            lastEpoch &&
-                            lastSeq
-                                ? `${lastEpoch}:${lastSeq}`
-                                : null
-                        );
-                } else {
-                    lastEpoch =
-                        data.epoch;
-                }
-
-                if (
-                    currentState
-                ) {
-                    currentState.generation =
-                        data.generation
-                            ? clone(
-                                data.generation,
-                            )
-                            : currentState
-                                .generation;
-                }
-
-                void persistCursor();
-
-                setStatus(
-                    'Live',
-                    `revision ${lastRevision}`,
-                );
-
-                reconnectAttempt =
-                    0;
-            } catch (error) {
-                warn(
-                    'Invalid SSE hello',
-                    error,
-                );
-            }
-        },
-    );
-
-    eventSource.addEventListener(
-        'replay',
-        event => {
-            void handleReplayEvent(
-                event,
-            );
-        },
-    );
-
-    eventSource.addEventListener(
-        'replay_complete',
-        () => {
-            void resyncCurrentScope(
-                'replay complete',
-            );
-        },
-    );
-
-    eventSource.addEventListener(
-        'resync_required',
-        event => {
-            let reason =
-                'server requested resync';
-
-            try {
-                const data =
-                    JSON.parse(
-                        event.data,
-                    );
-
-                reason =
-                    data.reason ||
-                    reason;
-            } catch {
-                // ignored
-            }
-
-            lastEventId =
-                null;
-
-            void resyncCurrentScope(
-                reason,
-            );
-        },
-    );
-
-    eventSource.addEventListener(
-        'sync',
-        event => {
-            void handleLiveEvent(
-                event,
-            );
-        },
-    );
-
-    eventSource.addEventListener(
-        'shutdown',
-        () => {
-            closeSse();
-
-            setStatus(
-                'Server restarting',
-                'Synchronization will reconnect automatically',
-            );
-
-            scheduleReconnect(
-                'server shutdown',
-            );
-        },
-    );
-
-    eventSource.onerror =
-        () => {
-            scheduleResync(
-                'SSE error',
-            );
-        };
-}
-
-async function handleReplayEvent(
-    event,
-) {
-    try {
-        const data =
-            JSON.parse(
-                event.data,
-            );
-
-        if (
-            lastEpoch &&
-            data.epoch !==
-                lastEpoch
-        ) {
-            await resyncCurrentScope(
-                'replay epoch mismatch',
-            );
-
-            return;
-        }
-
-        const seq =
-            Number(
-                data.seq,
-            );
-
-        if (
-            !Number.isSafeInteger(
-                seq,
-            )
-        ) {
-            await resyncCurrentScope(
-                'invalid replay sequence',
-            );
-
-            return;
-        }
-
-        if (
-            lastSeq > 0 &&
-            seq >
-                lastSeq + 1
-        ) {
-            await resyncCurrentScope(
-                'replay sequence gap',
-            );
-
-            return;
-        }
-
-        if (
-            seq <=
-            lastSeq
-        ) {
-            return;
-        }
-
-        lastSeq =
-            seq;
-
-        lastRevision =
-            Number(
-                data.revision,
-            );
-
-        lastEpoch =
-            data.epoch;
-
-        lastEventId =
-            data.id ||
-            `${lastEpoch}:${lastSeq}`;
-
-        await persistCursor();
-    } catch (error) {
-        warn(
-            'Replay event processing failed',
-            error,
+    if (
+        type === 'replay_complete'
+    ) {
+        await writeMeta(
+            expectedScope,
+            {
+                lastEventId:
+                    Number(
+                        data.eventId
+                        || lastEventId
+                        || 0,
+                    ),
+                epoch:
+                    data.epoch,
+                revision:
+                    Number(
+                        data.revision
+                        || currentState
+                            ?.revision
+                        || 0,
+                    ),
+            },
         );
 
-        await resyncCurrentScope(
-            'replay parse failure',
-        );
+        await resyncCurrentScope();
+
+        return;
     }
-}
 
+    if (
+        type === 'resync_required'
+    ) {
+        await writeMeta(
+            expectedScope,
+            {
+                lastEventId:
+                    0,
+            },
+        );
 
-/* -------------------------------------------------------------------------- */
-/* Live event handling                                                        */
-/* -------------------------------------------------------------------------- */
+        await resyncCurrentScope();
 
-async function handleLiveEvent(
-    event,
-) {
-    const expectedEpoch =
-        currentEpoch();
+        return;
+    }
 
-    try {
-        const data =
-            JSON.parse(
-                event.data,
-            );
-
+    if (
+        type === 'sync'
+    ) {
         if (
-            expectedEpoch !==
-                currentEpoch()
+            data.epoch
+            && currentState?.epoch
+            && data.epoch
+                !== currentState.epoch
         ) {
-            return;
-        }
-
-        if (
-            data.epoch !==
-            lastEpoch &&
-            lastEpoch
-        ) {
-            await resyncCurrentScope(
-                'live epoch mismatch',
-            );
+            await resyncCurrentScope();
 
             return;
         }
 
-        const seq =
-            Number(
-                data.seq,
-            );
-
-        const revision =
-            Number(
-                data.revision ||
-                data.state?.revision,
-            );
-
-        const baseRevision =
-            Number(
-                data.baseRevision,
-            );
+        await handleRemoteEvent(
+            data.event,
+            data.state,
+            expectedEpoch,
+        );
 
         if (
-            !Number.isSafeInteger(
-                seq,
-            ) ||
-            !Number.isSafeInteger(
-                revision,
+            scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
             )
         ) {
-            await resyncCurrentScope(
-                'invalid live event sequence',
-            );
-
-            return;
-        }
-
-        /*
-         * Ignore duplicates.
-         */
-        if (
-            seq <=
-            lastSeq
-        ) {
-            return;
-        }
-
-        /*
-         * Require exact contiguous ordering.
-         */
-        if (
-            lastSeq > 0 &&
-            seq !==
-                lastSeq + 1
-        ) {
-            await resyncCurrentScope(
-                'live sequence gap',
-            );
-
-            return;
-        }
-
-        /*
-         * Every accepted mutation advances revision by one.
-         */
-        if (
-            lastRevision > 0 &&
-            (
-                baseRevision !==
-                lastRevision ||
-                revision !==
-                lastRevision + 1
-            )
-        ) {
-            await resyncCurrentScope(
-                'live revision conflict',
-            );
-
-            return;
-        }
-
-        const sourceClientId =
-            data.sourceClientId;
-
-        const isLocalSource =
-            sourceClientId ===
-            clientId;
-
-        const isStream =
-            data.type ===
-            'generation_stream';
-
-        if (
-            data.state
-        ) {
-            applyStateCursor(
-                data.state,
-            );
-        }
-
-        if (
-            isLocalSource
-        ) {
-            /*
-             * We already have our own local state. The accepted server event
-             * becomes the new authoritative server base.
-             */
-            const localSnapshot =
-                makeLocalSnapshot();
-
-            if (
-                localSnapshot
-            ) {
-                currentState.serverSnapshot =
-                    clone(
-                        localSnapshot,
-                    );
-            }
-
             if (
                 data.state
             ) {
-                currentState.generation =
-                    data.state
-                        .generation
-                        ? clone(
+                await setServerState(
+                    data.state,
+                    {
+                        epoch:
+                            data.epoch
+                            || data.state
+                                .epoch,
+                        revision:
                             data.state
-                                .generation,
-                        )
-                        : null;
-            }
-        } else {
-            const pending =
-                await dbGetOperations(
-                    currentScope,
+                                .revision,
+                        lastEventId:
+                            lastEventId
+                            || data
+                                .event
+                                ?.id
+                            || 0,
+                    },
                 );
+            }
+        }
 
-            if (
-                pending.length
-            ) {
-                /*
-                 * Remote authority moved forward while this client has local
-                 * pending work. Preserve local intent, rebase it, then retry.
-                 */
-                if (
-                    data.patch?.kind ===
-                        'full'
-                ) {
-                    const remoteSnapshot =
-                        normalizeSnapshot(
-                            data.patch
-                                .snapshot,
-                        );
+        broadcastScopeEvent(
+            'remote',
+        );
 
-                    currentState.serverSnapshot =
-                        remoteSnapshot;
+        return;
+    }
 
-                    const rebased =
-                        await rebasePendingQueue(
-                            remoteSnapshot,
-                            revision,
-                        );
+    if (
+        type === 'shutdown'
+    ) {
+        closeSse();
+    }
+}
 
-                    if (
-                        rebased
-                    ) {
-                        await applySnapshotLocally(
-                            rebased,
-                            {
-                                persist:
-                                    true,
+/* -------------------------------------------------------------------------- */
+/* Joining / reconnect                                                         */
+/* -------------------------------------------------------------------------- */
 
-                                reason:
-                                    'remote-with-pending',
-                            },
-                        );
-                    }
+async function joinScope(
+    scope,
+    expectedEpoch,
+) {
+    if (
+        !scope
+        || !serverCompatible
+        || !settings.enabled
+        || !scopeIsCurrent(
+            expectedEpoch,
+            scope,
+        )
+    ) {
+        return false;
+    }
 
-                    void drainPendingQueue();
-                } else {
-                    await resyncCurrentScope(
-                        'remote event with pending operations',
-                    );
+    const previousMeta =
+        await readMeta(
+            scope,
+        );
 
-                    return;
-                }
-            } else if (
-                data.patch
-            ) {
-                const patch =
-                    data.patch;
+    try {
+        const result =
+            await api(
+                '/join',
+                {
+                    method:
+                        'POST',
+                    body:
+                        JSON.stringify({
+                            scope:
+                                scope,
+                            clientId,
+                            deviceId,
+                        }),
+                },
+            );
 
-                if (
-                    patch.kind ===
-                    'full'
-                ) {
-                    currentState.serverSnapshot =
-                        normalizeSnapshot(
-                            patch.snapshot,
-                        );
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                scope,
+            )
+        ) {
+            return false;
+        }
 
-                    await applySnapshotLocally(
-                        patch.snapshot,
-                        {
-                            persist:
-                                !isStream,
+        serverUserId =
+            String(
+                result.userId
+                || serverUserId
+                || '',
+            );
 
-                            reason:
-                                data.type,
-                        },
-                    );
-                } else {
-                    currentState.serverSnapshot =
-                        applyPatchToSnapshot(
-                            currentState.serverSnapshot,
-                            patch,
-                        );
+        currentState =
+            clone(
+                result.state,
+            );
 
-                    await applyPatchLocally(
-                        patch,
-                        {
-                            persist:
-                                !isStream,
+        currentState
+            .subscriptionToken =
+            result.subscriptionToken;
 
-                            reason:
-                                data.type,
-                        },
-                    );
-                }
+        const sameEpoch =
+            previousMeta.epoch
+                === result.state.epoch;
+
+        await writeMeta(
+            scope,
+            {
+                lastEventId:
+                    sameEpoch
+                        ? Number(
+                            previousMeta
+                                .lastEventId
+                            || 0,
+                        )
+                        : 0,
+
+                epoch:
+                    result.state
+                        .epoch,
+
+                revision:
+                    result.state
+                        .revision,
+
+                baseSnapshot:
+                    clone(
+                        result.state
+                            .snapshot
+                        || [],
+                    ),
+
+                baseMetadata:
+                    clone(
+                        result.state
+                            .chatMetadata
+                        || {},
+                    ),
+            },
+        );
+
+        ensureHostMessageIds();
+
+        if (
+            hostMessageIdsDirty
+            && settings.syncMessages
+        ) {
+            try {
+                await ctx.saveChat?.();
+                hostMessageIdsDirty =
+                    false;
+            } catch (error) {
+                warn(
+                    'message ID save failed',
+                    error,
+                );
             }
         }
 
         /*
-         * Generation control is handled separately.
+         * Never blindly overwrite local changes on join.
+         * Merge local state with server state.
          */
-        await handleGenerationEvent(
-            data,
-        );
-
-        lastSeq =
-            seq;
-
-        lastRevision =
-            revision;
-
-        lastEpoch =
-            data.epoch ||
-            lastEpoch;
-
-        lastEventId =
-            data.id ||
-            `${lastEpoch}:${lastSeq}`;
-
-        await persistCursor();
-
         if (
-            data.state
-                ?.generation
+            result.state
+            && currentScope
         ) {
-            currentState.generation =
-                clone(
-                    data.state
-                        .generation,
-                );
-        } else if (
-            [
-                'generation_terminal',
-                'generation_abandoned',
-            ].includes(
-                data.type,
-            )
-        ) {
-            currentState.generation =
-                null;
-        }
+            const local =
+                settings.syncMessages
+                    ? localSnapshot()
+                    : [];
 
-        if (
-            !data.state
-                ?.generation &&
-            !isLocalGenerationOwner()
-        ) {
-            setStatus(
-                'Synced',
-                `revision ${lastRevision}`,
-            );
-        }
-    } catch (error) {
-        warn(
-            'Live synchronization event failed',
-            error,
-        );
+            const remote =
+                result.state.snapshot
+                || [];
 
-        await resyncCurrentScope(
-            'live event failure',
-        );
-    }
-}
-
-function applyPatchToSnapshot(
-    current,
-    patch,
-) {
-    if (
-        !current
-    ) {
-        return null;
-    }
-
-    const snapshot =
-        clone(current);
-
-    if (
-        patch.kind ===
-        'append'
-    ) {
-        snapshot.chat.splice(
-            Number(
-                patch.startIndex,
-            ),
-            0,
-            ...(
-                patch.messages ||
-                []
-            ).map(
-                clone,
-            ),
-        );
-    }
-
-    if (
-        patch.kind ===
-        'patch'
-    ) {
-        for (
-            const change of
-                patch.changes ||
-                []
-        ) {
-            const index =
-                Number(
-                    change.index,
-                );
-
-            if (
-                Number.isInteger(
-                    index,
-                ) &&
-                index >= 1
-            ) {
-                snapshot.chat[index] =
-                    clone(
-                        change.message,
-                    );
-            }
-        }
-    }
-
-    if (
-        patch.chatMetadata
-    ) {
-        snapshot.chatMetadata =
-            clone(
-                patch.chatMetadata,
-            );
-
-        if (
-            snapshot.chat[0]
-        ) {
-            snapshot.chat[0]
-                .chat_metadata =
-                clone(
-                    patch.chatMetadata,
-                );
-        }
-    }
-
-    return snapshot;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Generation SSE handling                                                    */
-/* -------------------------------------------------------------------------- */
-
-async function handleGenerationEvent(
-    data,
-) {
-    if (
-        data.type ===
-        'generation_claimed'
-    ) {
-        const generation =
-            data.generation ||
-            data.state?.generation ||
-            null;
-
-        currentState.generation =
-            generation
-                ? clone(
-                    generation,
+            const differs =
+                settings.syncMessages
+                && JSON.stringify(
+                    local,
                 )
-                : null;
-
-        if (
-            generation &&
-            generation.ownerClientId !==
-                clientId &&
-            localGenerationId
-        ) {
-            localGenerationLost =
-                true;
-
-            try {
-                ctx.stopGeneration?.();
-            } catch {
-                // ignored
-            }
-        }
-
-        return;
-    }
-
-    if (
-        data.type ===
-        'generation_started'
-    ) {
-        if (
-            data.generation
-        ) {
-            currentState.generation =
-                clone(
-                    data.generation,
-                );
-        }
-
-        if (
-            data.generation
-                ?.ownerClientId !==
-                clientId &&
-            localGenerationId
-        ) {
-            localGenerationLost =
-                true;
-
-            try {
-                ctx.stopGeneration?.();
-            } catch {
-                // ignored
-            }
-        }
-
-        return;
-    }
-
-    if (
-        data.type ===
-        'generation_stop_requested'
-    ) {
-        const generation =
-            data.generation ||
-            data.state?.generation ||
-            currentState.generation;
-
-        if (
-            generation &&
-            generation.ownerClientId ===
-                clientId &&
-            generation.id ===
-                localGenerationId
-        ) {
-            localStopRequested =
-                true;
-
-            setStatus(
-                'Stop requested',
-                'Stopping local generation',
-            );
-
-            try {
-                ctx.stopGeneration?.();
-            } catch (error) {
-                warn(
-                    'Remote stop could not be executed',
-                    error,
-                );
-            }
-        }
-
-        currentState.generation =
-            generation
-                ? clone(
-                    generation,
-                )
-                : null;
-
-        return;
-    }
-
-    if (
-        data.type ===
-            'generation_abandoned' ||
-        data.type ===
-            'generation_terminal'
-    ) {
-        const generation =
-            data.generation ||
-            null;
-
-        if (
-            generation?.ownerClientId ===
-                clientId &&
-            generation.id ===
-                localGenerationId
-        ) {
-            localGenerationLost =
-                true;
-
-            if (
-                !localStopRequested
-            ) {
-                try {
-                    ctx.stopGeneration?.();
-                } catch {
-                    // ignored
-                }
-            }
-        }
-
-        currentState.generation =
-            data.type ===
-                'generation_terminal' ||
-                data.type ===
-                    'generation_abandoned'
-                ? null
-                : generation;
-
-        if (
-            generation?.id
-        ) {
-            generationTerminalizing.delete(
-                generation.id,
-            );
-        }
-
-        return;
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Generation stream pipeline                                                 */
-/* -------------------------------------------------------------------------- */
-
-function queueStreamUpdate(
-    reason = 'token',
-) {
-    if (
-        !isLocalGenerationOwner()
-    ) {
-        return;
-    }
-
-    latestStreamSnapshot =
-        makeLocalSnapshot();
-
-    latestStreamReason =
-        reason;
-
-    if (
-        streamTimer
-    ) {
-        return;
-    }
-
-    streamTimer =
-        setTimeout(
-            () => {
-                streamTimer =
-                    null;
-
-                void flushStreamUpdate();
-            },
-            STREAM_FLUSH_MS,
-        );
-}
-
-async function flushStreamUpdate() {
-    if (
-        streamFlushPromise ||
-        !isLocalGenerationOwner() ||
-        !latestStreamSnapshot
-    ) {
-        return;
-    }
-
-    const snapshot =
-        latestStreamSnapshot;
-
-    const reason =
-        latestStreamReason;
-
-    latestStreamSnapshot =
-        null;
-
-    latestStreamReason =
-        null;
-
-    const generation =
-        currentState.generation;
-
-    const streamSeq =
-        Number(
-            generation.streamSeq ||
-                0,
-        ) + 1;
-
-    const expectedEpoch =
-        currentEpoch();
-
-    streamFlushPromise =
-        (async () => {
-            try {
-                const result =
-                    await api(
-                        '/event',
-                        {
-                            method:
-                                'POST',
-
-                            body: {
-                                protocolVersion:
-                                    PROTOCOL_VERSION,
-
-                                clientId,
-
-                                deviceId,
-
-                                scope:
-                                    currentScope,
-
-                                opId:
-                                    uuid(),
-
-                                type:
-                                    'generation_stream',
-
-                                generationId:
-                                    generation.id,
-
-                                streamSeq,
-
-                                baseRevision:
-                                    lastRevision,
-
-                                payload: {
-                                    reason,
-                                },
-
-                                snapshot,
-                            },
-                        },
+                    !== JSON.stringify(
+                        remote,
                     );
 
-                if (
-                    expectedEpoch !==
-                    currentEpoch()
-                ) {
-                    return;
-                }
-
-                if (
-                    result.state
-                ) {
-                    applyStateCursor(
-                        result.state,
+            if (differs) {
+                const queue =
+                    await listQueuedOps(
+                        scope,
                     );
 
-                    currentState.generation =
-                        result.state
-                            .generation
-                            ? clone(
-                                result.state
-                                    .generation,
+                const merged =
+                    mergeSnapshots(
+                        queue.length
+                            ? (
+                                queue
+                                    .at(0)
+                                    .baseSnapshot
+                                || []
                             )
-                            : null;
-                }
-
-                if (
-                    result.state
-                        ?.generation
-                        ?.ownerClientId !==
-                    clientId
-                ) {
-                    localGenerationLost =
-                        true;
-
-                    try {
-                        ctx.stopGeneration?.();
-                    } catch {
-                        // ignored
-                    }
-                }
-
-                await persistCursor();
-            } catch (error) {
-                if (
-                    [
-                        'generation_stale',
-                        'generation_not_owner',
-                        'generation_expired',
-                    ].includes(
-                        error.code,
-                    )
-                ) {
-                    localGenerationLost =
-                        true;
-
-                    try {
-                        ctx.stopGeneration?.();
-                    } catch {
-                        // ignored
-                    }
-                } else if (
-                    error.code ===
-                        'stale_revision' ||
-                    error.code ===
-                        'stream_sequence_gap'
-                ) {
-                    await resyncCurrentScope(
-                        `generation stream ${error.code}`,
+                            : (
+                                currentState
+                                    .snapshot
+                                || []
+                            ),
+                        local,
+                        remote,
                     );
-                } else {
-                    warn(
-                        'Generation stream failed',
-                        error,
-                    );
-                }
-            } finally {
-                streamFlushPromise =
-                    null;
 
-                if (
-                    latestStreamSnapshot &&
-                    isLocalGenerationOwner()
-                ) {
-                    void flushStreamUpdate();
+                await applySnapshotLocally(
+                    merged,
+                    settings.syncMetadata
+                        ? {
+                            ...(
+                                result.state
+                                    .chatMetadata
+                                || {}
+                            ),
+                            ...localMetadata(),
+                        }
+                        : localMetadata(),
+                    expectedEpoch,
+                    'join-merge',
+                    scope,
+                );
+
+                if (!queue.length) {
+                    await enqueueMutation(
+                        'join-merge',
+                        expectedEpoch,
+                    );
                 }
             }
-        })();
 
-    return streamFlushPromise;
+            if (
+                settings.syncMessages
+                && result.state.snapshot
+                    ?.length
+                && !differs
+            ) {
+                await applySnapshotLocally(
+                    result.state.snapshot,
+                    settings.syncMetadata
+                        ? (
+                            result.state
+                                .chatMetadata
+                            || {}
+                        )
+                        : localMetadata(),
+                    expectedEpoch,
+                    'join',
+                    scope,
+                );
+            }
+        }
+
+        reconnectAttempt = 0;
+
+        await connectSse();
+
+        startHeartbeat();
+
+        void flushQueue(
+            expectedEpoch,
+        );
+
+        updateUi();
+        updateInfo();
+
+        return true;
+    } catch (error) {
+        serverAvailable =
+            error.code
+            !== 'unauthenticated'
+            && error.status
+                !== 404;
+
+        serverCompatible =
+            error.status
+                !== 404;
+
+        lastError =
+            error.message;
+
+        updateUi();
+        updateInfo();
+
+        return false;
+    }
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* Generation terminal                                                        */
-/* -------------------------------------------------------------------------- */
-
-async function finishGeneration(
-    status,
+async function leaveScope(
+    scope,
 ) {
-    const generation =
-        currentState?.generation;
-
     if (
-        !generation ||
-        !isLocalGenerationOwner()
+        !scope
+        || !serverCompatible
     ) {
         return;
     }
-
-    if (
-        generationTerminalizing.has(
-            generation.id,
-        )
-    ) {
-        return;
-    }
-
-    generationTerminalizing.add(
-        generation.id,
-    );
 
     try {
-        await flushStreamUpdate();
-
-        while (
-            streamFlushPromise
-        ) {
-            await new Promise(
-                resolve =>
-                    setTimeout(
-                        resolve,
-                        25,
-                    ),
-            );
-        }
-
-        await saveCurrentChat(
-            'generation-terminal',
-        );
-
-        const snapshot =
-            makeLocalSnapshot();
-
-        if (!snapshot) {
-            return;
-        }
-
-        const generationId =
-            generation.id;
-
-        try {
-            const result =
-                await api(
-                    '/event',
-                    {
-                        method:
-                            'POST',
-
-                        body: {
-                            protocolVersion:
-                                PROTOCOL_VERSION,
-
-                            clientId,
-
-                            deviceId,
-
-                            scope:
-                                currentScope,
-
-                            opId:
-                                uuid(),
-
-                            type:
-                                'generation_terminal',
-
-                            generationId,
-
-                            status,
-
-                            baseRevision:
-                                lastRevision,
-
-                            snapshot,
-                        },
-                    },
-                );
-
-            if (
-                result.state
-            ) {
-                applyStateCursor(
-                    result.state,
-                );
-
-                currentState.generation =
-                    result.state
-                        .generation
-                        ? clone(
-                            result.state
-                                .generation,
-                        )
-                        : null;
-            }
-
-            await persistCursor();
-
-            localGenerationId =
-                null;
-
-            localGenerationLost =
-                false;
-
-            localStopRequested =
-                false;
-
-            setStatus(
-                'Synced',
-                `${status}; revision ${lastRevision}`,
-            );
-        } catch (error) {
-            if (
-                error.code ===
-                'st_not_persisted'
-            ) {
-                /*
-                 * One deliberate retry after another ST save.
-                 */
-                await saveCurrentChat(
-                    'generation-terminal-retry',
-                );
-
-                const retrySnapshot =
-                    makeLocalSnapshot();
-
-                const retry =
-                    await api(
-                        '/event',
-                        {
-                            method:
-                                'POST',
-
-                            body: {
-                                protocolVersion:
-                                    PROTOCOL_VERSION,
-
-                                clientId,
-
-                                deviceId,
-
-                                scope:
-                                    currentScope,
-
-                                opId:
-                                    uuid(),
-
-                                type:
-                                    'generation_terminal',
-
-                                generationId,
-
-                                status,
-
-                                baseRevision:
-                                    lastRevision,
-
-                                snapshot:
-                                    retrySnapshot,
-                            },
-                        },
-                    );
-
-                if (
-                    retry.state
-                ) {
-                    applyStateCursor(
-                        retry.state,
-                    );
-
-                    currentState.generation =
-                        retry.state
-                            .generation
-                            ? clone(
-                                retry.state
-                                    .generation,
-                            )
-                            : null;
-                }
-
-                await persistCursor();
-
-                localGenerationId =
-                    null;
-
-                localGenerationLost =
-                    false;
-
-                localStopRequested =
-                    false;
-
-                return;
-            }
-
-            if (
-                error.code ===
-                'stale_revision'
-            ) {
-                await resyncCurrentScope(
-                    'generation terminal stale revision',
-                );
-            } else {
-                warn(
-                    'Generation terminal failed',
-                    error,
-                );
-            }
-        }
-    } finally {
-        generationTerminalizing.delete(
-            generation.id,
-        );
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Chat mutation event handlers                                               */
-/* -------------------------------------------------------------------------- */
-
-function scheduleMutation(
-    type,
-    payload = {},
-) {
-    if (
-        applyingRemoteDepth >
-            0 ||
-        !pluginAvailable ||
-        !getSettings().enabled ||
-        !currentScope
-    ) {
-        return;
-    }
-
-    if (
-        currentState?.generation &&
-        !isLocalGenerationOwner()
-    ) {
-        return;
-    }
-
-    if (
-        isLocalGenerationOwner()
-    ) {
-        queueStreamUpdate(
-            type,
-        );
-
-        return;
-    }
-
-    if (
-        resyncTimer
-    ) {
-        clearTimeout(
-            resyncTimer,
-        );
-    }
-
-    resyncTimer =
-        setTimeout(
-            () => {
-                resyncTimer =
-                    null;
-
-                void enqueueLocalMutation(
-                    type,
-                    payload,
-                );
+        await api(
+            '/leave',
+            {
+                method:
+                    'POST',
+                body:
+                    JSON.stringify({
+                        scope,
+                        clientId,
+                        deviceId,
+                    }),
             },
-            RESYNC_DELAY_MS,
         );
+    } catch {}
 }
-
-
-/* -------------------------------------------------------------------------- */
-/* ST listeners                                                               */
-/* -------------------------------------------------------------------------- */
-
-function bindStEvent(
-    eventName,
-    handler,
-) {
-    if (
-        !eventName ||
-        !ctx?.eventSource
-    ) {
-        return;
-    }
-
-    ctx.eventSource.on(
-        eventName,
-        handler,
-    );
-
-    stListeners.push([
-        eventName,
-        handler,
-    ]);
-}
-
-function unbindStEvents() {
-    if (
-        !ctx?.eventSource
-    ) {
-        return;
-    }
-
-    for (
-        const [
-            eventName,
-            handler,
-        ] of stListeners
-    ) {
-        try {
-            ctx.eventSource.removeListener(
-                eventName,
-                handler,
-            );
-        } catch {
-            // ignored
-        }
-    }
-
-    stListeners = [];
-}
-
-function bindStEvents() {
-    const e =
-        ctx?.eventTypes;
-
-    if (!e) {
-        return;
-    }
-
-    bindStEvent(
-        e.MESSAGE_SENT,
-        () =>
-            scheduleMutation(
-                'message_sent',
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_RECEIVED,
-        () =>
-            scheduleMutation(
-                'message_received',
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_EDITED,
-        (...args) =>
-            scheduleMutation(
-                'message_edited',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_DELETED,
-        (...args) =>
-            scheduleMutation(
-                'message_deleted',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_UPDATED,
-        (...args) =>
-            scheduleMutation(
-                'message_updated',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_SWIPED,
-        (...args) =>
-            scheduleMutation(
-                'message_swiped',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_SWIPE_DELETED,
-        (...args) =>
-            scheduleMutation(
-                'message_swipe_deleted',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_FILE_EMBEDDED,
-        (...args) =>
-            scheduleMutation(
-                'message_file_embedded',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.FILE_ATTACHMENT_DELETED,
-        (...args) =>
-            scheduleMutation(
-                'file_attachment_deleted',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MEDIA_ATTACHMENT_DELETED,
-        (...args) =>
-            scheduleMutation(
-                'media_attachment_deleted',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_REASONING_EDITED,
-        (...args) =>
-            scheduleMutation(
-                'message_reasoning_edited',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.MESSAGE_REASONING_DELETED,
-        (...args) =>
-            scheduleMutation(
-                'message_reasoning_deleted',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.STREAM_REASONING_DONE,
-        (...args) =>
-            scheduleMutation(
-                'stream_reasoning_done',
-                {
-                    args,
-                },
-            ),
-    );
-
-    bindStEvent(
-        e.TOOL_CALLS_PERFORMED,
-        (...args) =>
-            scheduleMutation(
-                'tool_calls_performed',
-                {
-                    args,
-                },
-            ),
-    );
-
-    /*
-     * MORE_MESSAGES_LOADED is not a mutation.
-     */
-    bindStEvent(
-        e.MORE_MESSAGES_LOADED,
-        () =>
-            scheduleResync(
-                'more messages loaded',
-            ),
-    );
-
-    bindStEvent(
-        e.CHAT_LOADED,
-        () =>
-            void handleChatLifecycle(
-                'chat_loaded',
-            ),
-    );
-
-    bindStEvent(
-        e.CHAT_CHANGED,
-        () =>
-            void handleChatLifecycle(
-                'chat_changed',
-            ),
-    );
-
-    bindStEvent(
-        e.CHAT_CREATED,
-        () =>
-            void handleChatLifecycle(
-                'chat_created',
-            ),
-    );
-
-    bindStEvent(
-        e.CHAT_DELETED,
-        () =>
-            void handleChatLifecycle(
-                'chat_deleted',
-            ),
-    );
-
-    bindStEvent(
-        e.CHAT_RENAMED,
-        () =>
-            void handleChatLifecycle(
-                'chat_renamed',
-            ),
-    );
-
-    bindStEvent(
-        e.GROUP_CHAT_CREATED,
-        () =>
-            void handleChatLifecycle(
-                'group_chat_created',
-            ),
-    );
-
-    bindStEvent(
-        e.GROUP_CHAT_DELETED,
-        () =>
-            void handleChatLifecycle(
-                'group_chat_deleted',
-            ),
-    );
-
-    bindStEvent(
-        e.GROUP_UPDATED,
-        () =>
-            void handleChatLifecycle(
-                'group_updated',
-            ),
-    );
-
-
-    /*
-     * Fallback generation path.
-     *
-     * The stronger path is generate_interceptor above.
-     */
-    bindStEvent(
-        e.GENERATION_STARTED,
-        async type => {
-            if (
-                applyingRemoteDepth >
-                    0 ||
-                !getSettings().enabled
-            ) {
-                return;
-            }
-
-            const available =
-                await ensureConnected();
-
-            if (!available) {
-                return;
-            }
-
-            const generation =
-                activeGeneration();
-
-            if (
-                generation &&
-                !isLocalGenerationOwner()
-            ) {
-                localGenerationLost =
-                    true;
-
-                try {
-                    ctx.stopGeneration?.();
-                } catch {
-                    // ignored
-                }
-
-                return;
-            }
-
-            if (
-                isLocalGenerationOwner()
-            ) {
-                if (
-                    generation.state !==
-                    'streaming'
-                ) {
-                    try {
-                        const result =
-                            await api(
-                                '/event',
-                                {
-                                    method:
-                                        'POST',
-
-                                    body: {
-                                        protocolVersion:
-                                            PROTOCOL_VERSION,
-
-                                        clientId,
-
-                                        deviceId,
-
-                                        scope:
-                                            currentScope,
-
-                                        opId:
-                                            uuid(),
-
-                                        type:
-                                            'generation_started',
-
-                                        baseRevision:
-                                            lastRevision,
-
-                                        generationId:
-                                            generation.id,
-                                    },
-                                },
-                            );
-
-                        if (
-                            result.state
-                        ) {
-                            applyStateCursor(
-                                result.state,
-                            );
-
-                            currentState.generation =
-                                result.state
-                                    .generation
-                                    ? clone(
-                                        result.state
-                                            .generation,
-                                    )
-                                    : null;
-                        }
-                    } catch (error) {
-                        warn(
-                            'Fallback generation start failed',
-                            error,
-                        );
-
-                        localGenerationLost =
-                            true;
-
-                        try {
-                            ctx.stopGeneration?.();
-                        } catch {
-                            // ignored
-                        }
-                    }
-                }
-
-                return;
-            }
-
-            const claimed =
-                await claimGeneration(
-                    type,
-                    getLastMessageSyncId(),
-                );
-
-            if (!claimed) {
-                try {
-                    ctx.stopGeneration?.();
-                } catch {
-                    // ignored
-                }
-
-                return;
-            }
-
-            try {
-                const result =
-                    await api(
-                        '/event',
-                        {
-                            method:
-                                'POST',
-
-                            body: {
-                                protocolVersion:
-                                    PROTOCOL_VERSION,
-
-                                clientId,
-
-                                deviceId,
-
-                                scope:
-                                    currentScope,
-
-                                opId:
-                                    uuid(),
-
-                                type:
-                                    'generation_started',
-
-                                baseRevision:
-                                    lastRevision,
-
-                                generationId:
-                                    currentState
-                                        .generation
-                                        .id,
-                            },
-                        },
-                    );
-
-                if (
-                    result.state
-                ) {
-                    applyStateCursor(
-                        result.state,
-                    );
-                }
-            } catch (error) {
-                warn(
-                    'Generation start failed',
-                    error,
-                );
-
-                localGenerationLost =
-                    true;
-
-                try {
-                    ctx.stopGeneration?.();
-                } catch {
-                    // ignored
-                }
-            }
-        },
-    );
-
-    bindStEvent(
-        e.STREAM_TOKEN_RECEIVED,
-        () =>
-            queueStreamUpdate(
-                'token',
-            ),
-    );
-
-    bindStEvent(
-        e.GENERATION_STOPPED,
-        async () => {
-            if (
-                isLocalGenerationOwner()
-            ) {
-                localStopRequested =
-                    true;
-
-                await finishGeneration(
-                    'stopped',
-                );
-            }
-        },
-    );
-
-    bindStEvent(
-        e.GENERATION_ENDED,
-        async () => {
-            if (
-                !isLocalGenerationOwner()
-            ) {
-                return;
-            }
-
-            if (
-                finalizationTimer
-            ) {
-                clearTimeout(
-                    finalizationTimer,
-                );
-            }
-
-            finalizationTimer =
-                setTimeout(
-                    () => {
-                        finalizationTimer =
-                            null;
-
-                        void finishGeneration(
-                            localStopRequested
-                                ? 'stopped'
-                                : 'completed',
-                        );
-                    },
-                    250,
-                );
-        },
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Chat lifecycle                                                              */
-/* -------------------------------------------------------------------------- */
-
-async function handleChatLifecycle(
-    reason,
-) {
-    if (
-        applyingRemoteDepth >
-            0 ||
-        stopping ||
-        !getSettings().enabled
-    ) {
-        return;
-    }
-
-    const nextScope =
-        getCurrentScope();
-
-    if (
-        !nextScope
-    ) {
-        await switchScope(
-            null,
-        );
-
-        return;
-    }
-
-    if (
-        !sameScope(
-            currentScope,
-            nextScope,
-        )
-    ) {
-        await switchScope(
-            nextScope,
-        );
-
-        return;
-    }
-
-    if (
-        pluginAvailable
-    ) {
-        scheduleResync(
-            reason,
-        );
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Scope switching                                                             */
-/* -------------------------------------------------------------------------- */
 
 async function switchScope(
     nextScope,
 ) {
     const previousScope =
-        currentScope;
-
-    scopeEpoch +=
-        1;
+        clone(
+            currentScope,
+        );
 
     const expectedEpoch =
-        scopeEpoch;
+        ++scopeEpoch;
 
-    clearHeartbeat();
     closeSse();
+    stopHeartbeat();
+    stopGenerationHeartbeat();
 
-    if (
-        reconnectTimer
-    ) {
-        clearTimeout(
-            reconnectTimer,
+    if (previousScope) {
+        void leaveScope(
+            previousScope,
         );
-
-        reconnectTimer =
-            null;
     }
-
-    if (
-        resyncTimer
-    ) {
-        clearTimeout(
-            resyncTimer,
-        );
-
-        resyncTimer =
-            null;
-    }
-
-    if (
-        streamTimer
-    ) {
-        clearTimeout(
-            streamTimer,
-        );
-
-        streamTimer =
-            null;
-    }
-
-    if (
-        finalizationTimer
-    ) {
-        clearTimeout(
-            finalizationTimer,
-        );
-
-        finalizationTimer =
-            null;
-    }
-
-    latestStreamSnapshot =
-        null;
-
-    latestStreamReason =
-        null;
 
     currentScope =
         nextScope
@@ -5953,967 +4501,2017 @@ async function switchScope(
     currentState =
         null;
 
-    subscriptionToken =
-        null;
-
-    localGenerationId =
+    localGeneration =
         null;
 
     localGenerationLost =
         false;
 
-    localStopRequested =
-        false;
+    if (!currentScope) {
+        updateUi();
+        updateInfo();
 
-    lastEventId =
-        null;
-
-    lastEpoch =
-        null;
-
-    lastSeq =
-        0;
-
-    lastRevision =
-        0;
+        return;
+    }
 
     if (
-        previousScope &&
-        pluginAvailable
+        !settings.enabled
+        || !settings.autoConnect
+        || !serverCompatible
     ) {
-        try {
+        updateUi();
+        updateInfo();
+
+        return;
+    }
+
+    await joinScope(
+        currentScope,
+        expectedEpoch,
+    );
+}
+
+async function reconnectCurrentScope() {
+    await checkHealth();
+
+    const target =
+        getCurrentScope();
+
+    if (!target) {
+        closeSse();
+        stopHeartbeat();
+
+        currentScope =
+            null;
+
+        currentState =
+            null;
+
+        updateUi();
+        updateInfo();
+
+        return false;
+    }
+
+    if (
+        sameScope(
+            target,
+            currentScope,
+        )
+    ) {
+        const expectedEpoch =
+            ++scopeEpoch;
+
+        closeSse();
+        stopHeartbeat();
+
+        await joinScope(
+            clone(target),
+            expectedEpoch,
+        );
+
+        return true;
+    }
+
+    await switchScope(
+        target,
+    );
+
+    return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Heartbeat                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function startHeartbeat() {
+    stopHeartbeat();
+
+    heartbeatTimer =
+        setInterval(
+            () =>
+                void sendHeartbeat(),
+            10_000,
+        );
+}
+
+function stopHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(
+            heartbeatTimer,
+        );
+    }
+
+    heartbeatTimer =
+        null;
+}
+
+async function sendHeartbeat() {
+    if (
+        !currentScope
+        || !serverCompatible
+        || !settings.enabled
+    ) {
+        return;
+    }
+
+    try {
+        const result =
             await api(
-                '/leave',
+                '/heartbeat',
                 {
                     method:
                         'POST',
-
-                    body: {
-                        protocolVersion:
-                            PROTOCOL_VERSION,
-
-                        clientId,
-
-                        deviceId,
-
-                        scope:
-                            previousScope,
-                    },
+                    body:
+                        JSON.stringify({
+                            scope:
+                                currentScope,
+                            clientId,
+                            deviceId,
+                        }),
                 },
             );
-        } catch {
-            /*
-             * Leave is best-effort. Server membership expiry is the crash-safe
-             * fallback.
-             */
+
+        if (
+            currentState
+        ) {
+            currentState.generation =
+                clone(
+                    result.generation
+                    || null,
+                );
+
+            currentState.revision =
+                Math.max(
+                    Number(
+                        currentState
+                            .revision
+                        || 0,
+                    ),
+                    Number(
+                        result.revision
+                        || 0,
+                    ),
+                );
         }
-    }
 
+        updateUi();
+    } catch {
+        scheduleReconnect(
+            scopeEpoch,
+        );
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Generation                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function startGenerationHeartbeat() {
+    stopGenerationHeartbeat();
+
+    generationHeartbeatTimer =
+        setInterval(
+            () =>
+                void renewGeneration(),
+            5_000,
+        );
+}
+
+function stopGenerationHeartbeat() {
     if (
-        expectedEpoch !==
-        scopeEpoch ||
-        !currentScope ||
-        stopping ||
-        !getSettings().enabled
+        generationHeartbeatTimer
     ) {
-        return;
+        clearInterval(
+            generationHeartbeatTimer,
+        );
     }
 
-    const available =
-        await checkPlugin();
+    generationHeartbeatTimer =
+        null;
+}
 
+async function renewGeneration() {
     if (
-        !available
+        !localGeneration
+        || localGenerationLost
+        || !currentScope
     ) {
         return;
     }
 
     try {
-        await joinCurrentScope(
-            currentScope,
-        );
+        const result =
+            await api(
+                '/heartbeat',
+                {
+                    method:
+                        'POST',
+                    body:
+                        JSON.stringify({
+                            scope:
+                                currentScope,
+                            clientId,
+                            deviceId,
+                            generationId:
+                                localGeneration
+                                    .id,
+                        }),
+                },
+            );
+
+        currentState = {
+            ...(currentState || {}),
+            generation:
+                clone(
+                    result.generation,
+                ),
+        };
     } catch (error) {
+        if (
+            [
+                'generation_mismatch',
+                'no_generation',
+                'not_generation_owner',
+            ].includes(
+                error.code,
+            )
+        ) {
+            localGenerationLost =
+                true;
+        }
+    }
+}
+
+async function claimGeneration(
+    generationType = 'normal',
+) {
+    if (
+        !settings.coordinateGeneration
+        || !currentScope
+        || !serverCompatible
+    ) {
+        return true;
+    }
+
+    if (
+        currentState?.generation
+    ) {
+        toast(
+            'warning',
+            'Another synchronized client owns generation in this chat.',
+        );
+
+        return false;
+    }
+
+    const generationId =
+        randomId('g_');
+
+    try {
+        const result =
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
+                    body:
+                        JSON.stringify(
+                            eventBody(
+                                'generation_claim',
+                                {
+                                    opId:
+                                        randomId(
+                                            'op_',
+                                        ),
+                                    generationId,
+                                    generationType,
+                                },
+                            ),
+                        ),
+                },
+            );
+
+        localGeneration = {
+            id:
+                generationId,
+            type:
+                generationType,
+        };
+
+        localGenerationLost =
+            false;
+
+        currentState = {
+            ...(currentState || {}),
+            generation:
+                clone(
+                    result.generation,
+                ),
+        };
+
+        startGenerationHeartbeat();
+
+        updateUi();
+
+        return true;
+    } catch (error) {
+        if (
+            error.code
+                === 'generation_busy'
+        ) {
+            toast(
+                'warning',
+                'Another synchronized client is generating in this chat.',
+            );
+        } else {
+            warn(
+                'generation claim failed',
+                error,
+            );
+        }
+
+        return false;
+    }
+}
+
+async function acknowledgeGenerationStarted(
+    type,
+    messageId,
+) {
+    if (
+        !localGeneration
+        || localGenerationLost
+        || !currentScope
+    ) {
+        return false;
+    }
+
+    try {
+        const result =
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
+                    body:
+                        JSON.stringify(
+                            eventBody(
+                                'generation_started',
+                                {
+                                    opId:
+                                        randomId(
+                                            'op_',
+                                        ),
+                                    generationId:
+                                        localGeneration
+                                            .id,
+                                    generationType:
+                                        type,
+                                    messageId:
+                                        messageId
+                                            || null,
+                                },
+                            ),
+                        ),
+                },
+            );
+
+        currentState = {
+            ...(currentState || {}),
+            generation:
+                clone(
+                    result.generation,
+                ),
+        };
+
+        return true;
+    } catch (error) {
+        localGenerationLost =
+            true;
+
         warn(
-            'Scope join failed',
+            'generation start acknowledgement failed',
             error,
         );
 
-        setStatus(
-            'Sync unavailable',
-            error.message ||
-                error.code ||
-                'join failed',
-        );
+        try {
+            ctx.stopGeneration?.();
+        } catch {}
 
-        scheduleReconnect(
-            'join failed',
-        );
+        return false;
     }
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* Join                                                                      */
-/* -------------------------------------------------------------------------- */
-
-async function joinCurrentScope(
-    scope,
+async function finishGeneration(
+    status = 'completed',
 ) {
-    const expectedEpoch =
-        currentEpoch();
+    if (
+        finishingGeneration
+    ) {
+        return;
+    }
 
-    const previousCursor =
-        await dbGetMeta(
-            stableStringify(
-                scope,
-            ),
+    finishingGeneration =
+        true;
+
+    try {
+        stopGenerationHeartbeat();
+
+        if (
+            !localGeneration
+            || localGenerationLost
+            || !currentScope
+            || !serverCompatible
+        ) {
+            return;
+        }
+
+        const generationId =
+            localGeneration.id;
+
+        await streamFlushPromise;
+
+        const expectedEpoch =
+            scopeEpoch;
+
+        const snapshot =
+            localSnapshot();
+
+        const metadata =
+            localMetadata();
+
+        if (
+            hostMessageIdsDirty
+        ) {
+            await ctx.saveChat?.();
+            hostMessageIdsDirty =
+                false;
+        }
+
+        const opId =
+            randomId('op_');
+
+        let accepted =
+            false;
+
+        for (
+            let attempt = 0;
+            attempt < 3;
+            attempt++
+        ) {
+            try {
+                const digest =
+                    await snapshotDigest(
+                        snapshot,
+                    );
+
+                const result =
+                    await api(
+                        '/event',
+                        {
+                            method:
+                                'POST',
+                            body:
+                                JSON.stringify(
+                                    eventBody(
+                                        'generation_terminal',
+                                        {
+                                            opId,
+                                            generationId,
+                                            status,
+                                            snapshot,
+                                            chatMetadata:
+                                                metadata,
+                                            ...(digest
+                                                ? {
+                                                    hostSnapshotDigest:
+                                                        digest,
+                                                }
+                                                : {}),
+                                        },
+                                    ),
+                                ),
+                        },
+                    );
+
+                accepted = true;
+
+                if (
+                    scopeIsCurrent(
+                        expectedEpoch,
+                    )
+                ) {
+                    await setServerState(
+                        result.state,
+                        {
+                            epoch:
+                                result.epoch,
+                            revision:
+                                result.revision,
+                            lastEventId:
+                                result.eventId,
+                        },
+                    );
+                }
+
+                return;
+            } catch (error) {
+                if (
+                    [
+                        'generation_mismatch',
+                        'no_generation',
+                        'not_generation_owner',
+                    ].includes(
+                        error.code,
+                    )
+                ) {
+                    localGenerationLost =
+                        true;
+
+                    return;
+                }
+
+                if (
+                    attempt < 2
+                    && (
+                        !error.status
+                        || error.status
+                            >= 500
+                    )
+                ) {
+                    await sleep(
+                        150 * (
+                            attempt + 1
+                        ),
+                    );
+
+                    continue;
+                }
+
+                warn(
+                    'generation terminal failed',
+                    error,
+                );
+
+                return;
+            }
+        }
+    } finally {
+        if (
+            acceptedGenerationTerminalPlaceholder
+            || localGenerationLost
+        ) {
+            localGeneration =
+                null;
+
+            localGenerationLost =
+                false;
+        }
+
+        /*
+         * `acceptedGenerationTerminalPlaceholder` is assigned by the
+         * outer completion helper below so the final cleanup remains
+         * intentionally conservative.
+         */
+        acceptedGenerationTerminalPlaceholder =
+            false;
+
+        finishingGeneration =
+            false;
+
+        updateUi();
+        updateInfo();
+    }
+}
+
+let acceptedGenerationTerminalPlaceholder =
+    false;
+
+async function sendGenerationStream(
+    message,
+) {
+    if (
+        !localGeneration
+        || localGenerationLost
+        || !currentScope
+        || !settings.coordinateGeneration
+    ) {
+        return;
+    }
+
+    const generationId =
+        localGeneration.id;
+
+    const nextSequence =
+        Number(
+            currentState
+                ?.generation
+                ?.streamSeq
+            || 0,
+        ) + 1;
+
+    const digest =
+        await snapshotDigest(
+            localSnapshot(),
         );
 
-    const result =
+    try {
+        const result =
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
+                    body:
+                        JSON.stringify(
+                            eventBody(
+                                'generation_stream',
+                                {
+                                    opId:
+                                        randomId(
+                                            'op_',
+                                        ),
+                                    generationId,
+                                    streamSeq:
+                                        nextSequence,
+                                    messageId:
+                                        stableMessageId(
+                                            message,
+                                        ),
+                                    message:
+                                        clone(
+                                            message,
+                                        ),
+                                    ...(digest
+                                        ? {
+                                            hostSnapshotDigest:
+                                                digest,
+                                        }
+                                        : {}),
+                                },
+                            ),
+                        ),
+                },
+            );
+
+        if (
+            localGeneration
+                ?.id
+                === generationId
+        ) {
+            currentState = {
+                ...(currentState || {}),
+                generation:
+                    clone(
+                        result.generation,
+                    ),
+            };
+        }
+    } catch (error) {
+        if (
+            [
+                'stream_sequence_gap',
+                'generation_mismatch',
+                'not_generation_owner',
+            ].includes(
+                error.code,
+            )
+        ) {
+            localGenerationLost =
+                true;
+        } else {
+            warn(
+                'generation stream failed',
+                error,
+            );
+        }
+    }
+}
+
+function streamCandidate() {
+    if (
+        !localGeneration
+        || localGenerationLost
+    ) {
+        return null;
+    }
+
+    const generatingId =
+        currentState
+            ?.generation
+            ?.messageId;
+
+    if (generatingId) {
+        const found =
+            ctx.chat.find(
+                message =>
+                    stableMessageId(
+                        message,
+                    )
+                    === generatingId,
+            );
+
+        if (found) {
+            return clone(
+                found,
+            );
+        }
+    }
+
+    const last =
+        ctx.chat?.at?.(-1);
+
+    return last
+        ? clone(last)
+        : null;
+}
+
+function scheduleStreamCapture() {
+    if (
+        !localGeneration
+        || localGenerationLost
+        || applyingRemoteDepth
+    ) {
+        return;
+    }
+
+    pendingStreamMessage =
+        streamCandidate();
+
+    if (streamTimer) {
+        return;
+    }
+
+    streamTimer =
+        setTimeout(
+            () => {
+                streamTimer =
+                    null;
+
+                const message =
+                    pendingStreamMessage;
+
+                pendingStreamMessage =
+                    null;
+
+                if (!message) {
+                    return;
+                }
+
+                streamFlushPromise =
+                    streamFlushPromise
+                        .then(
+                            () =>
+                                sendGenerationStream(
+                                    message,
+                                ),
+                        );
+            },
+            80,
+        );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Branches / checkpoints                                                      */
+/* -------------------------------------------------------------------------- */
+
+async function fetchNativeChatHeader(
+    scope,
+    childChatId,
+) {
+    try {
+        if (
+            scope.kind
+                === 'character'
+        ) {
+            const response =
+                await fetch(
+                    '/api/chats/get',
+                    {
+                        method:
+                            'POST',
+                        credentials:
+                            'same-origin',
+                        headers:
+                            ctx.getRequestHeaders?.()
+                            || {},
+                        body:
+                            JSON.stringify({
+                                avatar_url:
+                                    scope.character,
+                                file_name:
+                                    childChatId,
+                            }),
+                    },
+                );
+
+            if (!response.ok) {
+                return null;
+            }
+
+            const data =
+                await response.json();
+
+            return {
+                metadata:
+                    isObject(
+                        data?.[0]
+                            ?.chat_metadata,
+                    )
+                        ? clone(
+                            data[0]
+                                .chat_metadata,
+                        )
+                        : {},
+            };
+        }
+
+        const response =
+            await fetch(
+                '/api/chats/group/get',
+                {
+                    method:
+                        'POST',
+                    credentials:
+                        'same-origin',
+                    headers:
+                        ctx.getRequestHeaders?.()
+                        || {},
+                    body:
+                        JSON.stringify({
+                            id:
+                                childChatId,
+                        }),
+                },
+            );
+
+        if (!response.ok) {
+            return null;
+        }
+
+        const data =
+            await response.json();
+
+        return {
+            metadata:
+                isObject(
+                    data?.[0]
+                        ?.chat_metadata,
+                )
+                    ? clone(
+                        data[0]
+                            .chat_metadata,
+                    )
+                    : {},
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function announceNativeChild(
+    parentScope,
+    childChatId,
+    branchKind,
+    expectedEpoch,
+) {
+    const header =
+        await fetchNativeChatHeader(
+            parentScope,
+            childChatId,
+        );
+
+    if (
+        !header
+        || !header.metadata
+            ?.integrity
+        || !header.metadata
+            ?.main_chat
+    ) {
+        toast(
+            'warning',
+            'SillyTavern created the child chat, but its native branch metadata could not be read yet.',
+        );
+
+        return false;
+    }
+
+    const childScope = {
+        ...clone(
+            parentScope,
+        ),
+
+        chatId:
+            String(
+                childChatId,
+            ),
+
+        branchId:
+            String(
+                header.metadata
+                    .integrity,
+            ),
+
+        parentChatId:
+            String(
+                header.metadata
+                    .main_chat,
+            ),
+    };
+
+    try {
         await api(
-            '/join',
+            '/event',
             {
                 method:
                     'POST',
+                body:
+                    JSON.stringify(
+                        eventBody(
+                            'branch_announce',
+                            {
+                                opId:
+                                    randomId(
+                                        'op_',
+                                    ),
 
-                body: {
-                    protocolVersion:
-                        PROTOCOL_VERSION,
+                                baseRevision:
+                                    Number(
+                                        currentState
+                                            ?.revision
+                                        || 0,
+                                    ),
 
-                    clientId,
+                                branchKind,
 
-                    deviceId,
-
-                    scope,
-                },
-            },
-        );
-
-    if (
-        expectedEpoch !==
-            currentEpoch() ||
-        !sameScope(
-            currentScope,
-            scope,
-        )
-    ) {
-        return;
-    }
-
-    principalKey =
-        result.principalKey;
-
-    subscriptionToken =
-        result.subscriptionToken;
-
-    currentState = {
-        serverSnapshot:
-            result.state
-                ?.snapshot
-                ? normalizeSnapshot(
-                    result.state
-                        .snapshot,
-                )
-                : null,
-
-        generation:
-            result.state
-                ?.generation
-                ? clone(
-                    result.state
-                        .generation,
-                )
-                : null,
-
-        pendingCount:
-            0,
-
-        serverEpoch:
-            result.state?.epoch ||
-            null,
-    };
-
-    applyStateCursor(
-        result.state,
-    );
-
-    /*
-     * Preserve older replay cursor if it belongs to the same server epoch.
-     */
-    if (
-        previousCursor?.lastEpoch &&
-        previousCursor.lastEpoch ===
-            result.state?.epoch &&
-        Number.isSafeInteger(
-            Number(
-                previousCursor.lastSeq,
-            ),
-        ) &&
-        Number(
-            previousCursor.lastSeq,
-        ) <
-            Number(
-                result.state.seq,
-            )
-    ) {
-        lastEpoch =
-            previousCursor.lastEpoch;
-
-        lastSeq =
-            Number(
-                previousCursor.lastSeq,
-            );
-
-        lastRevision =
-            Number(
-                previousCursor.lastRevision,
-            ) || 0;
-
-        lastEventId =
-            previousCursor.lastEventId ||
-            null;
-    }
-
-
-    const pending =
-        await dbGetOperations(
-            scope,
-        );
-
-    currentState.pendingCount =
-        pending.length;
-
-    /*
-     * Make sure the local browser state uses stable IDs before comparing hashes.
-     */
-    const migrated =
-        ensureMessageIds(
-            ctx.chat,
-        );
-
-    if (
-        migrated
-    ) {
-        await saveCurrentChat(
-            'stable-message-id-migration',
-        );
-    }
-
-    const localSnapshot =
-        makeLocalSnapshot();
-
-    const localHash =
-        localSnapshot
-            ? await sha256(
-                localSnapshot,
-            )
-            : null;
-
-    const serverSnapshot =
-        currentState.serverSnapshot;
-
-
-    /*
-     * No server state yet.
-     *
-     * If ST already has a real file, the server's JOIN has normally populated
-     * the state. So this branch mainly covers a newly created unsaved chat.
-     */
-    if (
-        !serverSnapshot &&
-        localSnapshot &&
-        !pending.length
-    ) {
-        const bootstrap =
-            {
-                principalKey,
-
-                opId:
-                    uuid(),
-
-                localSeq:
-                    ++localSequence,
-
-                scope:
-                    clone(scope),
-
-                type:
-                    'bootstrap',
-
-                payload: {},
-
-                snapshot:
-                    clone(
-                        localSnapshot,
-                    ),
-
-                baseSnapshot:
-                    clone(
-                        localSnapshot,
-                    ),
-
-                baseRevision:
-                    0,
-
-                coalescible:
-                    false,
-            };
-
-        await dbPutOperation(
-            bootstrap,
-        );
-
-        await drainPendingQueue();
-    } else if (
-        serverSnapshot &&
-        !pending.length
-    ) {
-        /*
-         * With no local pending operations, decide whether server state should
-         * win automatically or whether the local browser contains an out-of-
-         * band change requiring an explicit user choice.
-         */
-        if (
-            localHash !==
-            result.state.snapshotHash
-        ) {
-            const serverWasNewer =
-                Boolean(
-                    previousCursor?.lastEpoch &&
-                    previousCursor
-                        .lastEpoch ===
-                        result.state
-                            .epoch &&
-                    Number(
-                        previousCursor
-                            .lastRevision,
-                    ) <
-                        Number(
-                            result.state
-                                .revision,
+                                childScope,
+                            },
+                            parentScope,
                         ),
-                );
-
-            if (
-                serverWasNewer
-            ) {
-                await applySnapshotLocally(
-                    serverSnapshot,
-                    {
-                        persist:
-                            true,
-
-                        reason:
-                            'server-newer-on-join',
-                    },
-                );
-            } else {
-                showDivergenceChoice(
-                    localSnapshot,
-                    serverSnapshot,
-                );
-            }
-        }
-    } else if (
-        serverSnapshot &&
-        pending.length
-    ) {
-        /*
-         * Keep the local pending intent, but rebase it against current server
-         * authority before transmitting it.
-         */
-        const rebased =
-            await rebasePendingQueue(
-                serverSnapshot,
-                lastRevision,
-            );
-
-        if (
-            rebased
-        ) {
-            await applySnapshotLocally(
-                rebased,
-                {
-                    persist:
-                        true,
-
-                    reason:
-                        'join-pending-rebase',
-                },
-            );
-        }
-
-        await drainPendingQueue();
-    }
-
-    /*
-     * If server reported a genuine persisted-file divergence, keep it visible
-     * rather than silently declaring victory.
-     */
-    if (
-        result.divergence
-            ?.detected &&
-        !pending.length
-    ) {
-        setStatus(
-            'Sync conflict',
-            'Server mirror and current ST chat differ',
-            [
-                {
-                    label:
-                        'Use server',
-
-                    run:
-                        () =>
-                            applySnapshotLocally(
-                                serverSnapshot,
-                                {
-                                    persist:
-                                        true,
-
-                                    reason:
-                                        'server-divergence-choice',
-                                },
-                            ),
-                },
-                {
-                    label:
-                        'Use current',
-
-                    run:
-                        () =>
-                            reconcileLocalToServer(
-                                makeLocalSnapshot(),
-                            ),
-                },
-            ],
-        );
-    }
-
-    connectSse();
-
-    startHeartbeat();
-
-    await persistCursor();
-
-    setStatus(
-        'Live',
-        `revision ${lastRevision}`,
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Reconnect                                                                  */
-/* -------------------------------------------------------------------------- */
-
-function scheduleReconnect(
-    reason = 'disconnect',
-) {
-    if (
-        stopping ||
-        reconnectTimer ||
-        !currentScope
-    ) {
-        return;
-    }
-
-    const delay =
-        Math.min(
-            MAX_RECONNECT_MS,
-
-            500 *
-                (
-                    2 **
-                    Math.min(
-                        reconnectAttempt,
-                        6,
-                    )
-                ) +
-
-                Math.floor(
-                    Math.random() *
-                        400,
-                ),
-        );
-
-    reconnectAttempt +=
-        1;
-
-    setStatus(
-        'Reconnecting',
-        `${reason}; ${Math.ceil(
-            delay / 1000,
-        )}s`,
-    );
-
-    reconnectTimer =
-        setTimeout(
-            async () => {
-                reconnectTimer =
-                    null;
-
-                await reconnectScope(
-                    reason,
-                );
+                    ),
             },
-            delay,
-        );
-}
-
-async function reconnectScope(
-    reason = 'reconnect',
-) {
-    if (
-        !currentScope ||
-        stopping
-    ) {
-        return false;
-    }
-
-    const available =
-        await checkPlugin();
-
-    if (
-        !available
-    ) {
-        return false;
-    }
-
-    try {
-        await switchScope(
-            currentScope,
         );
 
         return true;
     } catch (error) {
         warn(
-            'Reconnect failed',
-            reason,
+            'branch announcement failed',
             error,
         );
 
-        scheduleReconnect(
-            reason,
-        );
+        if (
+            error.code
+                === 'revision_conflict'
+        ) {
+            await resyncCurrentScope();
+
+            return false;
+        }
 
         return false;
     }
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* BroadcastChannel                                                           */
-/* -------------------------------------------------------------------------- */
-
-function startBroadcastChannel() {
+async function createNativeBranch() {
     if (
-        broadcastChannel
+        !settings.syncBranches
+        || !currentScope
+        || !serverCompatible
     ) {
+        return;
+    }
+
+    const parentScope =
+        clone(
+            currentScope,
+        );
+
+    const expectedEpoch =
+        scopeEpoch;
+
+    const index =
+        Math.max(
+            0,
+            ctx.chat.length - 1,
+        );
+
+    try {
+        const bookmarks =
+            await import(
+                '/scripts/bookmarks.js'
+            );
+
+        /*
+         * This is the current native ST API.
+         * It creates the branch without automatically navigating.
+         */
+        const childChatId =
+            await bookmarks.createBranch(
+                index,
+                {},
+            );
+
+        if (!childChatId) {
+            return;
+        }
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                parentScope,
+            )
+        ) {
+            return;
+        }
+
+        /*
+         * createBranch modifies the parent message's branch list.
+         * Persist that native parent change first.
+         */
+        try {
+            await ctx.saveChat?.();
+        } catch {}
+
+        await enqueueMutation(
+            'native-branch-created',
+            expectedEpoch,
+        );
+
+        await flushQueue(
+            expectedEpoch,
+        );
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                parentScope,
+            )
+        ) {
+            return;
+        }
+
+        await announceNativeChild(
+            parentScope,
+            String(childChatId),
+            'branch',
+            expectedEpoch,
+        );
+
+        toast(
+            'success',
+            `Branch created: ${childChatId}`,
+        );
+    } catch (error) {
+        warn(
+            'native branch creation failed',
+            error,
+        );
+
+        toast(
+            'error',
+            `Branch creation failed: ${error.message}`,
+        );
+    }
+}
+
+async function createNativeCheckpoint() {
+    if (
+        !settings.syncBranches
+        || !currentScope
+        || !serverCompatible
+    ) {
+        return;
+    }
+
+    const parentScope =
+        clone(
+            currentScope,
+        );
+
+    const expectedEpoch =
+        scopeEpoch;
+
+    const index =
+        Math.max(
+            0,
+            ctx.chat.length - 1,
+        );
+
+    try {
+        const bookmarks =
+            await import(
+                '/scripts/bookmarks.js'
+            );
+
+        /*
+         * Current native ST checkpoint API.
+         * It does not navigate away from the current chat.
+         */
+        const childChatId =
+            await bookmarks.createNewBookmark(
+                index,
+            );
+
+        if (!childChatId) {
+            return;
+        }
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                parentScope,
+            )
+        ) {
+            return;
+        }
+
+        await enqueueMutation(
+            'native-checkpoint-created',
+            expectedEpoch,
+        );
+
+        await flushQueue(
+            expectedEpoch,
+        );
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                parentScope,
+            )
+        ) {
+            return;
+        }
+
+        await announceNativeChild(
+            parentScope,
+            String(childChatId),
+            'checkpoint',
+            expectedEpoch,
+        );
+
+        toast(
+            'success',
+            `Checkpoint created: ${childChatId}`,
+        );
+    } catch (error) {
+        warn(
+            'native checkpoint creation failed',
+            error,
+        );
+
+        toast(
+            'error',
+            `Checkpoint creation failed: ${error.message}`,
+        );
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Group settings                                                              */
+/* -------------------------------------------------------------------------- */
+
+function currentGroupSettings() {
+    if (
+        !currentScope
+        || currentScope.kind
+            !== 'group'
+    ) {
+        return null;
+    }
+
+    const group =
+        ctx.groups?.find(
+            item =>
+                String(item.id)
+                === String(
+                    currentScope.groupId,
+                ),
+        );
+
+    if (!group) {
+        return null;
+    }
+
+    const allowedKeys = [
+        'name',
+        'members',
+        'disabled_members',
+        'chat_id',
+        'chats',
+        'generation_mode',
+        'generation_mode_join_prefix',
+        'generation_mode_join_suffix',
+        'activation_strategy',
+        'auto_mode_delay',
+        'allow_self_responses',
+        'avatar_url',
+        'hideMutedSprites',
+        'fav',
+    ];
+
+    const settingsSnapshot =
+        {};
+
+    for (
+        const key
+        of allowedKeys
+    ) {
+        if (
+            group[key] !== undefined
+        ) {
+            settingsSnapshot[key] =
+                clone(
+                    group[key],
+                );
+        }
+    }
+
+    return settingsSnapshot;
+}
+
+async function publishGroupSettings(
+    expectedEpoch = scopeEpoch,
+) {
+    if (
+        !settings.syncGroupSettings
+        || !currentScope
+        || currentScope.kind
+            !== 'group'
+        || !serverCompatible
+        || !scopeIsCurrent(
+            expectedEpoch,
+        )
+    ) {
+        return;
+    }
+
+    const snapshot =
+        currentGroupSettings();
+
+    if (!snapshot) {
+        return;
+    }
+
+    try {
+        const result =
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
+                    body:
+                        JSON.stringify(
+                            eventBody(
+                                'group_settings',
+                                {
+                                    opId:
+                                        randomId(
+                                            'op_',
+                                        ),
+                                    baseRevision:
+                                        Number(
+                                            currentState
+                                                ?.revision
+                                            || 0,
+                                        ),
+                                    groupSettings:
+                                        snapshot,
+                                },
+                            ),
+                        ),
+                },
+            );
+
+        if (
+            scopeIsCurrent(
+                expectedEpoch,
+            )
+        ) {
+            await setServerState(
+                result.state,
+                {
+                    epoch:
+                        result.epoch,
+                    revision:
+                        result.revision,
+                    lastEventId:
+                        result.eventId,
+                },
+            );
+        }
+    } catch (error) {
+        if (
+            error.code
+                === 'revision_conflict'
+        ) {
+            await resyncCurrentScope();
+            return;
+        }
+
+        warn(
+            'group setting publish failed',
+            error,
+        );
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Capture                                                                     */
+/* -------------------------------------------------------------------------- */
+
+function scheduleLocalCapture(
+    reason,
+) {
+    if (
+        applyingRemoteDepth
+        || !currentScope
+        || !serverCompatible
+        || !settings.enabled
+        || captureScheduled
+    ) {
+        return;
+    }
+
+    captureScheduled =
+        true;
+
+    clearTimeout(
+        captureTimer,
+    );
+
+    captureTimer =
+        setTimeout(
+            () => {
+                captureScheduled =
+                    false;
+
+                void enqueueMutation(
+                    reason,
+                    scopeEpoch,
+                );
+            },
+            SNAPSHOT_CAPTURE_DELAY,
+        );
+}
+
+async function handleChatChanged() {
+    if (
+        applyingRemoteDepth
+    ) {
+        return;
+    }
+
+    const nextScope =
+        getCurrentScope();
+
+    if (
+        sameScope(
+            nextScope,
+            currentScope,
+        )
+    ) {
+        scheduleLocalCapture(
+            'chat-changed',
+        );
+
+        return;
+    }
+
+    await switchScope(
+        nextScope,
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* BroadcastChannel                                                            */
+/* -------------------------------------------------------------------------- */
+
+function initBroadcastChannel() {
+    if (
+        typeof BroadcastChannel
+            === 'undefined'
+    ) {
+        return;
+    }
+
+    if (broadcastChannel) {
         return;
     }
 
     try {
         broadcastChannel =
             new BroadcastChannel(
-                `${EXTENSION_ID}:v4`,
+                EXTENSION_ID,
             );
 
-        broadcastChannel.addEventListener(
-            'message',
+        broadcastChannel.onmessage =
             event => {
-                void handleBroadcastMessage(
-                    event.data,
-                );
-            },
-        );
-    } catch (error) {
-        log(
-            'BroadcastChannel unavailable',
-            error,
-        );
+                const data =
+                    event.data;
 
+                if (
+                    !data
+                    || data.type
+                        !== 'scope-event'
+                ) {
+                    return;
+                }
+
+                if (
+                    data.scopeKey
+                        !== scopeKey(
+                            currentScope,
+                        )
+                ) {
+                    return;
+                }
+
+                /*
+                 * BroadcastChannel is only an optimization.
+                 * SSE remains the authoritative source.
+                 */
+                void resyncCurrentScope();
+            };
+    } catch {
         broadcastChannel =
             null;
     }
 }
 
-function broadcastLocalChange(
+function broadcastScopeEvent(
     type,
 ) {
     try {
-        broadcastChannel?.postMessage(
-            {
-                protocolVersion:
-                    PROTOCOL_VERSION,
+        broadcastChannel
+            ?.postMessage({
+                type:
+                    'scope-event',
+                scopeKey:
+                    scopeKey(
+                        currentScope,
+                    ),
+                eventType:
+                    type,
+            });
+    } catch {}
+}
 
-                sourceClientId:
-                    clientId,
+/* -------------------------------------------------------------------------- */
+/* Browser / ST events                                                         */
+/* -------------------------------------------------------------------------- */
 
-                sourceDeviceId:
-                    deviceId,
+function bindBrowserEvent(
+    name,
+    fn,
+    options,
+) {
+    window.addEventListener(
+        name,
+        fn,
+        options,
+    );
 
-                scope:
-                    currentScope,
+    browserBindings.push({
+        name,
+        fn,
+        options,
+    });
+}
 
-                type,
+function unbindBrowserEvents() {
+    for (
+        const binding
+        of browserBindings
+    ) {
+        window.removeEventListener(
+            binding.name,
+            binding.fn,
+            binding.options,
+        );
+    }
 
-                kind:
-                    'local_change',
+    browserBindings =
+        [];
+}
+
+function bindStEvent(
+    name,
+    handler,
+) {
+    if (
+        !name
+        || !ctx?.eventSource
+    ) {
+        return;
+    }
+
+    const wrapped =
+        (...args) =>
+            void handler(
+                ...args,
+            );
+
+    ctx.eventSource.on(
+        name,
+        wrapped,
+    );
+
+    listenerBindings.push({
+        name,
+        wrapped,
+    });
+}
+
+function unbindStEvents() {
+    for (
+        const binding
+        of listenerBindings
+    ) {
+        try {
+            ctx.eventSource
+                ?.removeListener(
+                    binding.name,
+                    binding.wrapped,
+                );
+        } catch {}
+    }
+
+    listenerBindings =
+        [];
+}
+
+function bindStEvents() {
+    unbindStEvents();
+
+    ctx =
+        getContext();
+
+    const events =
+        ctx.eventTypes
+        || ctx.event_types
+        || {};
+
+    const capture = [
+        'MESSAGE_SENT',
+        'MESSAGE_RECEIVED',
+        'MESSAGE_EDITED',
+        'MESSAGE_DELETED',
+        'MESSAGE_UPDATED',
+        'MESSAGE_SWIPED',
+        'MESSAGE_SWIPE_DELETED',
+        'MESSAGE_REASONING_EDITED',
+        'MESSAGE_REASONING_DELETED',
+        'MESSAGE_FILE_EMBEDDED',
+        'FILE_ATTACHMENT_DELETED',
+        'MEDIA_ATTACHMENT_DELETED',
+        'TOOL_CALLS_PERFORMED',
+    ];
+
+    for (
+        const key
+        of capture
+    ) {
+        const event =
+            events[key];
+
+        if (!event) {
+            continue;
+        }
+
+        bindStEvent(
+            event,
+            () => {
+                if (
+                    applyingRemoteDepth
+                    === 0
+                ) {
+                    scheduleLocalCapture(
+                        key,
+                    );
+                }
             },
         );
-    } catch {
-        // ignored
+    }
+
+    const chatChangedEvents = [
+        events.CHAT_CHANGED,
+        events.CHAT_LOADED,
+        events.CHAT_CREATED,
+        events.GROUP_CHAT_CREATED,
+    ].filter(Boolean);
+
+    for (
+        const event
+        of new Set(
+            chatChangedEvents,
+        )
+    ) {
+        bindStEvent(
+            event,
+            () =>
+                void handleChatChanged(),
+        );
+    }
+
+    if (
+        events.GROUP_UPDATED
+    ) {
+        bindStEvent(
+            events.GROUP_UPDATED,
+            () => {
+                if (
+                    applyingRemoteDepth
+                    === 0
+                    && settings
+                        .syncGroupSettings
+                ) {
+                    void publishGroupSettings(
+                        scopeEpoch,
+                    );
+                }
+            },
+        );
+    }
+
+    if (
+        events.CHAT_METADATA_UPDATED
+    ) {
+        bindStEvent(
+            events.CHAT_METADATA_UPDATED,
+            () => {
+                if (
+                    applyingRemoteDepth
+                    === 0
+                ) {
+                    scheduleLocalCapture(
+                        'metadata-updated',
+                    );
+                }
+            },
+        );
+    }
+
+    if (
+        events.CHAT_UPDATED
+    ) {
+        bindStEvent(
+            events.CHAT_UPDATED,
+            () => {
+                if (
+                    applyingRemoteDepth
+                    === 0
+                ) {
+                    scheduleLocalCapture(
+                        'chat-updated',
+                    );
+                }
+            },
+        );
+    }
+
+    if (
+        events.GENERATION_STARTED
+    ) {
+        bindStEvent(
+            events.GENERATION_STARTED,
+            () => {
+                if (
+                    !localGeneration
+                    || localGenerationLost
+                ) {
+                    return;
+                }
+
+                const last =
+                    ctx.chat?.at?.(-1);
+
+                void acknowledgeGenerationStarted(
+                    localGeneration.type
+                    || 'normal',
+                    stableMessageId(
+                        last,
+                    ),
+                );
+            },
+        );
+    }
+
+    if (
+        events.STREAM_TOKEN_RECEIVED
+    ) {
+        bindStEvent(
+            events.STREAM_TOKEN_RECEIVED,
+            () =>
+                scheduleStreamCapture(),
+        );
+    }
+
+    if (
+        events.GENERATION_STOPPED
+    ) {
+        bindStEvent(
+            events.GENERATION_STOPPED,
+            () => {
+                if (
+                    localGeneration
+                    && !localGenerationLost
+                ) {
+                    void finishGeneration(
+                        'stopped',
+                    );
+                }
+            },
+        );
+    }
+
+    if (
+        events.GENERATION_ENDED
+    ) {
+        bindStEvent(
+            events.GENERATION_ENDED,
+            () => {
+                if (
+                    localGeneration
+                    && !localGenerationLost
+                ) {
+                    void finishGeneration(
+                        'completed',
+                    );
+                }
+            },
+        );
     }
 }
 
-async function handleBroadcastMessage(
-    message,
+/* -------------------------------------------------------------------------- */
+/* Generation interceptor                                                      */
+/* -------------------------------------------------------------------------- */
+
+async function generationInterceptor(
+    chat,
+    contextSize,
+    abort,
+    type,
 ) {
     if (
-        !message ||
-        message.protocolVersion !==
-            PROTOCOL_VERSION
-    ) {
-        return;
-    }
-
-    if (
-        message.sourceClientId ===
-        clientId
-    ) {
-        return;
-    }
-
-    if (
-        !sameScope(
-            message.scope,
-            currentScope,
-        )
+        !settings?.enabled
+        || !settings
+            .coordinateGeneration
+        || !currentScope
+        || !serverCompatible
     ) {
         return;
     }
 
     /*
-     * BroadcastChannel is intentionally never applied as authority.
-     * It simply asks the current browser tab to reconcile from the server.
+     * Quiet prompts are not user-visible conversation generation and are
+     * intentionally outside synchronization ownership.
      */
     if (
-        message.kind ===
-        'local_change'
-    ) {
-        scheduleResync(
-            `same-browser peer: ${
-                message.type ||
-                'change'
-            }`,
-        );
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Browser lifecycle                                                          */
-/* -------------------------------------------------------------------------- */
-
-function bindBrowserEvents() {
-    const online =
-        () => {
-            void reconnectScope(
-                'browser online',
-            );
-        };
-
-    const pageShow =
-        () => {
-            scheduleResync(
-                'pageshow',
-            );
-        };
-
-    const visibility =
-        () => {
-            if (
-                document.visibilityState ===
-                'visible'
-            ) {
-                scheduleResync(
-                    'visibility resume',
-                );
-            }
-        };
-
-    window.addEventListener(
-        'online',
-        online,
-    );
-
-    window.addEventListener(
-        'pageshow',
-        pageShow,
-    );
-
-    document.addEventListener(
-        'visibilitychange',
-        visibility,
-    );
-
-    browserListeners.push(
-        [
-            'window',
-            'online',
-            online,
-        ],
-        [
-            'window',
-            'pageshow',
-            pageShow,
-        ],
-        [
-            'document',
-            'visibilitychange',
-            visibility,
-        ],
-    );
-}
-
-function unbindBrowserEvents() {
-    for (
-        const [
-            target,
-            event,
-            handler,
-        ] of browserListeners
-    ) {
-        try {
-            if (
-                target ===
-                'window'
-            ) {
-                window.removeEventListener(
-                    event,
-                    handler,
-                );
-            } else {
-                document.removeEventListener(
-                    event,
-                    handler,
-                );
-            }
-        } catch {
-            // ignored
-        }
-    }
-
-    browserListeners =
-        [];
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Start / stop                                                               */
-/* -------------------------------------------------------------------------- */
-
-async function startInternal() {
-    if (
-        started &&
-        !stopping
+        type === 'quiet'
     ) {
         return;
     }
 
-    stopping =
-        false;
-
-    ctx =
-        SillyTavern.getContext();
-
-    if (!ctx) {
-        return;
-    }
-
-    getSettings();
-
-    ensureUi();
-
-    setStatus(
-        'Starting',
-        'Checking synchronization server',
-    );
-
-    bindStEvents();
-    bindBrowserEvents();
-    startBroadcastChannel();
-
-    started =
-        true;
-
-    await checkPlugin();
-
-    if (
-        !pluginAvailable
-    ) {
-        return;
-    }
-
-    const scope =
+    const actualScope =
         getCurrentScope();
 
     if (
-        scope
+        !sameScope(
+            actualScope,
+            currentScope,
+        )
     ) {
         await switchScope(
-            scope,
+            actualScope,
         );
-    } else {
-        setStatus(
-            'Ready',
-            'Open a chat to start synchronization',
+    }
+
+    const granted =
+        await claimGeneration(
+            type
+            || 'normal',
         );
+
+    if (!granted) {
+        try {
+            abort?.(
+                true,
+            );
+        } catch {
+            /* Host generation API changed. */
+        }
     }
 }
 
-async function stopInternal() {
-    stopping =
-        true;
+globalThis
+    .multiClientSyncGenerateInterceptor =
+    generationInterceptor;
 
-    scopeEpoch +=
-        1;
+/* -------------------------------------------------------------------------- */
+/* Resync                                                                      */
+/* -------------------------------------------------------------------------- */
 
-    clearHeartbeat();
+async function resyncCurrentScope(
+    options = {},
+) {
+    const expectedEpoch =
+        scopeEpoch;
 
-    closeSse();
-
-    if (
-        reconnectTimer
-    ) {
-        clearTimeout(
-            reconnectTimer,
+    const expectedScope =
+        clone(
+            currentScope,
         );
 
-        reconnectTimer =
-            null;
-    }
-
     if (
-        pluginRetryTimer
+        !expectedScope
+        || !serverCompatible
+        || !scopeIsCurrent(
+            expectedEpoch,
+            expectedScope,
+        )
     ) {
-        clearTimeout(
-            pluginRetryTimer,
-        );
-
-        pluginRetryTimer =
-            null;
-    }
-
-    if (
-        resyncTimer
-    ) {
-        clearTimeout(
-            resyncTimer,
-        );
-
-        resyncTimer =
-            null;
-    }
-
-    if (
-        streamTimer
-    ) {
-        clearTimeout(
-            streamTimer,
-        );
-
-        streamTimer =
-            null;
-    }
-
-    if (
-        finalizationTimer
-    ) {
-        clearTimeout(
-            finalizationTimer,
-        );
-
-        finalizationTimer =
-            null;
+        return false;
     }
 
     try {
-        if (
-            currentScope &&
-            pluginAvailable
-        ) {
+        const data =
             await api(
-                '/leave',
+                '/state',
                 {
                     method:
                         'POST',
-
-                    body: {
-                        protocolVersion:
-                            PROTOCOL_VERSION,
-
-                        clientId,
-
-                        deviceId,
-
-                        scope:
-                            currentScope,
-                    },
+                    body:
+                        JSON.stringify({
+                            scope:
+                                expectedScope,
+                            clientId,
+                            deviceId,
+                        }),
                 },
             );
+
+        if (
+            !scopeIsCurrent(
+                expectedEpoch,
+                expectedScope,
+            )
+        ) {
+            return false;
         }
-    } catch {
-        // best effort
+
+        const serverState =
+            data.state;
+
+        const local =
+            settings.syncMessages
+                ? localSnapshot()
+                : [];
+
+        const queue =
+            await listQueuedOps(
+                expectedScope,
+            );
+
+        const hasLocalDivergence =
+            (
+                settings.syncMessages
+                && JSON.stringify(
+                    local,
+                )
+                    !== JSON.stringify(
+                        serverState
+                            .snapshot
+                        || [],
+                    )
+            )
+            || (
+                settings.syncMetadata
+                && JSON.stringify(
+                    localMetadata(),
+                )
+                    !== JSON.stringify(
+                        serverState
+                            .chatMetadata
+                        || {},
+                    )
+            );
+
+        if (
+            queue.length
+            || options.preferLocal
+            || hasLocalDivergence
+        ) {
+            const base =
+                queue.length
+                    ? (
+                        queue[0]
+                            .baseSnapshot
+                        || []
+                    )
+                    : (
+                        currentState
+                            ?.snapshot
+                        || serverState
+                            .snapshot
+                        || []
+                    );
+
+            const merged =
+                settings.syncMessages
+                    ? mergeSnapshots(
+                        base,
+                        local,
+                        serverState
+                            .snapshot
+                        || [],
+                    )
+                    : local;
+
+            if (
+                settings.syncMessages
+            ) {
+                await applySnapshotLocally(
+                    merged,
+                    settings.syncMetadata
+                        ? {
+                            ...(
+                                serverState
+                                    .chatMetadata
+                                || {}
+                            ),
+                            ...localMetadata(),
+                        }
+                        : localMetadata(),
+                    expectedEpoch,
+                    'resync-merge',
+                    expectedScope,
+                );
+            }
+
+            if (
+                !queue.length
+                && (
+                    (
+                        settings
+                            .syncMessages
+                    )
+                    || (
+                        settings
+                            .syncMetadata
+                    )
+                )
+            ) {
+                await enqueueMutation(
+                    'resync-merge',
+                    expectedEpoch,
+                );
+            }
+        } else {
+            await applySnapshotLocally(
+                serverState
+                    .snapshot
+                || [],
+                settings.syncMetadata
+                    ? (
+                        serverState
+                            .chatMetadata
+                        || {}
+                    )
+                    : localMetadata(),
+                expectedEpoch,
+                'resync',
+                expectedScope,
+            );
+        }
+
+        await setServerState(
+            serverState,
+            data.cursor,
+        );
+
+        await flushQueue(
+            expectedEpoch,
+        );
+
+        return true;
+    } catch (error) {
+        lastError =
+            error.message;
+
+        updateInfo();
+
+        return false;
     }
-
-    unbindStEvents();
-    unbindBrowserEvents();
-
-    try {
-        broadcastChannel?.close();
-    } catch {
-        // ignored
-    }
-
-    broadcastChannel =
-        null;
-
-    currentScope =
-        null;
-
-    currentState =
-        null;
-
-    subscriptionToken =
-        null;
-
-    pluginAvailable =
-        false;
-
-    principalKey =
-        null;
-
-    localGenerationId =
-        null;
-
-    localGenerationLost =
-        false;
-
-    localStopRequested =
-        false;
-
-    started =
-        false;
 }
 
-
 /* -------------------------------------------------------------------------- */
-/* Extension lifecycle hooks                                                  */
+/* Lifecycle                                                                   */
 /* -------------------------------------------------------------------------- */
 
-export async function init() {
+async function initialize() {
     if (
         startPromise
     ) {
@@ -6921,132 +6519,226 @@ export async function init() {
     }
 
     startPromise =
-        startInternal()
-            .finally(
+        (async () => {
+            ctx =
+                getContext();
+
+            settings =
+                settingsRef();
+
+            renderUi();
+
+            initBroadcastChannel();
+
+            bindBrowserEvent(
+                'online',
+                () =>
+                    void reconnectCurrentScope(),
+            );
+
+            bindBrowserEvent(
+                'pageshow',
+                () =>
+                    void reconnectCurrentScope(),
+            );
+
+            bindBrowserEvent(
+                'visibilitychange',
                 () => {
                     if (
-                        !started
+                        document
+                            .visibilityState
+                            === 'visible'
                     ) {
-                        startPromise =
-                            null;
+                        void reconnectCurrentScope();
                     }
                 },
             );
 
+            bindBrowserEvent(
+                'beforeunload',
+                () => {
+                    void leaveScope(
+                        currentScope,
+                    );
+                },
+            );
+
+            bindStEvents();
+
+            await checkHealth();
+
+            if (
+                !settings.enabled
+            ) {
+                updateUi();
+                updateInfo();
+
+                return;
+            }
+
+            const target =
+                getCurrentScope();
+
+            if (
+                target
+                && settings.autoConnect
+                && serverCompatible
+            ) {
+                await switchScope(
+                    target,
+                );
+            }
+
+            started =
+                true;
+
+            updateUi();
+            updateInfo();
+        })().catch(
+            error => {
+                warn(
+                    'extension initialization failed',
+                    error,
+                );
+
+                lastError =
+                    error.message;
+
+                updateUi();
+                updateInfo();
+            },
+        );
+
+    await startPromise;
+
     return startPromise;
 }
 
-export async function onInstall() {
-    ctx =
-        SillyTavern.getContext();
+async function stop() {
+    ++scopeEpoch;
 
-    if (!ctx) {
-        return;
-    }
+    clearTimeout(
+        captureTimer,
+    );
 
-    if (
-        !ctx.extensionSettings[
-            EXTENSION_ID
-        ]
-    ) {
-        ctx.extensionSettings[
-            EXTENSION_ID
-        ] =
-            structuredClone(
-                DEFAULT_SETTINGS,
-            );
+    clearTimeout(
+        streamTimer,
+    );
 
-        ctx.saveSettingsDebounced?.();
-    }
+    stopHeartbeat();
+    stopGenerationHeartbeat();
+
+    closeSse();
+
+    unbindStEvents();
+    unbindBrowserEvents();
+
+    try {
+        await leaveScope(
+            currentScope,
+        );
+    } catch {}
+
+    currentScope =
+        null;
+
+    currentState =
+        null;
+
+    localGeneration =
+        null;
+
+    localGenerationLost =
+        false;
+
+    pendingStreamMessage =
+        null;
+
+    started =
+        false;
+
+    startPromise =
+        null;
+
+    flushingQueueFlag =
+        false;
+
+    updateUi();
+    updateInfo();
 }
 
-export async function onUpdate() {
-    /*
-     * IndexedDB versioning is intentionally non-destructive.
-     * Existing queued operations survive extension upgrades.
-     */
-    return init();
+/* -------------------------------------------------------------------------- */
+/* Manifest hooks                                                              */
+/* -------------------------------------------------------------------------- */
+
+export async function onInstall() {
+    ctx =
+        getContext();
+
+    settings =
+        settingsRef();
+
+    await ctx
+        .saveSettingsDebounced
+        ?.();
+}
+
+export async function init() {
+    await initialize();
 }
 
 export async function onEnable() {
-    const settings =
-        getSettings();
+    settings =
+        settingsRef();
 
     settings.enabled =
         true;
 
-    ctx?.saveSettingsDebounced?.();
-
-    return init();
+    if (!started) {
+        await initialize();
+    } else {
+        await reconnectCurrentScope();
+    }
 }
 
 export async function onDisable() {
-    const settings =
-        getSettings();
+    if (settings) {
+        settings.enabled =
+            false;
+    }
 
-    settings.enabled =
-        false;
+    await stop();
 
-    ctx?.saveSettingsDebounced?.();
+    await ctx
+        ?.saveSettingsDebounced
+        ?.();
+}
 
-    await stopInternal();
+export async function onUpdate() {
+    ctx =
+        getContext();
 
-    setStatus(
-        'Disabled',
-        'Multi-client synchronization is disabled',
-    );
+    settings =
+        settingsRef();
+
+    await ctx
+        .saveSettingsDebounced
+        ?.();
 }
 
 export async function onDelete() {
-    await stopInternal();
+    await stop();
 }
 
 export async function onClean() {
-    try {
-        await dbClearAll();
-    } catch {
-        // ignored
+    await stop();
+
+    /*
+     * Only this extension's current authenticated namespace is removed.
+     * Other users' extension data remain intact.
+     */
+    if (serverUserId) {
+        await clearOwnData();
     }
 }
-
-
-/* -------------------------------------------------------------------------- */
-/* Minimal startup bootstrap                                                  */
-/* -------------------------------------------------------------------------- */
-
-/*
- * ST's current extension lifecycle invokes exported hooks from the manifest.
- * Keep an idempotent fallback for existing manifests that only load index.js.
- */
-void (async () => {
-    try {
-        const eventTypes =
-            SillyTavern
-                .getContext?.()
-                ?.eventTypes;
-
-        if (
-            eventTypes?.APP_READY
-        ) {
-            const eventSource =
-                SillyTavern
-                    .getContext()
-                    .eventSource;
-
-            eventSource.once(
-                eventTypes.APP_READY,
-                () => {
-                    void init();
-                },
-            );
-        } else {
-            void init();
-        }
-    } catch {
-        try {
-            void init();
-        } catch {
-            // ignored
-        }
-    }
-})();
