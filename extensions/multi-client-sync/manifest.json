@@ -3,21 +3,11 @@
     "loading_order": 1,
     "requires": [],
     "optional": [],
+    "generate_interceptor": "multiClientSyncGenerateInterceptor",
     "js": "index.js",
     "css": "style.css",
     "author": "SillyTavern",
-    "version": "1.2.0",
-    "minimum_client_version": "1.19.0",
+    "version": "1.0.0",
     "homePage": "",
-    "auto_update": false,
-    "generate_interceptor": "multiClientSyncGenerateInterceptor",
-    "hooks": {
-        "install": "onInstall",
-        "activate": "init",
-        "enable": "onEnable",
-        "disable": "onDisable",
-        "update": "onUpdate",
-        "delete": "onDelete",
-        "clean": "onClean"
-    }
+    "auto_update": false
 }
