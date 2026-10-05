@@ -1490,18 +1490,141 @@ async function onDisable() {
 
 async function mountSettings() {
     if (settingsPanelMounted) return;
-    const host = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
+
+    const host =
+        document.querySelector('#extensions_settings') ||
+        document.querySelector('#extensions_settings2');
+
     if (!host) {
-        setTimeout(mountSettings, 1000);
+        setTimeout(
+            () => mountSettings(),
+            1000,
+        );
         return;
     }
+
     settingsPanelMounted = true;
-    try {
-        const html = await ctx.renderExtensionTemplateAsync?.('third-party/multi-client-sync', 'settings');
-        if (html) host.insertAdjacentHTML('beforeend', html);
-    } catch {
-        host.insertAdjacentHTML('beforeend', '<div id="mcs_settings_panel"><b>Multi-Client Sync</b><div id="mcs_status">Offline</div><button id="mcs_reconnect" class="menu_button">Reconnect</button></div>');
-    }
+
+    // Build the settings UI directly in JS.
+    // This avoids requiring a settings.html file.
+    const panel =
+        document.createElement('div');
+
+    panel.id =
+        'mcs_settings_panel';
+
+    panel.className =
+        'mcs-settings';
+
+    panel.innerHTML = `
+        <h3>Multi-Client Sync</h3>
+
+        <div class="mcs-status-row">
+            <span
+                id="mcs_status_dot"
+                class="mcs-status mcs-disabled"
+                title="Multi-Client Sync status"
+            ></span>
+
+            <span
+                id="mcs_status"
+                class="mcs-state-text"
+            >
+                Starting…
+            </span>
+        </div>
+
+        <div class="mcs-info">
+            Tabs/devices viewing the same chat share messages,
+            edits, generation state, and live streaming.
+            Different chats remain independent.
+        </div>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_enabled"
+            >
+            <span>Enable synchronization</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_auto_connect"
+            >
+            <span>Auto-connect to active chats</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_sync_messages"
+            >
+            <span>Sync messages</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_sync_metadata"
+            >
+            <span>Sync chat metadata</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_coordinate_generation"
+            >
+            <span>Coordinate generation between clients</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_remote_stop"
+            >
+            <span>Allow remote Stop</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_notifications"
+            >
+            <span>Show synchronization notifications</span>
+        </label>
+
+        <label class="checkbox_label">
+            <input
+                type="checkbox"
+                id="mcs_debug"
+            >
+            <span>Debug logging</span>
+        </label>
+
+        <div class="mcs-actions">
+            <button
+                id="mcs_reconnect"
+                class="menu_button"
+                type="button"
+            >
+                Reconnect
+            </button>
+
+            <button
+                id="mcs_resync"
+                class="menu_button"
+                type="button"
+            >
+                Resync Current Chat
+            </button>
+        </div>
+    `;
+
+    host.appendChild(panel);
+
     const map = {
         mcs_enabled: 'enabled',
         mcs_auto_connect: 'autoConnect',
@@ -1512,29 +1635,119 @@ async function mountSettings() {
         mcs_notifications: 'notifications',
         mcs_debug: 'debug',
     };
-    for (const [id, key] of Object.entries(map)) {
-        const el = document.getElementById(id);
+
+    for (
+        const [id, key]
+        of Object.entries(map)
+    ) {
+        const el =
+            document.getElementById(id);
+
         if (!el) continue;
-        el.checked = !!settings[key];
-        el.addEventListener('change', async () => {
-            settings[key] = !!el.checked;
-            saveSettings();
 
-            if (key === 'enabled') {
-                if (settings.enabled) await onEnable();
-                else await onDisable();
-                return;
-            }
+        el.checked =
+            !!settings[key];
 
-            if (settings.enabled && settings.autoConnect) {
-                await switchScope(`setting:${key}`);
-            }
+        el.addEventListener(
+            'change',
+            async () => {
+                settings[key] =
+                    !!el.checked;
 
-            updateGenerationUi();
-        });
+                saveSettings();
+
+                if (
+                    key === 'enabled'
+                ) {
+                    if (
+                        settings.enabled
+                    ) {
+                        await onEnable();
+                    } else {
+                        await onDisable();
+                    }
+
+                    updateGenerationUi();
+                    return;
+                }
+
+                if (
+                    settings.enabled &&
+                    settings.autoConnect
+                ) {
+                    await switchScope(
+                        `setting:${key}`
+                    );
+                }
+
+                updateGenerationUi();
+            },
+        );
     }
-    document.getElementById('mcs_reconnect')?.addEventListener('click', () => switchScope('manual-reconnect'));
-    document.getElementById('mcs_resync')?.addEventListener('click', () => resyncCurrentScope());
+
+    document
+        .getElementById(
+            'mcs_reconnect'
+        )
+        ?.addEventListener(
+            'click',
+            async () => {
+                try {
+                    ++scopeEpoch;
+
+                    const epoch =
+                        scopeEpoch;
+
+                    await leaveCurrentScope();
+
+                    currentScope =
+                        scopeFromContext();
+
+                    scopeKeyValue =
+                        makeScopeKey(
+                            currentScope
+                        );
+
+                    if (
+                        currentScope &&
+                        settings.enabled &&
+                        settings.autoConnect
+                    ) {
+                        await openScope(
+                            epoch
+                        );
+                    } else {
+                        statusText(
+                            'No active chat'
+                        );
+                    }
+                } catch (error) {
+                    warn(
+                        'manual reconnect failed',
+                        error,
+                    );
+                }
+            },
+        );
+
+    document
+        .getElementById(
+            'mcs_resync'
+        )
+        ?.addEventListener(
+            'click',
+            async () => {
+                try {
+                    await resyncCurrentScope();
+                } catch (error) {
+                    warn(
+                        'manual resync failed',
+                        error,
+                    );
+                }
+            },
+        );
+
     updateGenerationUi();
 }
 
