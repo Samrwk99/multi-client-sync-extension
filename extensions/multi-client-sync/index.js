@@ -155,85 +155,200 @@ function normalizeSnapshot(snapshot) {
 function scopeFromContext() {
     if (!ctx) return null;
 
-    const rawGroupId = ctx.groupId;
-    const isGroup =
-        rawGroupId !== undefined &&
-        rawGroupId !== null &&
-        String(rawGroupId) !== '';
+    const groupId =
+        ctx.groupId !== undefined &&
+        ctx.groupId !== null &&
+        String(ctx.groupId) !== ''
+            ? String(ctx.groupId)
+            : '';
 
+    const isGroup = !!groupId;
+
+    /*
+     * SillyTavern's own chat selector is the most reliable
+     * source for the currently open chat file. ST updates
+     * #selected_chat_pole when opening/switching chats.
+     */
     let chatId = '';
 
-    try {
-        chatId = String(
-            ctx.getCurrentChatId?.() ||
-            ctx.chatId ||
-            ''
+    const selectedChat =
+        document.querySelector(
+            '#selected_chat_pole'
         );
-    } catch {
-        chatId = String(
-            ctx.chatId || ''
-        );
+
+    if (
+        selectedChat &&
+        typeof selectedChat.value === 'string'
+    ) {
+        chatId =
+            selectedChat.value.trim();
     }
 
+    /*
+     * Fallback to the public ST context API.
+     */
+    if (!chatId) {
+        try {
+            if (
+                typeof ctx.getCurrentChatId ===
+                'function'
+            ) {
+                chatId =
+                    String(
+                        ctx.getCurrentChatId() || ''
+                    ).trim();
+            }
+        } catch {
+            /* ignore */
+        }
+    }
+
+    if (!chatId && ctx.chatId) {
+        chatId =
+            String(ctx.chatId).trim();
+    }
+
+    /*
+     * Group fallback.
+     */
+    if (!chatId && isGroup) {
+        const group =
+            Array.isArray(ctx.groups)
+                ? ctx.groups.find(
+                    group =>
+                        String(group?.id) ===
+                        groupId
+                )
+                : null;
+
+        if (group?.chat_id) {
+            chatId =
+                String(group.chat_id).trim();
+        }
+    }
+
+    /*
+     * Character fallback.
+     *
+     * characterId can temporarily be unavailable while
+     * SillyTavern is switching/loading a chat, so don't make
+     * the whole sync system depend on it being present.
+     */
+    if (!chatId && !isGroup) {
+        const characterId =
+            ctx.characterId !== undefined &&
+            ctx.characterId !== null
+                ? String(ctx.characterId)
+                : '';
+
+        const character =
+            characterId &&
+            Array.isArray(ctx.characters)
+                ? ctx.characters[
+                    characterId
+                ]
+                : null;
+
+        if (character?.chat) {
+            chatId =
+                String(
+                    character.chat
+                ).trim();
+        }
+    }
+
+    /*
+     * We cannot have a valid sync scope without a chat ID.
+     */
     if (!chatId) {
         return null;
     }
 
+    /*
+     * Build a stable owner identity.
+     */
+    let ownerId = '';
+
     if (isGroup) {
-        return {
-            kind: 'group',
-            ownerId: String(rawGroupId),
-            chatId,
-            branchId: String(
-                ctx.chatMetadata?.main_chat || ''
-            ),
-        };
+        ownerId =
+            `group:${groupId}`;
+    } else {
+        let character = null;
+
+        const characterId =
+            ctx.characterId !== undefined &&
+            ctx.characterId !== null
+                ? String(ctx.characterId)
+                : '';
+
+        if (
+            characterId &&
+            Array.isArray(ctx.characters)
+        ) {
+            character =
+                ctx.characters[
+                    characterId
+                ] || null;
+        }
+
+        /*
+         * If characterId is temporarily missing, try
+         * the currently displayed character name.
+         */
+        if (
+            !character &&
+            ctx.name2 &&
+            Array.isArray(ctx.characters)
+        ) {
+            character =
+                ctx.characters.find(
+                    entry =>
+                        entry?.name ===
+                        ctx.name2
+                ) || null;
+        }
+
+        ownerId =
+            String(
+                character?.avatar ||
+                character?.name ||
+                ctx.name2 ||
+                'character:unknown'
+            );
     }
 
-    // SillyTavern's characterId is the string index of the
-    // currently selected character. Prefer its avatar as the
-    // stable identity, but fall back to characterId so that
-    // lazy-loaded/missing character data does not make the
-    // extension think there is no active chat.
-    const characterIndex =
-        ctx.characterId;
+    /*
+     * Branch/checkpoint identity.
+     */
+    const metadata =
+        ctx.chatMetadata || {};
 
-    if (
-        characterIndex === undefined ||
-        characterIndex === null ||
-        String(characterIndex) === ''
-    ) {
-        return null;
-    }
-
-    const character =
-        ctx.characters?.[characterIndex];
-
-    const ownerId =
-        String(
-            character?.avatar ||
-            `character:${characterIndex}`
-        );
-
-    if (!ownerId) {
-        return null;
-    }
-
-    // For a branch/checkpoint, main_chat identifies the parent
-    // chat. Otherwise this is the normal chat scope.
     const branchId =
-        ctx.chatMetadata?.main_chat
+        metadata?.main_chat
             ? String(
-                ctx.chatMetadata.main_chat
+                metadata.main_chat
             )
             : '';
 
-    return {
-        kind: 'character',
+    const scope = {
+        kind:
+            isGroup
+                ? 'group'
+                : 'character',
+
         ownerId,
+
         chatId,
+
         branchId,
     };
+
+    log(
+        '[MCS] resolved scope:',
+        scope
+    );
+
+    return scope;
 }
 function encodeScope(scope) {
     return btoa(unescape(encodeURIComponent(JSON.stringify(scope))))
@@ -1587,6 +1702,16 @@ async function onActivate() {
 
     globalThis.multiClientSyncGenerateInterceptor = coordinatedGenerateInterceptor;
     await switchScope('activate');
+
+    setTimeout(() => {
+        switchScope('post-activate')
+            .catch(error =>
+                warn(
+                    'post-activate scope check failed',
+                    error,
+                )
+            );
+    }, 1000);
 }
 
 async function onEnable() {
