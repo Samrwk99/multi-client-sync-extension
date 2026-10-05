@@ -1,287 +1,676 @@
 /**
- * Multi Client Sync - SillyTavern UI extension.
+ * Multi-Client Sync — SillyTavern UI extension
+ *
+ * The extension is intentionally dependency-soft:
+ *
+ *   plugin present + compatible -> synchronization enabled
+ *   plugin missing             -> show "Server plugin required", do nothing
+ *   plugin incompatible        -> show "Plugin incompatible", do nothing
+ *
+ * Ordinary SillyTavern continues functioning in all of those cases.
  *
  * Uses:
- * - SillyTavern.getContext() public extension API
- * - BroadcastChannel as a same-browser optimization
- * - Server SSE as the authoritative live transport
- * - IndexedDB for durable pending local mutations
- * - Full snapshots + server revisions for deterministic conflict control
- * - 3-way merge for concurrent message/metadata edits
- * - Generation ownership/leases/fencing
+ * - SillyTavern.getContext()
+ * - ST public event API
+ * - ST public save path
+ * - ST public generation interceptor
+ * - SSE for authoritative live transport
+ * - BroadcastChannel as an optimization only
+ * - IndexedDB for durable pending local operations
  *
- * Important:
- * - The server is authoritative for revision ordering.
- * - BroadcastChannel is never authoritative.
- * - ST itself remains responsible for persistent chat-file saving.
+ * The server is authoritative for:
+ * - user
+ * - scope
+ * - revision
+ * - event sequence
+ * - generation ownership
+ * - generation lease
+ *
+ * The browser remains authoritative only for its own unacknowledged local
+ * changes until the server accepts/rebases them.
  */
 
-const MODULE = 'multi_client_sync';
-const PLUGIN_BASE = '/api/plugins/multi-client-sync';
-const PROTOCOL_VERSION = 2;
+const EXTENSION_ID =
+    'multi-client-sync';
 
-const DB_NAME = 'multi-client-sync-v2';
-const DB_VERSION = 1;
+const PLUGIN_BASE =
+    '/api/plugins/multi-client-sync';
 
-const CHANNEL_NAME = 'multi-client-sync-v2';
+const PROTOCOL_VERSION =
+    4;
 
-const MAX_RECONNECT_MS = 30_000;
-const HEARTBEAT_MS = 10_000;
-const STREAM_FLUSH_MS = 120;
-const FINALIZE_DELAY_MS = 250;
-const SNAPSHOT_DEBOUNCE_MS = 80;
+const DB_NAME =
+    'multi-client-sync-v4';
 
-const DEFAULTS = Object.freeze({
-    enabled: true,
-    debug: false,
-});
+const DB_VERSION =
+    2;
+
+const MESSAGE_NAMESPACE =
+    'multi_client_sync';
+
+const MAX_LOCAL_QUEUE =
+    200;
+
+const MAX_PENDING_BYTES =
+    64 * 1024 * 1024;
+
+const HEARTBEAT_MS =
+    10_000;
+
+const STREAM_FLUSH_MS =
+    160;
+
+const RESYNC_DELAY_MS =
+    120;
+
+const PLUGIN_RETRY_MS =
+    30_000;
+
+const MAX_RECONNECT_MS =
+    30_000;
+
+const DEFAULT_SETTINGS =
+    Object.freeze({
+        enabled:
+            true,
+
+        debug:
+            false,
+    });
+
+
+/* -------------------------------------------------------------------------- */
+/* Runtime                                                                    */
+/* -------------------------------------------------------------------------- */
 
 let ctx = null;
-let initialized = false;
-let destroyed = false;
 
-let listeners = [];
+let startPromise =
+    null;
 
-let broadcastChannel = null;
-let eventSource = null;
+let started =
+    false;
 
-let reconnectTimer = null;
-let heartbeatTimer = null;
-let pendingStreamTimer = null;
-let localMutationTimer = null;
-let finalizeTimer = null;
+let stopping =
+    false;
 
-let localSaveChain = Promise.resolve();
+let pluginAvailable =
+    false;
 
-let currentScope = null;
-let currentState = null;
-let currentClientId = null;
-let currentDeviceId = null;
+let principalKey =
+    null;
 
-let scopeEpoch = 0;
-let reconnectAttempt = 0;
+let subscriptionToken =
+    null;
 
-let generationCandidate = null;
-let localStopIssued = false;
-let localGenerationClaimLost = false;
-let lastGenerationStatus = null;
+let currentScope =
+    null;
 
-let streamInFlight = false;
-let latestStreamSnapshot = null;
-let latestStreamReason = null;
+let currentState =
+    null;
 
-let uiNode = null;
+let scopeEpoch =
+    0;
+
+let reconnectTimer =
+    null;
+
+let pluginRetryTimer =
+    null;
+
+let heartbeatTimer =
+    null;
+
+let resyncTimer =
+    null;
+
+let streamTimer =
+    null;
+
+let finalizationTimer =
+    null;
+
+let eventSource =
+    null;
+
+let broadcastChannel =
+    null;
+
+let reconnectAttempt =
+    0;
+
+let applyingRemoteDepth =
+    0;
+
+let queueDrainPromise =
+    null;
+
+let resyncPromise =
+    null;
+
+let saveChain =
+    Promise.resolve();
+
+let streamFlushPromise =
+    null;
+
+let latestStreamSnapshot =
+    null;
+
+let latestStreamReason =
+    null;
+
+let localGenerationId =
+    null;
+
+let localGenerationLost =
+    false;
+
+let localStopRequested =
+    false;
+
+let generationTerminalizing =
+    new Set();
+
+let lastEventId =
+    null;
+
+let lastEpoch =
+    null;
+
+let lastSeq =
+    0;
+
+let lastRevision =
+    0;
+
+let localSequence =
+    0;
+
+let browserListeners =
+    [];
+
+let stListeners =
+    [];
+
+let uiRoot =
+    null;
 
 
 /* -------------------------------------------------------------------------- */
-/* Utility                                                                    */
+/* Basic utilities                                                            */
 /* -------------------------------------------------------------------------- */
 
-function log(...args) {
-    if (getSettings().debug) {
-        console.debug('[MultiClientSync]', ...args);
+function log(
+    ...args
+) {
+    if (
+        getSettings().debug
+    ) {
+        console.debug(
+            '[MultiClientSync]',
+            ...args,
+        );
     }
 }
 
-function warn(...args) {
-    console.warn('[MultiClientSync]', ...args);
+function warn(
+    ...args
+) {
+    console.warn(
+        '[MultiClientSync]',
+        ...args,
+    );
 }
 
-function clone(value) {
-    if (value === undefined) return undefined;
+function clone(
+    value,
+) {
+    if (
+        value === undefined
+    ) {
+        return undefined;
+    }
 
-    if (typeof structuredClone === 'function') {
+    if (
+        typeof structuredClone ===
+        'function'
+    ) {
         try {
-            return structuredClone(value);
+            return structuredClone(
+                value,
+            );
         } catch {
-            // fallback below
+            // fallback
         }
     }
 
-    return JSON.parse(JSON.stringify(value));
+    return JSON.parse(
+        JSON.stringify(
+            value,
+        ),
+    );
 }
 
-function randomId() {
-    try {
-        if (globalThis.crypto?.randomUUID) {
-            return globalThis.crypto.randomUUID();
-        }
-    } catch {
-        // fallback below
+function stableStringify(
+    value,
+) {
+    if (
+        value === null ||
+        typeof value !==
+            'object'
+    ) {
+        return JSON.stringify(
+            value,
+        );
     }
 
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    if (
+        Array.isArray(value)
+    ) {
+        return `[${value.map(
+            stableStringify,
+        ).join(',')}]`;
+    }
+
+    return `{${Object.keys(value)
+        .sort()
+        .map(
+            key =>
+                `${JSON.stringify(
+                    key,
+                )}:${stableStringify(
+                    value[key],
+                )}`,
+        )
+        .join(',')}}`;
 }
 
-function stableStringify(value) {
-    if (value === null || typeof value !== 'object') {
-        return JSON.stringify(value);
-    }
+async function sha256(
+    value,
+) {
+    const stringValue =
+        typeof value ===
+            'string'
+            ? value
+            : stableStringify(
+                value,
+            );
 
-    if (Array.isArray(value)) {
-        return `[${value.map(stableStringify).join(',')}]`;
-    }
+    const bytes =
+        new TextEncoder().encode(
+            stringValue,
+        );
 
-    return `{${Object.keys(value).sort().map(
-        key => `${JSON.stringify(key)}:${stableStringify(value[key])}`,
-    ).join(',')}}`;
-}
+    const digest =
+        await crypto.subtle.digest(
+            'SHA-256',
+            bytes,
+        );
 
-async function sha256(text) {
-    if (!globalThis.crypto?.subtle) {
-        return null;
-    }
-
-    const data = new TextEncoder().encode(text);
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', data);
-
-    return [...new Uint8Array(digest)]
-        .map(x => x.toString(16).padStart(2, '0'))
+    return Array
+        .from(
+            new Uint8Array(
+                digest,
+            ),
+        )
+        .map(
+            byte =>
+                byte
+                    .toString(16)
+                    .padStart(
+                        2,
+                        '0',
+                    ),
+        )
         .join('');
 }
 
-function safeGetContext() {
-    try {
-        return SillyTavern.getContext();
-    } catch (error) {
-        warn('SillyTavern.getContext() unavailable', error);
-        return null;
-    }
-}
-
-function getSettings() {
-    const settingsRoot = ctx?.extensionSettings || {};
-
-    if (!settingsRoot[MODULE]) {
-        settingsRoot[MODULE] = structuredClone(DEFAULTS);
+function uuid() {
+    if (
+        crypto.randomUUID
+    ) {
+        return crypto.randomUUID();
     }
 
-    for (const [key, value] of Object.entries(DEFAULTS)) {
-        if (!(key in settingsRoot[MODULE])) {
-            settingsRoot[MODULE][key] = value;
-        }
-    }
-
-    return settingsRoot[MODULE];
+    return (
+        `${Date.now()
+            .toString(36)}-` +
+        `${Math.random()
+            .toString(36)
+            .slice(2)}-` +
+        `${Math.random()
+            .toString(36)
+            .slice(2)}`
+    );
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Identity                                                                    */
+/* Client/device identity                                                     */
 /* -------------------------------------------------------------------------- */
 
 function loadIdentity() {
-    let deviceId;
-    let clientId;
+    let storedDeviceId =
+        localStorage.getItem(
+            `${EXTENSION_ID}:deviceId`,
+        );
 
-    try {
-        deviceId = localStorage.getItem(`${MODULE}:deviceId`);
-    } catch {
-        // ignored
-    }
-
-    if (!deviceId) {
-        deviceId = randomId();
+    if (!storedDeviceId) {
+        storedDeviceId =
+            uuid();
 
         try {
-            localStorage.setItem(`${MODULE}:deviceId`, deviceId);
+            localStorage.setItem(
+                `${EXTENSION_ID}:deviceId`,
+                storedDeviceId,
+            );
         } catch {
-            // ignored
+            // storage unavailable
         }
     }
 
-    try {
-        clientId = sessionStorage.getItem(`${MODULE}:clientId`);
-    } catch {
-        // ignored
-    }
+    let storedClientId =
+        sessionStorage.getItem(
+            `${EXTENSION_ID}:clientId`,
+        );
 
-    if (!clientId) {
-        clientId = randomId();
+    if (!storedClientId) {
+        storedClientId =
+            uuid();
 
         try {
-            sessionStorage.setItem(`${MODULE}:clientId`, clientId);
+            sessionStorage.setItem(
+                `${EXTENSION_ID}:clientId`,
+                storedClientId,
+            );
         } catch {
-            // ignored
+            // storage unavailable
         }
     }
 
-    currentDeviceId = deviceId;
-    currentClientId = clientId;
+    return {
+        deviceId:
+            storedDeviceId,
+
+        clientId:
+            storedClientId,
+    };
+}
+
+const identity =
+    loadIdentity();
+
+const deviceId =
+    identity.deviceId;
+
+const clientId =
+    identity.clientId;
+
+
+/* -------------------------------------------------------------------------- */
+/* Settings                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function getSettings() {
+    const settings =
+        ctx?.extensionSettings || {};
+
+    if (
+        !settings[
+            EXTENSION_ID
+        ]
+    ) {
+        settings[
+            EXTENSION_ID
+        ] =
+            structuredClone(
+                DEFAULT_SETTINGS,
+            );
+    }
+
+    for (
+        const [
+            key,
+            value,
+        ] of Object.entries(
+            DEFAULT_SETTINGS,
+        )
+    ) {
+        if (
+            !Object.hasOwn(
+                settings[
+                    EXTENSION_ID
+                ],
+                key,
+            )
+        ) {
+            settings[
+                EXTENSION_ID
+            ][key] =
+                value;
+        }
+    }
+
+    return settings[
+        EXTENSION_ID
+    ];
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Scope                                                                      */
+/* Scope                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function getScope() {
-    if (!ctx) return null;
-
-    const groupId = ctx.groupId ?? null;
-    const characterId = ctx.characterId ?? null;
-    const chatId = ctx.chatId ?? ctx.getCurrentChatId?.();
-
-    if (!chatId) {
+function getCurrentScope() {
+    if (!ctx) {
         return null;
     }
 
-    if (groupId !== null && groupId !== undefined && String(groupId) !== '') {
-        return {
-            scopeType: 'group',
-            chatId: String(chatId),
-            characterId: null,
-            groupId: String(groupId),
-        };
+    const chatId =
+        ctx.chatId ??
+        ctx.getCurrentChatId?.();
+
+    if (
+        chatId ==
+            null ||
+        chatId ===
+            ''
+    ) {
+        return null;
     }
 
-    if (characterId !== null && characterId !== undefined && String(characterId) !== '') {
-        return {
-            scopeType: 'character',
-            chatId: String(chatId),
-            characterId: String(characterId),
-            groupId: null,
-        };
+    const groupId =
+        ctx.groupId !=
+            null &&
+        String(
+            ctx.groupId,
+        ) !==
+            ''
+            ? String(
+                ctx.groupId,
+            )
+            : null;
+
+    let characterId =
+        null;
+
+    if (
+        groupId ===
+            null &&
+        ctx.characterId !=
+            null
+    ) {
+        const character =
+            ctx.characters?.[
+                ctx.characterId
+            ];
+
+        if (
+            character?.avatar
+        ) {
+            characterId =
+                String(
+                    character.avatar,
+                );
+        }
     }
 
-    return null;
+    if (
+        groupId ===
+            null &&
+        !characterId
+    ) {
+        return null;
+    }
+
+    const metadata =
+        ctx.chatMetadata || {};
+
+    const branchId =
+        metadata.main_chat
+            ? (
+                metadata.integrity
+                    ? String(
+                        metadata.integrity,
+                    )
+                    : null
+            )
+            : null;
+
+    const parentChatId =
+        metadata.main_chat
+            ? String(
+                metadata.main_chat,
+            )
+            : null;
+
+    return {
+        scopeType:
+            groupId !==
+                null
+                ? 'group'
+                : 'character',
+
+        characterId:
+            groupId !==
+                null
+                ? null
+                : characterId,
+
+        groupId,
+
+        chatId:
+            String(
+                chatId,
+            ),
+
+        branchId,
+
+        parentChatId,
+    };
 }
 
-function scopeKey(scope) {
-    return scope ? JSON.stringify(scope) : 'none';
+function sameScope(
+    a,
+    b,
+) {
+    return (
+        Boolean(a) &&
+        Boolean(b) &&
+        stableStringify(
+            a,
+        ) ===
+            stableStringify(
+                b,
+            )
+    );
 }
 
-function sameScope(a, b) {
-    return Boolean(a && b && scopeKey(a) === scopeKey(b));
+function currentEpoch() {
+    return scopeEpoch;
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Message identity / branch safety                                          */
+/* Snapshot handling                                                          */
 /* -------------------------------------------------------------------------- */
 
-function messageHasId(message) {
-    return Boolean(message?.extra?.multi_client_sync_id);
-}
-
-function ensureMessageIds(messages) {
-    let changed = false;
-
-    if (!Array.isArray(messages)) {
+function ensureMessageIds(
+    chat,
+) {
+    if (
+        !Array.isArray(chat)
+    ) {
         return false;
     }
 
-    for (const message of messages) {
-        if (!message || typeof message !== 'object') {
+    let changed =
+        false;
+
+    /*
+     * chat[0] is the ST chat header. Message IDs start at 1.
+     */
+    for (
+        let index = 1;
+        index <
+            chat.length;
+        index++
+    ) {
+        const message =
+            chat[index];
+
+        if (
+            !message ||
+            typeof message !==
+                'object'
+        ) {
             continue;
         }
 
-        if (!message.extra || typeof message.extra !== 'object' || Array.isArray(message.extra)) {
+        if (
+            !message.extra ||
+            typeof message.extra !==
+                'object' ||
+            Array.isArray(
+                message.extra,
+            )
+        ) {
             message.extra = {};
+            changed = true;
         }
 
-        if (!messageHasId(message)) {
-            message.extra.multi_client_sync_id = randomId();
+        if (
+            !message.extra[
+                MESSAGE_NAMESPACE
+            ] ||
+            typeof message.extra[
+                MESSAGE_NAMESPACE
+            ] !==
+                'object' ||
+            Array.isArray(
+                message.extra[
+                    MESSAGE_NAMESPACE
+                ],
+            )
+        ) {
+            message.extra[
+                MESSAGE_NAMESPACE
+            ] = {};
+
+            changed = true;
+        }
+
+        if (
+            !message.extra[
+                MESSAGE_NAMESPACE
+            ].messageId
+        ) {
+            message.extra[
+                MESSAGE_NAMESPACE
+            ].messageId =
+                uuid();
+
             changed = true;
         }
     }
@@ -289,750 +678,393 @@ function ensureMessageIds(messages) {
     return changed;
 }
 
-function repairBranchIntegrity() {
-    /**
-     * Current ST branch/checkpoint chat metadata can share lineage fields with
-     * the parent. A separate integrity identity per child prevents the sync
-     * extension from depending on a shared parent identity.
-     *
-     * Only branch/checkpoint chats carrying main_chat are changed.
-     */
-    try {
-        const metadata = ctx?.chatMetadata;
-
-        if (!metadata || typeof metadata !== 'object') {
-            return false;
-        }
-
-        if (!metadata.main_chat) {
-            return false;
-        }
-
-        if (metadata.multi_client_sync_branch_integrity_v1) {
-            return false;
-        }
-
-        if (typeof ctx.uuidv4 !== 'function') {
-            return false;
-        }
-
-        metadata.integrity = ctx.uuidv4();
-        metadata.multi_client_sync_branch_integrity_v1 = true;
-
-        return true;
-    } catch (error) {
-        warn('Branch integrity repair failed', error);
-        return false;
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Snapshot                                                                    */
-/* -------------------------------------------------------------------------- */
-
-function makeSnapshot() {
-    if (!ctx || !currentScope) {
-        return null;
-    }
-
-    const idsChanged = ensureMessageIds(ctx.chat || []);
-    const messages = clone(ctx.chat || []);
-    const metadata = clone(ctx.chatMetadata || {});
-
-    if (metadata?.main_chat && !metadata.multi_client_sync_parent_chat_id) {
-        metadata.multi_client_sync_parent_chat_id = String(metadata.main_chat);
-    }
-
-    return {
-        scopeType: currentScope.scopeType,
-        chatId: currentScope.chatId,
-        characterId: currentScope.characterId,
-        groupId: currentScope.groupId,
-        chat: messages,
-        chatMetadata: metadata,
-        idsChanged,
-    };
-}
-
-function normalizeSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object') {
-        return null;
-    }
-
-    if (!Array.isArray(snapshot.chat)) {
-        return null;
-    }
-
-    const out = {
-        scopeType: snapshot.scopeType,
-        chatId: snapshot.chatId,
-        characterId: snapshot.characterId ?? null,
-        groupId: snapshot.groupId ?? null,
-        chat: clone(snapshot.chat),
-        chatMetadata: clone(snapshot.chatMetadata || {}),
-    };
-
-    ensureMessageIds(out.chat);
-
-    return out;
-}
-
-function snapshotForHash(snapshot) {
-    const normalized = normalizeSnapshot(snapshot);
-
-    return stableStringify(normalized);
-}
-
-async function snapshotHash(snapshot) {
-    return sha256(snapshotForHash(snapshot));
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* API                                                                         */
-/* -------------------------------------------------------------------------- */
-
-function getHeaders(extra = {}) {
-    const base = typeof ctx?.getRequestHeaders === 'function'
-        ? ctx.getRequestHeaders()
-        : {};
-
-    return {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        ...base,
-        ...extra,
-    };
-}
-
-async function api(pathname, options = {}) {
-    const response = await fetch(`${PLUGIN_BASE}${pathname}`, {
-        credentials: 'same-origin',
-        cache: 'no-store',
-        ...options,
-        headers: {
-            ...getHeaders(),
-            ...(options.headers || {}),
-        },
-    });
-
-    let body = null;
-
-    try {
-        body = await response.json();
-    } catch {
-        // non-JSON response
-    }
-
-    if (!response.ok) {
-        const error = new Error(
-            body?.message || `HTTP ${response.status}`,
-        );
-
-        error.status = response.status;
-        error.code = body?.code || `http_${response.status}`;
-        error.state = body?.state;
-
-        throw error;
-    }
-
-    return body || { ok: true };
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* IndexedDB durable queue                                                     */
-/* -------------------------------------------------------------------------- */
-
-function openDb() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-        request.onerror = () => reject(request.error);
-
-        request.onupgradeneeded = () => {
-            const db = request.result;
-
-            if (!db.objectStoreNames.contains('kv')) {
-                db.createObjectStore('kv');
-            }
-        };
-
-        request.onsuccess = () => resolve(request.result);
-    });
-}
-
-async function dbGet(key) {
-    try {
-        const db = await openDb();
-
-        return await new Promise((resolve, reject) => {
-            const tx = db.transaction('kv', 'readonly');
-            const request = tx.objectStore('kv').get(key);
-
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve(request.result);
-
-            tx.oncomplete = () => db.close();
-            tx.onerror = () => db.close();
-        });
-    } catch (error) {
-        log('IndexedDB get failed', error);
-        return null;
-    }
-}
-
-async function dbPut(key, value) {
-    try {
-        const db = await openDb();
-
-        await new Promise((resolve, reject) => {
-            const tx = db.transaction('kv', 'readwrite');
-
-            tx.objectStore('kv').put(value, key);
-
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () => reject(tx.error);
-        });
-
-        db.close();
-    } catch (error) {
-        log('IndexedDB put failed', error);
-    }
-}
-
-async function dbDelete(key) {
-    try {
-        const db = await openDb();
-
-        await new Promise((resolve, reject) => {
-            const tx = db.transaction('kv', 'readwrite');
-
-            tx.objectStore('kv').delete(key);
-
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () => reject(tx.error);
-        });
-
-        db.close();
-    } catch (error) {
-        log('IndexedDB delete failed', error);
-    }
-}
-
-function pendingKey(scope) {
-    return `${MODULE}:pending:${scopeKey(scope)}`;
-}
-
-function metaKey(scope) {
-    return `${MODULE}:meta:${scopeKey(scope)}`;
-}
-
-async function savePending(pending) {
-    if (!pending?.scope) {
-        return;
-    }
-
-    await dbPut(
-        pendingKey(pending.scope),
-        clone(pending),
-    );
-}
-
-async function loadPending(scope) {
-    return dbGet(pendingKey(scope));
-}
-
-async function deletePending(scope) {
-    await dbDelete(pendingKey(scope));
-}
-
-async function saveMeta(scope, meta) {
-    await dbPut(
-        metaKey(scope),
-        clone(meta),
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* UI                                                                          */
-/* -------------------------------------------------------------------------- */
-
-function setStatus(status, detail = '') {
-    if (!uiNode) {
-        return;
-    }
-
-    const stateNode = uiNode.querySelector('.mcs-state');
-    const detailNode = uiNode.querySelector('.mcs-detail');
-    const stopButton = uiNode.querySelector('.mcs-stop-remote');
-
-    if (stateNode) {
-        stateNode.textContent = status;
-    }
-
-    if (detailNode) {
-        detailNode.textContent = detail;
-    }
-
-    const active = currentState?.generation;
-    const remote = Boolean(
-        active &&
-        active.ownerClientId !== currentClientId,
-    );
-
-    if (stopButton) {
-        stopButton.hidden = !remote;
-    }
-}
-
-function renderUi() {
-    if (uiNode || !document.body) {
-        return;
-    }
-
-    uiNode = document.createElement('div');
-    uiNode.id = 'mcs-status-panel';
-
-    uiNode.innerHTML = `
-        <div class="mcs-title">Multi-client sync</div>
-        <div class="mcs-state">Starting…</div>
-        <div class="mcs-detail"></div>
-
-        <button type="button" class="mcs-stop-remote" hidden>
-            Request remote stop
-        </button>
-
-        <label class="mcs-toggle">
-            <input type="checkbox" class="mcs-enabled">
-            Enabled
-        </label>
-
-        <label class="mcs-toggle">
-            <input type="checkbox" class="mcs-debug">
-            Debug
-        </label>
-    `;
-
-    Object.assign(uiNode.style, {
-        position: 'fixed',
-        right: '12px',
-        bottom: '12px',
-        zIndex: '99999',
-        background: 'rgba(20,20,20,.94)',
-        color: '#fff',
-        padding: '9px 11px',
-        borderRadius: '8px',
-        fontSize: '12px',
-        lineHeight: '1.35',
-        maxWidth: '280px',
-        boxShadow: '0 3px 18px rgba(0,0,0,.35)',
-    });
-
-    const title = uiNode.querySelector('.mcs-title');
-    if (title) {
-        title.style.fontWeight = '700';
-        title.style.marginBottom = '3px';
-    }
-
-    const detail = uiNode.querySelector('.mcs-detail');
-    if (detail) {
-        detail.style.opacity = '0.75';
-        detail.style.wordBreak = 'break-word';
-    }
-
-    for (const node of uiNode.querySelectorAll('.mcs-toggle')) {
-        node.style.display = 'block';
-    }
-
-    for (const node of uiNode.querySelectorAll('button')) {
-        node.style.marginTop = '5px';
-    }
-
-    document.body.appendChild(uiNode);
-
-    const settings = getSettings();
-
-    const enabledCheckbox = uiNode.querySelector('.mcs-enabled');
-    const debugCheckbox = uiNode.querySelector('.mcs-debug');
-
-    if (enabledCheckbox) {
-        enabledCheckbox.checked = settings.enabled;
-
-        enabledCheckbox.addEventListener('change', async event => {
-            settings.enabled = event.target.checked;
-            ctx?.saveSettingsDebounced?.();
-
-            if (settings.enabled) {
-                await start();
-            } else {
-                await stop();
-            }
-        });
-    }
-
-    if (debugCheckbox) {
-        debugCheckbox.checked = settings.debug;
-
-        debugCheckbox.addEventListener('change', event => {
-            settings.debug = event.target.checked;
-            ctx?.saveSettingsDebounced?.();
-        });
-    }
-
-    uiNode.querySelector('.mcs-stop-remote')?.addEventListener(
-        'click',
-        () => void requestRemoteStop(),
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* BroadcastChannel                                                            */
-/* -------------------------------------------------------------------------- */
-
-function broadcastLocal(message) {
-    try {
-        broadcastChannel?.postMessage({
-            protocolVersion: PROTOCOL_VERSION,
-            sourceClientId: currentClientId,
-            sourceDeviceId: currentDeviceId,
-            ...message,
-        });
-    } catch (error) {
-        log('BroadcastChannel send failed', error);
-    }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* SSE                                                                          */
-/* -------------------------------------------------------------------------- */
-
-function closeSse() {
-    if (!eventSource) {
-        return;
-    }
-
-    try {
-        eventSource.close();
-    } catch {
-        // ignored
-    }
-
-    eventSource = null;
-}
-
-function clearReconnectTimer() {
-    if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-    }
-
-    reconnectTimer = null;
-}
-
-function clearHeartbeat() {
-    if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-    }
-
-    heartbeatTimer = null;
-}
-
-function scheduleReconnect(reason = 'reconnect') {
+function normalizeSnapshot(
+    raw,
+) {
     if (
-        destroyed ||
-        !getSettings().enabled ||
-        !currentScope ||
-        reconnectTimer
+        !raw ||
+        typeof raw !==
+            'object' ||
+        !Array.isArray(
+            raw.chat,
+        )
     ) {
-        return;
+        return null;
     }
 
-    const delay = Math.min(
-        MAX_RECONNECT_MS,
-        500 * (2 ** Math.min(reconnectAttempt, 6))
-            + Math.floor(Math.random() * 400),
+    const snapshot = {
+        chat:
+            clone(
+                raw.chat,
+            ),
+
+        chatMetadata:
+            clone(
+                raw.chatMetadata ||
+                raw.chat?.[0]
+                    ?.chat_metadata ||
+                {},
+            ),
+    };
+
+    ensureMessageIds(
+        snapshot.chat,
     );
 
-    reconnectAttempt += 1;
-
-    setStatus(
-        'Reconnecting',
-        `${reason}; ${Math.ceil(delay / 1000)}s`,
-    );
-
-    reconnectTimer = setTimeout(async () => {
-        reconnectTimer = null;
-
-        try {
-            await joinAndConnect(
-                currentScope,
-                { reconnect: true },
+    if (
+        snapshot.chat[0]
+    ) {
+        snapshot.chat[0]
+            .chat_metadata =
+            clone(
+                snapshot.chatMetadata,
             );
-        } catch (error) {
-            warn('Reconnect failed', error);
-            scheduleReconnect(
-                error.code || 'reconnect_failed',
-            );
-        }
-    }, delay);
-}
-
-function startHeartbeat() {
-    clearHeartbeat();
-
-    heartbeatTimer = setInterval(async () => {
-        if (!currentScope || !currentState) {
-            return;
-        }
-
-        try {
-            const response = await api('/heartbeat', {
-                method: 'POST',
-                body: JSON.stringify({
-                    protocolVersion: PROTOCOL_VERSION,
-                    clientId: currentClientId,
-                    deviceId: currentDeviceId,
-                    scope: currentScope,
-
-                    generationId:
-                        currentState.generation?.ownerClientId === currentClientId
-                            ? currentState.generation.id
-                            : null,
-                }),
-            });
-
-            if (response.state) {
-                applyServerMeta(response.state);
-            }
-        } catch (error) {
-            if (
-                error.code === 'not_member' ||
-                error.code === 'membership_expired' ||
-                error.code === 'device_mismatch'
-            ) {
-                scheduleReconnect(error.code);
-            } else {
-                log('Heartbeat failed', error);
-            }
-        }
-    }, HEARTBEAT_MS);
-}
-
-function applyServerMeta(state) {
-    if (!currentState || !state) {
-        return;
     }
 
-    currentState.serverRevision =
-        Number(state.revision) || 0;
+    return snapshot;
+}
 
-    currentState.serverSeq =
-        Number(state.seq) || 0;
+function makeLocalSnapshot() {
+    if (
+        !ctx ||
+        !currentScope
+    ) {
+        return null;
+    }
 
-    currentState.serverEpoch =
-        state.epoch ||
-        currentState.serverEpoch ||
-        null;
+    const snapshot =
+        normalizeSnapshot({
+            chat:
+                ctx.chat,
 
-    currentState.snapshotHash =
-        state.snapshotHash ||
-        currentState.snapshotHash ||
-        null;
+            chatMetadata:
+                ctx.chatMetadata,
+        });
 
-    currentState.generation =
-        state.generation
-            ? clone(state.generation)
-            : null;
+    return snapshot;
+}
 
-    void saveMeta(
-        currentScope,
-        {
-            serverRevision:
-                currentState.serverRevision,
+async function hashLocalSnapshot() {
+    const snapshot =
+        makeLocalSnapshot();
 
-            serverSeq:
-                currentState.serverSeq,
-
-            serverEpoch:
-                currentState.serverEpoch,
-
-            snapshotHash:
-                currentState.snapshotHash,
-        },
-    );
+    return snapshot
+        ? sha256(
+            snapshot,
+        )
+        : null;
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* ST application / persistence                                                */
+/* ST UI application                                                          */
 /* -------------------------------------------------------------------------- */
 
-async function applyAuthoritativeSnapshot(
+async function applySnapshotLocally(
     snapshot,
     {
         persist = true,
-        serverState = null,
-        reason = 'remote',
+        reason = 'apply',
+    } = {},
+) {
+    const normalized =
+        normalizeSnapshot(
+            snapshot,
+        );
+
+    if (
+        !normalized ||
+        !currentScope
+    ) {
+        return false;
+    }
+
+    const scopeAtStart =
+        clone(currentScope);
+
+    applyingRemoteDepth += 1;
+
+    try {
+        if (
+            !sameScope(
+                scopeAtStart,
+                currentScope,
+            )
+        ) {
+            return false;
+        }
+
+        if (
+            Array.isArray(
+                ctx.chat,
+            )
+        ) {
+            ctx.chat.splice(
+                0,
+                ctx.chat.length,
+                ...normalized.chat.map(
+                    clone,
+                ),
+            );
+        }
+
+        if (
+            normalized.chat[0]
+        ) {
+            normalized.chat[0]
+                .chat_metadata =
+                clone(
+                    normalized.chatMetadata,
+                );
+        }
+
+        /*
+         * Current ST exposes updateChatMetadata as the public metadata mutation
+         * path.
+         */
+        if (
+            typeof ctx.updateChatMetadata ===
+            'function'
+        ) {
+            ctx.updateChatMetadata(
+                clone(
+                    normalized.chatMetadata,
+                ),
+                true,
+            );
+        }
+
+        /*
+         * Current ST exposes printMessages publicly through getContext().
+         */
+        if (
+            typeof ctx.printMessages ===
+            'function'
+        ) {
+            await ctx.printMessages();
+        }
+
+        if (
+            persist
+        ) {
+            const saved =
+                await saveCurrentChat(
+                    `remote:${reason}`,
+                );
+
+            if (
+                !saved
+            ) {
+                setStatus(
+                    'Save pending',
+                    'Remote state is applied in memory but ST did not confirm the save',
+                );
+            }
+        }
+
+        return true;
+    } catch (error) {
+        warn(
+            'Remote snapshot application failed',
+            error,
+        );
+
+        setStatus(
+            'Sync error',
+            'Could not apply authoritative state',
+        );
+
+        return false;
+    } finally {
+        applyingRemoteDepth -= 1;
+    }
+}
+
+async function applyPatchLocally(
+    patch,
+    {
+        persist = true,
+        reason = 'patch',
     } = {},
 ) {
     if (
-        !snapshot ||
-        !currentScope ||
-        !sameScope(snapshot, currentScope)
+        !patch ||
+        !currentScope
     ) {
         return false;
-    }
-
-    const normalized =
-        normalizeSnapshot(snapshot);
-
-    if (!normalized) {
-        return false;
-    }
-
-    const currentAtStart = getScope();
-
-    if (!sameScope(currentAtStart, currentScope)) {
-        return false;
-    }
-
-    /*
-     * Direct array mutation avoids creating another sync event.
-     */
-    if (Array.isArray(ctx.chat)) {
-        ctx.chat.splice(
-            0,
-            ctx.chat.length,
-            ...normalized.chat.map(clone),
-        );
     }
 
     if (
-        ctx.chatMetadata &&
-        typeof ctx.chatMetadata === 'object'
+        patch.kind ===
+        'full'
     ) {
-        for (
-            const key of Object.keys(ctx.chatMetadata)
+        return applySnapshotLocally(
+            patch.snapshot,
+            {
+                persist,
+                reason,
+            },
+        );
+    }
+
+    applyingRemoteDepth += 1;
+
+    try {
+        if (
+            patch.kind ===
+            'append'
         ) {
-            delete ctx.chatMetadata[key];
-        }
+            const messages =
+                Array.isArray(
+                    patch.messages,
+                )
+                    ? patch.messages
+                        .map(
+                            clone,
+                        )
+                    : [];
 
-        Object.assign(
-            ctx.chatMetadata,
-            clone(normalized.chatMetadata || {}),
-        );
-    }
-
-    if (
-        typeof ctx.clearChat === 'function' &&
-        typeof ctx.printMessages === 'function'
-    ) {
-        try {
-            ctx.clearChat();
-            ctx.printMessages();
-        } catch (error) {
-            log(
-                'Render after remote apply failed',
-                error,
+            ctx.chat.splice(
+                Number(
+                    patch.startIndex,
+                ),
+                0,
+                ...messages,
             );
         }
+
+        if (
+            patch.kind ===
+            'patch'
+        ) {
+            for (
+                const change of
+                    patch.changes ||
+                    []
+            ) {
+                const index =
+                    Number(
+                        change.index,
+                    );
+
+                if (
+                    Number.isInteger(
+                        index,
+                    ) &&
+                    index >= 1 &&
+                    index <
+                        ctx.chat.length
+                ) {
+                    ctx.chat[index] =
+                        clone(
+                            change.message,
+                        );
+                }
+            }
+        }
+
+        if (
+            patch.chatMetadata
+        ) {
+            if (
+                typeof ctx.updateChatMetadata ===
+                'function'
+            ) {
+                ctx.updateChatMetadata(
+                    clone(
+                        patch.chatMetadata,
+                    ),
+                    true,
+                );
+            }
+
+            if (
+                ctx.chat[0]
+            ) {
+                ctx.chat[0]
+                    .chat_metadata =
+                    clone(
+                        patch.chatMetadata,
+                    );
+            }
+        }
+
+        if (
+            typeof ctx.printMessages ===
+            'function'
+        ) {
+            await ctx.printMessages();
+        }
+
+        if (
+            persist
+        ) {
+            await saveCurrentChat(
+                `remote:${reason}`,
+            );
+        }
+
+        return true;
+    } catch (error) {
+        warn(
+            'Remote patch application failed',
+            error,
+        );
+
+        return false;
+    } finally {
+        applyingRemoteDepth -= 1;
     }
-
-    if (persist) {
-        await persistCurrentChat('remote-apply');
-    }
-
-    if (serverState) {
-        currentState.serverSnapshot =
-            clone(normalized);
-
-        currentState.serverRevision =
-            Number(serverState.revision)
-            || currentState.serverRevision
-            || 0;
-
-        currentState.serverSeq =
-            Number(serverState.seq)
-            || currentState.serverSeq
-            || 0;
-
-        currentState.serverEpoch =
-            serverState.epoch
-            || currentState.serverEpoch
-            || null;
-
-        currentState.snapshotHash =
-            serverState.snapshotHash
-            || await snapshotHash(normalized);
-
-        currentState.generation =
-            serverState.generation
-            ? clone(serverState.generation)
-            : null;
-    } else {
-        currentState.serverSnapshot =
-            clone(normalized);
-
-        currentState.snapshotHash =
-            await snapshotHash(normalized);
-    }
-
-    setStatus(
-        'Synced',
-        `${reason}; rev ${currentState.serverRevision}`,
-    );
-
-    return true;
 }
 
-function persistCurrentChat(reason = 'local') {
+
+/* -------------------------------------------------------------------------- */
+/* ST persistence                                                             */
+/* -------------------------------------------------------------------------- */
+
+async function saveCurrentChat(
+    reason = 'save',
+) {
     const scopeAtStart =
         currentScope
-            ? clone(currentScope)
+            ? clone(
+                currentScope,
+            )
             : null;
 
     if (
         !scopeAtStart ||
-        !ctx?.saveChat
+        typeof ctx.saveChat !==
+            'function'
     ) {
-        return Promise.resolve(false);
+        return false;
     }
 
-    localSaveChain =
-        localSaveChain.then(
+    saveChain =
+        saveChain.then(
             async () => {
                 if (
                     !sameScope(
                         scopeAtStart,
-                        getScope(),
+                        currentScope,
                     )
                 ) {
                     return false;
                 }
 
                 try {
-                    /*
-                     * ST exposes this as its public conditional-save path.
-                     * We serialize our calls so sync cannot create overlapping
-                     * local save requests from this extension.
-                     */
                     await ctx.saveChat();
 
                     log(
-                        'ST save requested',
+                        'ST save completed',
                         reason,
                     );
 
                     return true;
                 } catch (error) {
                     warn(
-                        `ST save failed (${reason})`,
+                        'ST save failed',
+                        reason,
                         error,
                     );
 
@@ -1041,1057 +1073,854 @@ function persistCurrentChat(reason = 'local') {
             },
         );
 
-    return localSaveChain;
+    return saveChain;
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Three-way merge                                                             */
+/* HTTP                                                                       */
 /* -------------------------------------------------------------------------- */
 
-function messageValueChanged(a, b) {
-    return stableStringify(a) !== stableStringify(b);
-}
-
-function mapByMessageId(messages) {
-    const map = new Map();
-    const duplicates = new Set();
-
-    for (
-        let index = 0;
-        index < messages.length;
-        index++
-    ) {
-        const id =
-            messages[index]
-                ?.extra
-                ?.multi_client_sync_id;
-
-        if (!id) {
-            continue;
-        }
-
-        if (map.has(id)) {
-            duplicates.add(id);
-        }
-
-        map.set(
-            id,
-            {
-                message: messages[index],
-                index,
-            },
-        );
-    }
-
+function requestHeaders(
+    extra = {},
+) {
     return {
-        map,
-        duplicates,
+        Accept:
+            'application/json',
+
+        ...(
+            ctx?.getRequestHeaders?.() ||
+            {}
+        ),
+
+        ...extra,
     };
 }
 
-function mergeMessages3Way(
-    base,
-    local,
-    remote,
-    conflicts,
-) {
-    const baseMessages =
-        Array.isArray(base?.chat)
-            ? base.chat
-            : [];
-
-    const localMessages =
-        Array.isArray(local?.chat)
-            ? local.chat
-            : [];
-
-    const remoteMessages =
-        Array.isArray(remote?.chat)
-            ? remote.chat
-            : [];
-
-    const baseMapInfo =
-        mapByMessageId(baseMessages);
-
-    const localMapInfo =
-        mapByMessageId(localMessages);
-
-    const remoteMapInfo =
-        mapByMessageId(remoteMessages);
-
-    /*
-     * Legacy or duplicate IDs cannot be merged safely.
-     */
-    if (
-        baseMapInfo.map.size !== baseMessages.length ||
-        localMapInfo.map.size !== localMessages.length ||
-        remoteMapInfo.map.size !== remoteMessages.length
-    ) {
-        const sameAsBase =
-            messageValueChanged(
-                localMessages,
-                baseMessages,
-            ) === false;
-
-        if (sameAsBase) {
-            return remoteMessages.map(clone);
-        }
-
-        const remoteSameAsBase =
-            messageValueChanged(
-                remoteMessages,
-                baseMessages,
-            ) === false;
-
-        if (remoteSameAsBase) {
-            return localMessages.map(clone);
-        }
-
-        conflicts.push({
-            type: 'message_identity',
-            policy: 'remote_wins',
-            reason:
-                'legacy_or_duplicate_message_ids',
-        });
-
-        return remoteMessages.map(clone);
-    }
-
-    const resultById = new Map();
-
-    const allIds = new Set([
-        ...baseMapInfo.map.keys(),
-        ...localMapInfo.map.keys(),
-        ...remoteMapInfo.map.keys(),
-    ]);
-
-    for (const id of allIds) {
-        const b =
-            baseMapInfo.map.get(id)?.message;
-
-        const l =
-            localMapInfo.map.get(id)?.message;
-
-        const r =
-            remoteMapInfo.map.get(id)?.message;
-
-        const lPresent = Boolean(l);
-        const rPresent = Boolean(r);
-        const bPresent = Boolean(b);
-
-        if (!lPresent && !rPresent) {
-            continue;
-        }
-
-        /*
-         * New message.
-         */
-        if (!bPresent) {
-            if (lPresent && rPresent) {
-                if (messageValueChanged(l, r)) {
-                    conflicts.push({
-                        type: 'concurrent_insert',
-                        id,
-                        policy: 'remote_wins',
-                    });
-
-                    resultById.set(
-                        id,
-                        clone(r),
-                    );
-                } else {
-                    resultById.set(
-                        id,
-                        clone(l),
-                    );
-                }
-            } else if (lPresent) {
-                resultById.set(
-                    id,
-                    clone(l),
-                );
-            } else {
-                resultById.set(
-                    id,
-                    clone(r),
-                );
-            }
-
-            continue;
-        }
-
-        const localSameAsBase =
-            lPresent &&
-            bPresent &&
-            !messageValueChanged(l, b);
-
-        const remoteSameAsBase =
-            rPresent &&
-            bPresent &&
-            !messageValueChanged(r, b);
-
-        /*
-         * Local deletion.
-         */
-        if (!lPresent) {
-            if (remoteSameAsBase) {
-                continue;
-            }
-
-            if (
-                !rPresent ||
-                messageValueChanged(r, b)
-            ) {
-                conflicts.push({
-                    type: 'delete_vs_change',
-                    id,
-                    policy: 'remote_wins',
-                });
-
-                if (rPresent) {
-                    resultById.set(
-                        id,
-                        clone(r),
-                    );
-                }
-            }
-
-            continue;
-        }
-
-        /*
-         * Remote deletion.
-         */
-        if (!rPresent) {
-            if (localSameAsBase) {
-                continue;
-            }
-
-            conflicts.push({
-                type: 'change_vs_delete',
-                id,
-                policy: 'remote_wins',
-            });
-
-            continue;
-        }
-
-        /*
-         * Only remote changed.
-         */
-        if (
-            localSameAsBase &&
-            !remoteSameAsBase
-        ) {
-            resultById.set(
-                id,
-                clone(r),
-            );
-
-            continue;
-        }
-
-        /*
-         * Only local changed.
-         */
-        if (
-            remoteSameAsBase &&
-            !localSameAsBase
-        ) {
-            resultById.set(
-                id,
-                clone(l),
-            );
-
-            continue;
-        }
-
-        /*
-         * Both changed.
-         */
-        if (
-            !localSameAsBase &&
-            !remoteSameAsBase
-        ) {
-            if (messageValueChanged(l, r)) {
-                conflicts.push({
-                    type: 'concurrent_edit',
-                    id,
-                    policy: 'remote_wins',
-                });
-
-                resultById.set(
-                    id,
-                    clone(r),
-                );
-            } else {
-                resultById.set(
-                    id,
-                    clone(l),
-                );
-            }
-
-            continue;
-        }
-
-        /*
-         * Neither changed.
-         */
-        resultById.set(
-            id,
-            clone(b),
-        );
-    }
-
-    /*
-     * Preserve remote order first.
-     */
-    const output = [];
-    const emitted = new Set();
-
-    for (const message of remoteMessages) {
-        const id =
-            message
-                ?.extra
-                ?.multi_client_sync_id;
-
-        if (
-            !id ||
-            !resultById.has(id) ||
-            emitted.has(id)
-        ) {
-            continue;
-        }
-
-        output.push(
-            clone(resultById.get(id)),
-        );
-
-        emitted.add(id);
-    }
-
-    /*
-     * Place local-only inserts beside their local predecessor.
-     */
-    const localIds =
-        localMessages
-            .map(
-                message =>
-                    message
-                        ?.extra
-                        ?.multi_client_sync_id,
-            )
-            .filter(Boolean);
-
-    for (
-        let i = 0;
-        i < localIds.length;
-        i++
-    ) {
-        const id = localIds[i];
-
-        if (
-            emitted.has(id) ||
-            !resultById.has(id) ||
-            remoteMapInfo.map.has(id)
-        ) {
-            continue;
-        }
-
-        let insertAt =
-            output.length;
-
-        for (
-            let j = i - 1;
-            j >= 0;
-            j--
-        ) {
-            const previousId =
-                localIds[j];
-
-            const index =
-                output.findIndex(
-                    message =>
-                        message
-                            ?.extra
-                            ?.multi_client_sync_id
-                        === previousId,
-                );
-
-            if (index >= 0) {
-                insertAt = index + 1;
-                break;
-            }
-        }
-
-        output.splice(
-            insertAt,
-            0,
-            clone(resultById.get(id)),
-        );
-
-        emitted.add(id);
-
-        conflicts.push({
-            type: 'concurrent_insert',
-            id,
-            policy: 'local_position_near_anchor',
-        });
-    }
-
-    return output;
-}
-
-function mergeObject3Way(
-    base,
-    local,
-    remote,
-    conflicts,
-    fieldName,
-) {
-    const out =
-        clone(remote || {});
-
-    const keys = new Set([
-        ...Object.keys(base || {}),
-        ...Object.keys(local || {}),
-        ...Object.keys(remote || {}),
-    ]);
-
-    for (const key of keys) {
-        const b = base?.[key];
-        const l = local?.[key];
-        const r = remote?.[key];
-
-        const localChanged =
-            messageValueChanged(l, b);
-
-        const remoteChanged =
-            messageValueChanged(r, b);
-
-        if (
-            localChanged &&
-            !remoteChanged
-        ) {
-            out[key] = clone(l);
-        } else if (
-            localChanged &&
-            remoteChanged &&
-            messageValueChanged(l, r)
-        ) {
-            conflicts.push({
-                type: 'concurrent_metadata',
-                field: fieldName,
-                key,
-                policy: 'remote_wins',
-            });
-
-            out[key] = clone(r);
-        }
-    }
-
-    return out;
-}
-
-function mergeSnapshots3Way(
-    base,
-    local,
-    remote,
-) {
-    const conflicts = [];
-
-    const merged =
-        clone(remote);
-
-    merged.chat =
-        mergeMessages3Way(
-            base,
-            local,
-            remote,
-            conflicts,
-        );
-
-    merged.chatMetadata =
-        mergeObject3Way(
-            base?.chatMetadata || {},
-            local?.chatMetadata || {},
-            remote?.chatMetadata || {},
-            conflicts,
-            'chatMetadata',
-        );
-
-    merged.scopeType =
-        remote.scopeType;
-
-    merged.chatId =
-        remote.chatId;
-
-    merged.characterId =
-        remote.characterId;
-
-    merged.groupId =
-        remote.groupId;
-
-    return {
-        snapshot: merged,
-        conflicts,
-    };
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Pending mutation pipeline                                                   */
-/* -------------------------------------------------------------------------- */
-
-async function sendPending(
-    pending,
-    depth = 0,
-) {
-    if (
-        !pending ||
-        !currentScope ||
-        !sameScope(
-            pending.scope,
-            currentScope,
-        )
-    ) {
-        return false;
-    }
-
-    if (depth > 5) {
-        setStatus(
-            'Pending',
-            'rebase limit reached; retrying on next sync',
-        );
-
-        return false;
-    }
-
-    try {
-        const result =
-            await api('/event', {
-                method: 'POST',
-
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
-
-                    clientId:
-                        currentClientId,
-
-                    deviceId:
-                        currentDeviceId,
-
-                    scope:
-                        pending.scope,
-
-                    opId:
-                        pending.opId,
-
-                    type:
-                        pending.type,
-
-                    baseRevision:
-                        pending.baseRevision,
-
-                    payload:
-                        pending.payload || {},
-
-                    snapshot:
-                        pending.snapshot,
-                }),
-            });
-
-        if (result.state) {
-            applyServerMeta(
-                result.state,
-            );
-        }
-
-        if (result.state?.snapshot) {
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    result.state.snapshot,
-                );
-        }
-
-        await deletePending(
-            pending.scope,
-        );
-
-        currentState.pending = null;
-
-        setStatus(
-            'Synced',
-            `accepted ${pending.type}; rev ${currentState.serverRevision}`,
-        );
-
-        broadcastLocal({
-            kind: 'accepted',
-            scope: pending.scope,
-            event: result.event,
-            state: result.state,
-        });
-
-        return true;
-    } catch (error) {
-        /*
-         * Optimistic concurrency conflict.
-         */
-        if (
-            error.code === 'stale_revision' &&
-            error.state?.snapshot
-        ) {
-            const remote =
-                normalizeSnapshot(
-                    error.state.snapshot,
-                );
-
-            const base =
-                normalizeSnapshot(
-                    pending.baseSnapshot ||
-                    currentState.serverSnapshot ||
-                    remote,
-                );
-
-            const local =
-                normalizeSnapshot(
-                    pending.snapshot,
-                );
-
-            const merged =
-                mergeSnapshots3Way(
-                    base,
-                    local,
-                    remote,
-                );
-
-            currentState.serverSnapshot =
-                remote;
-
-            currentState.serverRevision =
-                Number(error.state.revision)
-                || 0;
-
-            currentState.serverSeq =
-                Number(error.state.seq)
-                || currentState.serverSeq
-                || 0;
-
-            currentState.serverEpoch =
-                error.state.epoch
-                || currentState.serverEpoch;
-
-            currentState.generation =
-                error.state.generation
-                || null;
-
-            currentState.pending = {
-                ...pending,
-
-                baseSnapshot:
-                    remote,
-
-                baseRevision:
-                    currentState.serverRevision,
-
-                snapshot:
-                    merged.snapshot,
-
-                opId:
-                    randomId(),
-
-                conflicts:
-                    [
-                        ...(pending.conflicts || []),
-                        ...merged.conflicts,
-                    ],
-            };
-
-            await savePending(
-                currentState.pending,
-            );
-
-            /*
-             * Show the server state first.
-             */
-            await applyAuthoritativeSnapshot(
-                remote,
-                {
-                    persist: true,
-                    serverState: error.state,
-                    reason: 'conflict-resync',
-                },
-            );
-
-            /*
-             * Then apply the deterministic three-way merge locally.
-             * Server revision remains the remote revision until the merged
-             * snapshot is accepted.
-             */
-            await applyAuthoritativeSnapshot(
-                merged.snapshot,
-                {
-                    persist: true,
-                    reason: 'apply-three-way-merge',
-                },
-            );
-
-            currentState.serverSnapshot =
-                remote;
-
-            currentState.serverRevision =
-                Number(error.state.revision)
-                || 0;
-
-            currentState.serverSeq =
-                Number(error.state.seq)
-                || 0;
-
-            currentState.serverEpoch =
-                error.state.epoch
-                || currentState.serverEpoch;
-
-            currentState.generation =
-                error.state.generation
-                || null;
-
-            if (merged.conflicts.length) {
-                setStatus(
-                    'Conflict resolved',
-                    `${merged.conflicts.length} conflict(s); server-biased`,
-                );
-            }
-
-            return sendPending(
-                currentState.pending,
-                depth + 1,
-            );
-        }
-
-        if (
-            error.code === 'generation_lock'
-        ) {
-            setStatus(
-                'Generation active',
-                'Remote generation owns this chat',
-            );
-        } else if (
-            error.code === 'not_member' ||
-            error.code === 'membership_expired'
-        ) {
-            scheduleReconnect(
-                error.code,
-            );
-        } else {
-            setStatus(
-                'Pending',
-                error.message ||
-                error.code ||
-                'event retry',
-            );
-        }
-
-        return false;
-    }
-}
-
-async function enqueueSnapshotMutation(
-    type,
-    payload = {},
+async function api(
+    path,
     {
-        persist = true,
+        method = 'GET',
+        body = undefined,
     } = {},
 ) {
+    const options = {
+        method,
+
+        credentials:
+            'same-origin',
+
+        cache:
+            'no-store',
+
+        headers:
+            requestHeaders(
+                body !== undefined
+                    ? {
+                        'Content-Type':
+                            'application/json',
+                    }
+                    : {},
+            ),
+    };
+
     if (
-        !getSettings().enabled ||
-        !currentScope ||
-        !currentState
+        body !== undefined
     ) {
-        return;
+        options.body =
+            JSON.stringify(
+                body,
+            );
     }
 
-    if (currentState.suppressLocalEvents) {
-        return;
-    }
-
-    /*
-     * While another generation is active, non-owner clients do not send chat
-     * mutations. Owner stream data is sent through generation_stream instead.
-     */
-    if (
-        currentState.generation &&
-        currentState.generation.ownerClientId !==
-            currentClientId
-    ) {
-        setStatus(
-            'Generation active',
-            'Remote owner has the mutation lock',
+    const response =
+        await fetch(
+            `${PLUGIN_BASE}${path}`,
+            options,
         );
 
-        return;
-    }
+    let parsed =
+        null;
 
-    /*
-     * Owner-side generation mutations are treated as stream state.
-     */
-    if (
-        currentState.generation &&
-        currentState.generation.ownerClientId ===
-            currentClientId &&
-        !localGenerationClaimLost
-    ) {
-        await queueStreamSnapshot(type);
-        return;
-    }
-
-    if (persist) {
-        await persistCurrentChat(type);
-    }
-
-    const snapshot =
-        makeSnapshot();
-
-    if (!snapshot) {
-        return;
+    try {
+        parsed =
+            await response.json();
+    } catch {
+        // non-json
     }
 
     if (
-        snapshot.idsChanged &&
-        persist
+        !response.ok
     ) {
-        await persistCurrentChat(
-            'stable-message-ids',
-        );
+        const error =
+            new Error(
+                parsed?.message ||
+                    `HTTP ${response.status}`,
+            );
+
+        error.status =
+            response.status;
+
+        error.code =
+            parsed?.code ||
+            `http_${response.status}`;
+
+        error.state =
+            parsed?.state;
+
+        error.expectedHash =
+            parsed?.expectedHash;
+
+        error.actualHash =
+            parsed?.actualHash;
+
+        throw error;
     }
 
-    delete snapshot.idsChanged;
-
-    const existing =
-        currentState.pending;
-
-    const pending = existing
-        ? {
-            ...existing,
-            snapshot,
-            type,
-            payload,
-            opId: randomId(),
-        }
-        : {
-            scope:
-                clone(currentScope),
-
-            opId:
-                randomId(),
-
-            type,
-
-            payload,
-
-            baseRevision:
-                currentState.serverRevision,
-
-            baseSnapshot:
-                clone(
-                    currentState.serverSnapshot
-                    || snapshot,
-                ),
-
-            snapshot,
-
-            conflicts: [],
-        };
-
-    currentState.pending =
-        pending;
-
-    await savePending(
-        pending,
-    );
-
-    broadcastLocal({
-        kind: 'local_pending',
-        scope: currentScope,
-        type,
-    });
-
-    await sendPending(
-        pending,
-    );
+    return parsed || {};
 }
 
-function enqueueSnapshotMutationSoon(
-    type,
-    payload = {},
-) {
-    if (localMutationTimer) {
-        clearTimeout(
-            localMutationTimer,
-        );
+
+/* -------------------------------------------------------------------------- */
+/* IndexedDB                                                                  */
+/* -------------------------------------------------------------------------- */
+
+let databasePromise =
+    null;
+
+function openDatabase() {
+    if (
+        databasePromise
+    ) {
+        return databasePromise;
     }
 
-    localMutationTimer =
-        setTimeout(
-            () => {
-                localMutationTimer = null;
+    databasePromise =
+        new Promise(
+            (
+                resolve,
+                reject,
+            ) => {
+                const request =
+                    indexedDB.open(
+                        DB_NAME,
+                        DB_VERSION,
+                    );
 
-                void enqueueSnapshotMutation(
-                    type,
-                    payload,
-                );
+                request.onerror =
+                    () =>
+                        reject(
+                            request.error,
+                        );
+
+                request.onupgradeneeded =
+                    () => {
+                        const db =
+                            request.result;
+
+                        if (
+                            !db.objectStoreNames.contains(
+                                'ops',
+                            )
+                        ) {
+                            db.createObjectStore(
+                                'ops',
+                                {
+                                    keyPath:
+                                        'opId',
+                                },
+                            );
+                        }
+
+                        if (
+                            !db.objectStoreNames.contains(
+                                'meta',
+                            )
+                        ) {
+                            db.createObjectStore(
+                                'meta',
+                            );
+                        }
+                    };
+
+                request.onsuccess =
+                    () =>
+                        resolve(
+                            request.result,
+                        );
             },
-            SNAPSHOT_DEBOUNCE_MS,
         );
+
+    return databasePromise;
+}
+
+async function dbPutOperation(
+    operation,
+) {
+    const db =
+        await openDatabase();
+
+    await new Promise(
+        (
+            resolve,
+            reject,
+        ) => {
+            const tx =
+                db.transaction(
+                    'ops',
+                    'readwrite',
+                );
+
+            tx.objectStore(
+                'ops',
+            ).put(
+                clone(
+                    operation,
+                ),
+            );
+
+            tx.oncomplete =
+                resolve;
+
+            tx.onerror =
+                () =>
+                    reject(
+                        tx.error,
+                    );
+        },
+    );
+}
+
+async function dbDeleteOperation(
+    opId,
+) {
+    const db =
+        await openDatabase();
+
+    await new Promise(
+        (
+            resolve,
+            reject,
+        ) => {
+            const tx =
+                db.transaction(
+                    'ops',
+                    'readwrite',
+                );
+
+            tx.objectStore(
+                'ops',
+            ).delete(
+                opId,
+            );
+
+            tx.oncomplete =
+                resolve;
+
+            tx.onerror =
+                () =>
+                    reject(
+                        tx.error,
+                    );
+        },
+    );
+}
+
+async function dbGetOperations(
+    scope,
+) {
+    if (
+        !principalKey
+    ) {
+        return [];
+    }
+
+    const db =
+        await openDatabase();
+
+    return new Promise(
+        (
+            resolve,
+            reject,
+        ) => {
+            const tx =
+                db.transaction(
+                    'ops',
+                    'readonly',
+                );
+
+            const request =
+                tx.objectStore(
+                    'ops',
+                ).getAll();
+
+            request.onerror =
+                () =>
+                    reject(
+                        request.error,
+                    );
+
+            request.onsuccess =
+                () => {
+                    const values =
+                        request.result
+                            .filter(
+                                operation =>
+                                    operation
+                                        .principalKey ===
+                                        principalKey &&
+                                    sameScope(
+                                        operation.scope,
+                                        scope,
+                                    ),
+                            )
+                            .sort(
+                                (
+                                    a,
+                                    b,
+                                ) =>
+                                    a.localSeq -
+                                    b.localSeq,
+                            );
+
+                    resolve(
+                        values,
+                    );
+                };
+        },
+    );
+}
+
+async function dbPutMeta(
+    key,
+    value,
+) {
+    if (
+        !principalKey
+    ) {
+        return;
+    }
+
+    const db =
+        await openDatabase();
+
+    await new Promise(
+        (
+            resolve,
+            reject,
+        ) => {
+            const tx =
+                db.transaction(
+                    'meta',
+                    'readwrite',
+                );
+
+            tx.objectStore(
+                'meta',
+            ).put(
+                clone(
+                    value,
+                ),
+                `${principalKey}:${key}`,
+            );
+
+            tx.oncomplete =
+                resolve;
+
+            tx.onerror =
+                () =>
+                    reject(
+                        tx.error,
+                    );
+        },
+    );
+}
+
+async function dbGetMeta(
+    key,
+) {
+    if (
+        !principalKey
+    ) {
+        return null;
+    }
+
+    const db =
+        await openDatabase();
+
+    return new Promise(
+        (
+            resolve,
+            reject,
+        ) => {
+            const tx =
+                db.transaction(
+                    'meta',
+                    'readonly',
+                );
+
+            const request =
+                tx.objectStore(
+                    'meta',
+                ).get(
+                    `${principalKey}:${key}`,
+                );
+
+            request.onerror =
+                () =>
+                    reject(
+                        request.error,
+                    );
+
+            request.onsuccess =
+                () =>
+                    resolve(
+                        request.result ||
+                            null,
+                    );
+        },
+    );
+}
+
+async function dbClearAll() {
+    const db =
+        await openDatabase();
+
+    await new Promise(
+        (
+            resolve,
+            reject,
+        ) => {
+            const tx =
+                db.transaction(
+                    [
+                        'ops',
+                        'meta',
+                    ],
+                    'readwrite',
+                );
+
+            tx.objectStore(
+                'ops',
+            ).clear();
+
+            tx.objectStore(
+                'meta',
+            ).clear();
+
+            tx.oncomplete =
+                resolve;
+
+            tx.onerror =
+                () =>
+                    reject(
+                        tx.error,
+                    );
+        },
+    );
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Generation ownership / streaming                                           */
+/* UI                                                                         */
 /* -------------------------------------------------------------------------- */
 
-async function claimGeneration() {
+function ensureUi() {
     if (
-        !currentScope ||
-        !currentState
+        uiRoot ||
+        !document.body
     ) {
-        return false;
+        return;
     }
+
+    uiRoot =
+        document.createElement(
+            'div',
+        );
+
+    uiRoot.id =
+        'multi-client-sync-status';
+
+    uiRoot.innerHTML = `
+        <div data-mcs-title></div>
+        <div data-mcs-detail></div>
+        <div data-mcs-actions></div>
+    `;
+
+    Object.assign(
+        uiRoot.style,
+        {
+            position:
+                'fixed',
+
+            right:
+                '12px',
+
+            bottom:
+                '12px',
+
+            zIndex:
+                '99999',
+
+            minWidth:
+                '230px',
+
+            maxWidth:
+                '360px',
+
+            padding:
+                '9px 11px',
+
+            borderRadius:
+                '8px',
+
+            background:
+                'rgba(20,20,20,.94)',
+
+            color:
+                '#fff',
+
+            fontSize:
+                '12px',
+
+            lineHeight:
+                '1.4',
+
+            boxShadow:
+                '0 3px 18px rgba(0,0,0,.35)',
+        },
+    );
+
+    document.body.appendChild(
+        uiRoot,
+    );
+}
+
+function setStatus(
+    title,
+    detail = '',
+    actions = [],
+) {
+    ensureUi();
+
+    if (!uiRoot) {
+        return;
+    }
+
+    const titleNode =
+        uiRoot.querySelector(
+            '[data-mcs-title]',
+        );
+
+    const detailNode =
+        uiRoot.querySelector(
+            '[data-mcs-detail]',
+        );
+
+    const actionsNode =
+        uiRoot.querySelector(
+            '[data-mcs-actions]',
+        );
+
+    titleNode.textContent =
+        title;
+
+    detailNode.textContent =
+        detail;
+
+    actionsNode.replaceChildren();
+
+    for (
+        const action of
+            actions
+    ) {
+        const button =
+            document.createElement(
+                'button',
+            );
+
+        button.type =
+            'button';
+
+        button.textContent =
+            action.label;
+
+        button.style.margin =
+            '5px 4px 0 0';
+
+        button.addEventListener(
+            'click',
+            action.run,
+        );
+
+        actionsNode.appendChild(
+            button,
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Server cursor                                                              */
+/* -------------------------------------------------------------------------- */
+
+async function persistCursor() {
+    if (
+        !currentScope
+    ) {
+        return;
+    }
+
+    await dbPutMeta(
+        stableStringify(
+            currentScope,
+        ),
+        {
+            lastEventId,
+            lastEpoch,
+            lastSeq,
+            lastRevision,
+        },
+    );
+}
+
+function applyStateCursor(
+    state,
+) {
+    if (!state) {
+        return;
+    }
+
+    if (
+        state.epoch
+    ) {
+        lastEpoch =
+            String(
+                state.epoch,
+            );
+    }
+
+    if (
+        Number.isSafeInteger(
+            Number(
+                state.seq,
+            ),
+        )
+    ) {
+        lastSeq =
+            Number(
+                state.seq,
+            );
+    }
+
+    if (
+        Number.isSafeInteger(
+            Number(
+                state.revision,
+            ),
+        )
+    ) {
+        lastRevision =
+            Number(
+                state.revision,
+            );
+    }
+
+    if (
+        state.lastEventId
+    ) {
+        lastEventId =
+            String(
+                state.lastEventId,
+            );
+    } else if (
+        lastEpoch &&
+        lastSeq >
+            0
+    ) {
+        lastEventId =
+            `${lastEpoch}:${lastSeq}`;
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Generation helpers                                                         */
+/* -------------------------------------------------------------------------- */
+
+function isLocalGenerationOwner() {
+    const generation =
+        currentState?.generation;
+
+    return Boolean(
+        generation &&
+        generation.ownerClientId ===
+            clientId &&
+        generation.ownerDeviceId ===
+            deviceId &&
+        localGenerationId ===
+            generation.id &&
+        !localGenerationLost,
+    );
+}
+
+function activeGeneration() {
+    return (
+        currentState?.generation ||
+        null
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Generation claim                                                           */
+/* -------------------------------------------------------------------------- */
+
+async function claimGeneration(
+    generationType,
+    targetMessageId = null,
+) {
+    if (
+        currentState?.generation
+    ) {
+        return isLocalGenerationOwner();
+    }
+
+    const expectedScope =
+        currentEpoch();
 
     const generationId =
-        randomId();
+        uuid();
 
-    generationCandidate =
+    localGenerationId =
         generationId;
 
-    localStopIssued =
+    localGenerationLost =
         false;
 
-    localGenerationClaimLost =
+    localStopRequested =
         false;
 
     try {
         const result =
-            await api('/event', {
-                method: 'POST',
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
 
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
+                    body: {
+                        protocolVersion:
+                            PROTOCOL_VERSION,
 
-                    clientId:
-                        currentClientId,
+                        clientId,
 
-                    deviceId:
-                        currentDeviceId,
+                        deviceId,
 
-                    scope:
-                        currentScope,
+                        scope:
+                            currentScope,
 
-                    opId:
-                        randomId(),
+                        opId:
+                            uuid(),
 
-                    type:
-                        'generation_claim',
+                        type:
+                            'generation_claim',
 
-                    baseRevision:
-                        currentState.serverRevision,
+                        generationId,
 
-                    generationId,
+                        generationType:
+                            String(
+                                generationType ||
+                                    'unknown',
+                            ),
 
-                    payload: {},
-                }),
-            });
+                        targetMessageId,
 
-        if (result.state) {
-            applyServerMeta(
-                result.state,
+                        baseRevision:
+                            lastRevision,
+                    },
+                },
             );
-        }
 
         if (
-            result.state?.generation?.id !==
-            generationId
+            expectedScope !==
+            currentEpoch()
         ) {
-            localGenerationClaimLost =
+            localGenerationLost =
                 true;
-
-            try {
-                ctx?.stopGeneration?.();
-            } catch {
-                // ignored
-            }
 
             return false;
         }
 
-        currentState.generation =
-            clone(
-                result.state.generation,
+        if (
+            result.state
+        ) {
+            applyStateCursor(
+                result.state,
             );
 
-        currentState.serverSnapshot =
-            normalizeSnapshot(
-                result.state.snapshot ||
-                currentState.serverSnapshot,
-            );
+            currentState =
+                currentState ||
+                {};
+
+            currentState.generation =
+                result.state
+                    .generation
+                    ? clone(
+                        result.state
+                            .generation,
+                    )
+                    : null;
+        }
+
+        if (
+            result.state
+                ?.generation
+                ?.id !==
+            generationId
+        ) {
+            localGenerationLost =
+                true;
+
+            return false;
+        }
 
         setStatus(
-            'Generating',
-            'This client owns generation',
+            'Generation owner',
+            'This client owns the generation lease',
         );
 
-        broadcastLocal({
-            kind: 'generation_owner',
-            scope: currentScope,
-            state: result.state,
-        });
+        await persistCursor();
 
         return true;
     } catch (error) {
-        localGenerationClaimLost =
+        localGenerationLost =
             true;
 
         if (
-            error.code === 'generation_owned' ||
-            error.code === 'generation_not_owner'
+            error.code ===
+            'generation_owned'
         ) {
             try {
-                ctx?.stopGeneration?.();
+                ctx.stopGeneration?.();
             } catch {
                 // ignored
             }
 
             setStatus(
                 'Generation busy',
-                'Stopped local generation; another client owns it',
+                'Another client owns generation',
             );
         } else if (
-            error.code === 'stale_revision' &&
-            error.state
+            error.code ===
+            'stale_revision'
         ) {
-            applyServerMeta(
-                error.state,
+            await resyncCurrentScope(
+                'generation claim conflict',
             );
 
-            if (
-                error.state.snapshot
-            ) {
-                await applyAuthoritativeSnapshot(
-                    error.state.snapshot,
-                    {
-                        serverState:
-                            error.state,
-
-                        reason:
-                            'claim-resync',
-                    },
-                );
-            }
-
             try {
-                ctx?.stopGeneration?.();
+                ctx.stopGeneration?.();
             } catch {
                 // ignored
             }
@@ -2100,493 +1929,1212 @@ async function claimGeneration() {
                 'Generation claim failed',
                 error,
             );
-
-            try {
-                ctx?.stopGeneration?.();
-            } catch {
-                // ignored
-            }
         }
 
         return false;
     }
 }
 
-async function queueStreamSnapshot(
-    reason = 'token',
+
+/* -------------------------------------------------------------------------- */
+/* Pre-generation interceptor                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Current ST resolves generate_interceptor by looking up the configured
+ * function name on globalThis.
+ *
+ * Therefore this is deliberately attached to globalThis.
+ *
+ * IMPORTANT:
+ * The manifest still needs:
+ *
+ * "generate_interceptor": "multiClientSyncGenerateInterceptor"
+ *
+ * to activate this pre-generation gate.
+ */
+async function multiClientSyncGenerateInterceptor(
+    chat,
+    contextSize,
+    abort,
+    type,
 ) {
     if (
-        !currentScope ||
-        !currentState?.generation ||
-        currentState.generation.ownerClientId !==
-            currentClientId ||
-        localGenerationClaimLost
+        !getSettings().enabled
     ) {
         return;
     }
 
-    latestStreamSnapshot =
-        makeSnapshot();
+    const available =
+        await ensureConnected();
 
-    if (!latestStreamSnapshot) {
+    /*
+     * Missing plugin must never break ordinary Tavern generation.
+     */
+    if (!available) {
         return;
     }
-
-    delete latestStreamSnapshot.idsChanged;
-
-    latestStreamReason =
-        reason;
-
-    if (pendingStreamTimer) {
-        return;
-    }
-
-    pendingStreamTimer =
-        setTimeout(
-            () => {
-                pendingStreamTimer = null;
-                void flushStreamSnapshot();
-            },
-            STREAM_FLUSH_MS,
-        );
-}
-
-async function flushStreamSnapshot() {
-    if (
-        streamInFlight ||
-        !latestStreamSnapshot ||
-        !currentState?.generation
-    ) {
-        return;
-    }
-
-    const snapshot =
-        latestStreamSnapshot;
-
-    const reason =
-        latestStreamReason;
-
-    latestStreamSnapshot =
-        null;
-
-    latestStreamReason =
-        null;
-
-    streamInFlight =
-        true;
 
     const generation =
-        currentState.generation;
+        activeGeneration();
 
-    const streamSeq =
-        Number(
-            generation.streamSeq || 0,
-        ) + 1;
+    if (
+        generation &&
+        !isLocalGenerationOwner()
+    ) {
+        abort(
+            true,
+        );
 
-    try {
-        const result =
-            await api('/event', {
-                method: 'POST',
+        return;
+    }
 
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
+    const targetMessageId =
+        getLastMessageSyncId();
 
-                    clientId:
-                        currentClientId,
+    const claimed =
+        await claimGeneration(
+            type,
+            targetMessageId,
+        );
 
-                    deviceId:
-                        currentDeviceId,
+    if (
+        !claimed
+    ) {
+        abort(
+            true,
+        );
+    }
+}
 
-                    scope:
-                        currentScope,
+globalThis.multiClientSyncGenerateInterceptor =
+    multiClientSyncGenerateInterceptor;
 
-                    opId:
-                        randomId(),
 
-                    type:
-                        'generation_stream',
+/* -------------------------------------------------------------------------- */
+/* Stable message identity                                                    */
+/* -------------------------------------------------------------------------- */
 
-                    baseRevision:
-                        currentState.serverRevision,
+function getLastMessageSyncId() {
+    const snapshot =
+        makeLocalSnapshot();
 
-                    generationId:
-                        generation.id,
+    if (
+        !snapshot ||
+        snapshot.chat.length <
+            2
+    ) {
+        return null;
+    }
 
-                    streamSeq,
+    for (
+        let index =
+            snapshot.chat.length -
+            1;
+        index >= 1;
+        index--
+    ) {
+        const id =
+            snapshot.chat[index]
+                ?.extra
+                ?.[MESSAGE_NAMESPACE]
+                ?.messageId;
 
-                    payload: {
-                        reason,
-                    },
+        if (id) {
+            return id;
+        }
+    }
 
-                    snapshot,
-                }),
-            });
+    return null;
+}
 
-        if (result.state) {
-            applyServerMeta(
-                result.state,
+
+/* -------------------------------------------------------------------------- */
+/* Three-way merge                                                            */
+/* -------------------------------------------------------------------------- */
+
+function messageId(
+    message,
+) {
+    return (
+        message
+            ?.extra
+            ?.[MESSAGE_NAMESPACE]
+            ?.messageId ||
+        null
+    );
+}
+
+function messageMap(
+    chat,
+) {
+    const result =
+        new Map();
+
+    for (
+        let index = 1;
+        index < chat.length;
+        index++
+    ) {
+        const id =
+            messageId(
+                chat[index],
             );
 
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    result.state.snapshot ||
-                    snapshot,
+        if (
+            id
+        ) {
+            result.set(
+                id,
+                {
+                    message:
+                        chat[index],
+
+                    index,
+                },
+            );
+        }
+    }
+
+    return result;
+}
+
+function mergeSnapshots(
+    base,
+    local,
+    remote,
+) {
+    const conflicts =
+        [];
+
+    const baseChat =
+        base?.chat || [];
+
+    const localChat =
+        local?.chat || [];
+
+    const remoteChat =
+        remote?.chat || [];
+
+    const baseMap =
+        messageMap(
+            baseChat,
+        );
+
+    const localMap =
+        messageMap(
+            localChat,
+        );
+
+    const remoteMap =
+        messageMap(
+            remoteChat,
+        );
+
+    /*
+     * A precise merge is impossible if one side does not have stable IDs.
+     * Use authoritative remote state instead of guessing.
+     */
+    for (
+        const chat of [
+            baseChat,
+            localChat,
+            remoteChat,
+        ]
+    ) {
+        for (
+            let i = 1;
+            i < chat.length;
+            i++
+        ) {
+            if (
+                !messageId(
+                    chat[i],
+                )
+            ) {
+                conflicts.push({
+                    type:
+                        'legacy_message_identity',
+
+                    policy:
+                        'remote_wins',
+                });
+
+                return {
+                    snapshot:
+                        clone(
+                            remote,
+                        ),
+
+                    conflicts,
+                };
+            }
+        }
+    }
+
+    const ids =
+        new Set([
+            ...baseMap.keys(),
+            ...localMap.keys(),
+            ...remoteMap.keys(),
+        ]);
+
+    const mergedById =
+        new Map();
+
+    for (
+        const id of ids
+    ) {
+        const b =
+            baseMap.get(id)
+                ?.message;
+
+        const l =
+            localMap.get(id)
+                ?.message;
+
+        const r =
+            remoteMap.get(id)
+                ?.message;
+
+        const bExists =
+            Boolean(b);
+
+        const lExists =
+            Boolean(l);
+
+        const rExists =
+            Boolean(r);
+
+        if (
+            !bExists
+        ) {
+            if (
+                lExists &&
+                rExists
+            ) {
+                if (
+                    sameValue(
+                        l,
+                        r,
+                    )
+                ) {
+                    mergedById.set(
+                        id,
+                        clone(l),
+                    );
+                } else {
+                    /*
+                     * Deterministic conflict policy.
+                     */
+                    mergedById.set(
+                        id,
+                        clone(r),
+                    );
+
+                    conflicts.push({
+                        type:
+                            'concurrent_insert',
+
+                        messageId:
+                            id,
+
+                        policy:
+                            'remote_wins',
+                    });
+                }
+            } else if (
+                lExists
+            ) {
+                mergedById.set(
+                    id,
+                    clone(l),
+                );
+            } else if (
+                rExists
+            ) {
+                mergedById.set(
+                    id,
+                    clone(r),
+                );
+            }
+
+            continue;
+        }
+
+        const localChanged =
+            lExists &&
+            !sameValue(
+                l,
+                b,
+            );
+
+        const remoteChanged =
+            rExists &&
+            !sameValue(
+                r,
+                b,
+            );
+
+        if (
+            !lExists &&
+            !rExists
+        ) {
+            continue;
+        }
+
+        if (
+            !lExists
+        ) {
+            if (
+                remoteChanged
+            ) {
+                conflicts.push({
+                    type:
+                        'delete_vs_change',
+
+                    messageId:
+                        id,
+
+                    policy:
+                        'remote_wins',
+                });
+
+                mergedById.set(
+                    id,
+                    clone(r),
+                );
+            }
+
+            continue;
+        }
+
+        if (
+            !rExists
+        ) {
+            if (
+                localChanged
+            ) {
+                conflicts.push({
+                    type:
+                        'change_vs_delete',
+
+                    messageId:
+                        id,
+
+                    policy:
+                        'remote_wins',
+                });
+            }
+
+            continue;
+        }
+
+        if (
+            localChanged &&
+            !remoteChanged
+        ) {
+            mergedById.set(
+                id,
+                clone(l),
+            );
+
+            continue;
+        }
+
+        if (
+            !localChanged &&
+            remoteChanged
+        ) {
+            mergedById.set(
+                id,
+                clone(r),
+            );
+
+            continue;
+        }
+
+        if (
+            localChanged &&
+            remoteChanged
+        ) {
+            if (
+                sameValue(
+                    l,
+                    r,
+                )
+            ) {
+                mergedById.set(
+                    id,
+                    clone(l),
+                );
+            } else {
+                mergedById.set(
+                    id,
+                    clone(r),
+                );
+
+                conflicts.push({
+                    type:
+                        'concurrent_edit',
+
+                    messageId:
+                        id,
+
+                    policy:
+                        'remote_wins',
+                });
+            }
+
+            continue;
+        }
+
+        mergedById.set(
+            id,
+            clone(b),
+        );
+    }
+
+    /*
+     * Preserve remote ordering for shared messages.
+     */
+    const resultMessages =
+        [];
+
+    const emitted =
+        new Set();
+
+    for (
+        let index = 1;
+        index <
+            remoteChat.length;
+        index++
+    ) {
+        const id =
+            messageId(
+                remoteChat[index],
+            );
+
+        if (
+            id &&
+            mergedById.has(
+                id,
+            )
+        ) {
+            resultMessages.push(
+                clone(
+                    mergedById.get(
+                        id,
+                    ),
+                ),
+            );
+
+            emitted.add(
+                id,
+            );
+        }
+    }
+
+    /*
+     * Insert local-only messages deterministically after their nearest surviving
+     * predecessor.
+     */
+    for (
+        let index = 1;
+        index <
+            localChat.length;
+        index++
+    ) {
+        const id =
+            messageId(
+                localChat[index],
+            );
+
+        if (
+            !id ||
+            emitted.has(id) ||
+            !mergedById.has(id)
+        ) {
+            continue;
+        }
+
+        let insertAt =
+            resultMessages.length;
+
+        for (
+            let previous =
+                index - 1;
+            previous >= 1;
+            previous--
+        ) {
+            const previousId =
+                messageId(
+                    localChat[previous],
+                );
+
+            const anchor =
+                resultMessages.findIndex(
+                    message =>
+                        messageId(
+                            message,
+                        ) ===
+                        previousId,
                 );
 
             if (
-                result.state.generation
+                anchor >= 0
             ) {
-                currentState.generation =
-                    clone(
-                        result.state.generation,
-                    );
+                insertAt =
+                    anchor + 1;
+
+                break;
             }
         }
 
-        broadcastLocal({
-            kind: 'stream',
-            scope: currentScope,
-            state: result.state,
-            event: result.event,
-        });
-    } catch (error) {
-        if (
-            error.code === 'generation_stale' ||
-            error.code === 'generation_not_owner' ||
-            error.code === 'generation_expired'
-        ) {
-            localGenerationClaimLost =
-                true;
-
-            try {
-                ctx?.stopGeneration?.();
-            } catch {
-                // ignored
-            }
-
-            setStatus(
-                'Generation ended',
-                'Ownership lost; local generation stopped',
-            );
-        } else if (
-            error.code === 'stale_revision' &&
-            error.state?.snapshot
-        ) {
-            currentState.serverRevision =
-                Number(
-                    error.state.revision,
-                ) || 0;
-
-            currentState.serverSeq =
-                Number(
-                    error.state.seq,
-                ) || 0;
-
-            currentState.serverEpoch =
-                error.state.epoch ||
-                currentState.serverEpoch;
-
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    error.state.snapshot,
-                );
-
-            currentState.generation =
-                error.state.generation ||
-                null;
-
-            setStatus(
-                'Generating',
-                'Stream revision changed; state will resync',
-            );
-        } else {
-            log(
-                'Stream update failed',
-                error,
-            );
-        }
-    } finally {
-        streamInFlight =
-            false;
-
-        if (latestStreamSnapshot) {
-            void flushStreamSnapshot();
-        }
-    }
-}
-
-async function waitForStreamIdle() {
-    if (latestStreamSnapshot) {
-        await flushStreamSnapshot();
-    }
-
-    while (streamInFlight) {
-        await new Promise(
-            resolve => setTimeout(
-                resolve,
-                20,
+        resultMessages.splice(
+            insertAt,
+            0,
+            clone(
+                mergedById.get(
+                    id,
+                ),
             ),
         );
+
+        emitted.add(
+            id,
+        );
+
+        conflicts.push({
+            type:
+                'concurrent_insert_position',
+
+            messageId:
+                id,
+
+            policy:
+                'deterministic_anchor',
+        });
     }
 
-    if (latestStreamSnapshot) {
-        await flushStreamSnapshot();
+    /*
+     * Metadata merge.
+     */
+    const mergedMetadata =
+        clone(
+            remote?.chatMetadata ||
+                {},
+        );
+
+    const baseMetadata =
+        base?.chatMetadata ||
+            {};
+
+    const localMetadata =
+        local?.chatMetadata ||
+            {};
+
+    const metadataKeys =
+        new Set([
+            ...Object.keys(
+                baseMetadata,
+            ),
+            ...Object.keys(
+                localMetadata,
+            ),
+            ...Object.keys(
+                remote?.chatMetadata ||
+                    {},
+            ),
+        ]);
+
+    for (
+        const key of
+            metadataKeys
+    ) {
+        const b =
+            baseMetadata[key];
+
+        const l =
+            localMetadata[key];
+
+        const r =
+            remote?.chatMetadata?.[
+                key
+            ];
+
+        const localChanged =
+            !sameValue(
+                l,
+                b,
+            );
+
+        const remoteChanged =
+            !sameValue(
+                r,
+                b,
+            );
+
+        if (
+            localChanged &&
+            !remoteChanged
+        ) {
+            mergedMetadata[key] =
+                clone(l);
+        } else if (
+            localChanged &&
+            remoteChanged &&
+            !sameValue(
+                l,
+                r,
+            )
+        ) {
+            conflicts.push({
+                type:
+                    'metadata_conflict',
+
+                key,
+
+                policy:
+                    'remote_wins',
+            });
+        }
     }
+
+    return {
+        snapshot: {
+            chat: [
+                clone(
+                    remoteChat[0] ||
+                        {
+                            chat_metadata:
+                                {},
+                        },
+                ),
+                ...resultMessages,
+            ],
+
+            chatMetadata:
+                mergedMetadata,
+        },
+
+        conflicts,
+    };
 }
 
-async function finishGeneration(
-    status,
+
+/* -------------------------------------------------------------------------- */
+/* Pending queue                                                              */
+/* -------------------------------------------------------------------------- */
+
+const COALESCIBLE_TYPES =
+    new Set([
+        'message_sent',
+        'message_received',
+        'message_edited',
+        'message_updated',
+        'message_swiped',
+        'message_reasoning_edited',
+        'message_reasoning_deleted',
+        'stream_reasoning_done',
+        'tool_calls_performed',
+    ]);
+
+function pendingBytes(
+    operations,
+) {
+    return operations.reduce(
+        (
+            total,
+            operation,
+        ) =>
+            total +
+            JSON.stringify(
+                operation,
+            ).length,
+        0,
+    );
+}
+
+async function enqueueLocalMutation(
+    type,
+    payload = {},
 ) {
     if (
+        applyingRemoteDepth >
+            0 ||
+        !pluginAvailable ||
         !currentScope ||
-        !currentState?.generation ||
-        currentState.generation.ownerClientId !==
-            currentClientId ||
-        localGenerationClaimLost
+        !currentState ||
+        !getSettings().enabled
     ) {
         return;
     }
 
-    await waitForStreamIdle();
-
     /*
-     * Final persistence request before terminal state.
+     * A remote generation owner controls ordinary chat state until its terminal
+     * event. The non-owner must not manufacture conflicting writes.
      */
-    await persistCurrentChat(
-        'generation-terminal',
-    );
+    if (
+        currentState.generation &&
+        !isLocalGenerationOwner()
+    ) {
+        return;
+    }
 
-    const generation =
-        currentState.generation;
+    const saved =
+        await saveCurrentChat(
+            type,
+        );
+
+    if (
+        !saved
+    ) {
+        setStatus(
+            'Save pending',
+            'SillyTavern did not confirm the current local save',
+        );
+
+        return;
+    }
+
+    const migrated =
+        ensureMessageIds(
+            ctx.chat,
+        );
+
+    if (
+        migrated
+    ) {
+        const idsSaved =
+            await saveCurrentChat(
+                'stable-message-id-migration',
+            );
+
+        if (
+            !idsSaved
+        ) {
+            return;
+        }
+    }
 
     const snapshot =
-        makeSnapshot();
+        makeLocalSnapshot();
 
     if (!snapshot) {
         return;
     }
 
-    delete snapshot.idsChanged;
-
-    try {
-        const result =
-            await api('/event', {
-                method: 'POST',
-
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
-
-                    clientId:
-                        currentClientId,
-
-                    deviceId:
-                        currentDeviceId,
-
-                    scope:
-                        currentScope,
-
-                    opId:
-                        randomId(),
-
-                    type:
-                        'generation_terminal',
-
-                    baseRevision:
-                        currentState.serverRevision,
-
-                    generationId:
-                        generation.id,
-
-                    status,
-
-                    payload: {},
-
-                    snapshot,
-                }),
-            });
-
-        if (result.state) {
-            applyServerMeta(
-                result.state,
-            );
-
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    result.state.snapshot ||
-                    snapshot,
-                );
-
-            currentState.generation =
-                result.state.generation ||
-                null;
-        }
-
-        lastGenerationStatus =
-            status;
-
-        broadcastLocal({
-            kind: 'generation_terminal',
-            scope: currentScope,
-            status,
-            state: result.state,
-        });
-
-        setStatus(
-            'Synced',
-            `${status}; rev ${currentState.serverRevision}`,
+    let operations =
+        await dbGetOperations(
+            currentScope,
         );
-    } catch (error) {
-        if (
-            error.code === 'stale_revision' &&
-            error.state?.snapshot
-        ) {
-            currentState.serverRevision =
-                Number(
-                    error.state.revision,
-                ) || 0;
 
-            currentState.serverSeq =
-                Number(
-                    error.state.seq,
-                ) || 0;
+    const serialized =
+        JSON.stringify(
+            snapshot,
+        );
 
-            currentState.serverEpoch =
-                error.state.epoch ||
-                currentState.serverEpoch;
+    if (
+        serialized.length >
+            MAX_PENDING_BYTES
+    ) {
+        setStatus(
+            'Chat too large',
+            'Local synchronization snapshot exceeds the client queue limit',
+        );
 
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    error.state.snapshot,
-                );
-
-            currentState.generation =
-                error.state.generation ||
-                null;
-
-            if (
-                currentState.generation?.ownerClientId ===
-                currentClientId
-            ) {
-                setTimeout(
-                    () => void finishGeneration(status),
-                    0,
-                );
-            }
-        } else {
-            warn(
-                'Generation terminal update failed',
-                error,
-            );
-        }
-    } finally {
-        generationCandidate =
-            null;
-
-        localStopIssued =
-            false;
+        return;
     }
+
+    if (
+        COALESCIBLE_TYPES.has(
+            type,
+        ) &&
+        operations.length
+    ) {
+        const last =
+            operations[
+                operations.length - 1
+            ];
+
+        if (
+            last.coalescible
+        ) {
+            await dbDeleteOperation(
+                last.opId,
+            );
+
+            operations =
+                operations.slice(
+                    0,
+                    -1,
+                );
+        }
+    }
+
+    if (
+        operations.length >=
+        MAX_LOCAL_QUEUE
+    ) {
+        setStatus(
+            'Sync queue full',
+            'Local changes are not being silently discarded',
+        );
+
+        return;
+    }
+
+    localSequence +=
+        1;
+
+    const operation = {
+        principalKey,
+
+        opId:
+            uuid(),
+
+        localSeq:
+            localSequence,
+
+        scope:
+            clone(
+                currentScope,
+            ),
+
+        type,
+
+        payload:
+            clone(
+                payload,
+            ),
+
+        snapshot:
+            clone(
+                snapshot,
+            ),
+
+        baseSnapshot:
+            clone(
+                currentState.serverSnapshot ||
+                    snapshot,
+            ),
+
+        baseRevision:
+            lastRevision,
+
+        coalescible:
+            COALESCIBLE_TYPES.has(
+                type,
+            ),
+    };
+
+    operations.push(
+        operation,
+    );
+
+    if (
+        pendingBytes(
+            operations,
+        ) >
+        MAX_PENDING_BYTES
+    ) {
+        setStatus(
+            'Sync queue full',
+            'Durable local queue limit reached',
+        );
+
+        return;
+    }
+
+    await dbPutOperation(
+        operation,
+    );
+
+    broadcastLocalChange(
+        type,
+    );
+
+    await drainPendingQueue();
 }
 
-async function requestRemoteStop(
-    retry = false,
+async function rebasePendingQueue(
+    remoteSnapshot,
+    remoteRevision,
+) {
+    const operations =
+        await dbGetOperations(
+            currentScope,
+        );
+
+    if (
+        !operations.length
+    ) {
+        return null;
+    }
+
+    let baseSnapshot =
+        clone(
+            remoteSnapshot,
+        );
+
+    let baseRevision =
+        Number(
+            remoteRevision,
+        ) || 0;
+
+    for (
+        const operation of
+            operations
+    ) {
+        const merged =
+            mergeSnapshots(
+                operation.baseSnapshot ||
+                    baseSnapshot,
+                operation.snapshot,
+                baseSnapshot,
+            );
+
+        operation.baseSnapshot =
+            clone(
+                baseSnapshot,
+            );
+
+        operation.baseRevision =
+            baseRevision;
+
+        operation.snapshot =
+            clone(
+                merged.snapshot,
+            );
+
+        baseSnapshot =
+            clone(
+                merged.snapshot,
+            );
+
+        /*
+         * The queue is submitted sequentially. Once this operation is accepted,
+         * the next one will be based on the next revision.
+         */
+        baseRevision +=
+            1;
+
+        await dbPutOperation(
+            operation,
+        );
+    }
+
+    return baseSnapshot;
+}
+
+async function sendPendingOperation(
+    operation,
 ) {
     if (
-        !currentState?.generation ||
-        !currentScope
+        !currentScope ||
+        !pluginAvailable ||
+        !sameScope(
+            currentScope,
+            operation.scope,
+        )
     ) {
         return false;
     }
 
-    const generationId =
-        currentState.generation.id;
-
     try {
         const result =
-            await api('/event', {
-                method: 'POST',
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
 
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
+                    body: {
+                        protocolVersion:
+                            PROTOCOL_VERSION,
 
-                    clientId:
-                        currentClientId,
+                        clientId,
 
-                    deviceId:
-                        currentDeviceId,
+                        deviceId,
 
-                    scope:
-                        currentScope,
+                        scope:
+                            operation.scope,
 
-                    opId:
-                        randomId(),
+                        opId:
+                            operation.opId,
 
-                    type:
-                        'generation_stop_request',
+                        type:
+                            operation.type,
 
-                    baseRevision:
-                        currentState.serverRevision,
+                        payload:
+                            operation.payload,
 
-                    generationId,
+                        snapshot:
+                            operation.snapshot,
 
-                    payload: {},
-                }),
-            });
+                        baseSnapshot:
+                            operation.baseSnapshot,
 
-        if (result.state) {
-            applyServerMeta(
+                        baseRevision:
+                            operation.baseRevision,
+                    },
+                },
+            );
+
+        if (
+            result.state
+        ) {
+            applyStateCursor(
                 result.state,
             );
+
+            currentState.serverSnapshot =
+                result.state.snapshot
+                    ? normalizeSnapshot(
+                        result.state
+                            .snapshot,
+                    )
+                    : currentState.serverSnapshot;
+
+            currentState.generation =
+                result.state.generation
+                    ? clone(
+                        result.state
+                            .generation,
+                    )
+                    : null;
         }
 
-        setStatus(
-            'Stop requested',
-            `generation ${generationId.slice(0, 8)}`,
+        await dbDeleteOperation(
+            operation.opId,
         );
+
+        await persistCursor();
 
         return true;
     } catch (error) {
         if (
-            error.code === 'stale_revision' &&
-            error.state
+            error.code ===
+                'st_not_persisted'
         ) {
-            applyServerMeta(
-                error.state,
+            await saveCurrentChat(
+                'pending-save-retry',
             );
 
-            if (
-                error.state.snapshot
-            ) {
-                await applyAuthoritativeSnapshot(
-                    error.state.snapshot,
-                    {
-                        serverState:
-                            error.state,
+            operation.snapshot =
+                makeLocalSnapshot();
 
+            operation.opId =
+                uuid();
+
+            await dbPutOperation(
+                operation,
+            );
+
+            return false;
+        }
+
+        if (
+            error.code ===
+            'stale_revision'
+        ) {
+            if (
+                error.state
+                    ?.snapshot
+            ) {
+                const remoteSnapshot =
+                    normalizeSnapshot(
+                        error.state
+                            .snapshot,
+                    );
+
+                const merged =
+                    mergeSnapshots(
+                        operation.baseSnapshot ||
+                            currentState.serverSnapshot ||
+                            remoteSnapshot,
+
+                        operation.snapshot,
+
+                        remoteSnapshot,
+                    );
+
+                applyStateCursor(
+                    error.state,
+                );
+
+                currentState.serverSnapshot =
+                    remoteSnapshot;
+
+                operation.baseSnapshot =
+                    clone(
+                        remoteSnapshot,
+                    );
+
+                operation.baseRevision =
+                    lastRevision;
+
+                operation.snapshot =
+                    clone(
+                        merged.snapshot,
+                    );
+
+                operation.opId =
+                    uuid();
+
+                await applySnapshotLocally(
+                    merged.snapshot,
+                    {
                         persist:
-                            false,
+                            true,
 
                         reason:
-                            'stop-request-resync',
+                            'stale-revision-rebase',
                     },
+                );
+
+                await dbPutOperation(
+                    operation,
+                );
+
+                return sendPendingOperation(
+                    operation,
                 );
             }
 
-            if (
-                currentState?.generation?.id ===
-                    generationId &&
-                !retry
-            ) {
-                return requestRemoteStop(
-                    true,
-                );
-            }
+            await resyncCurrentScope(
+                'stale revision',
+            );
+
+            return false;
+        }
+
+        if (
+            error.code ===
+            'generation_lock'
+        ) {
+            return false;
+        }
+
+        if (
+            [
+                'not_member',
+                'membership_expired',
+                'scope_not_found',
+            ].includes(
+                error.code,
+            )
+        ) {
+            await reconnectScope(
+                'membership recovery',
+            );
+
+            return false;
         }
 
         warn(
-            'Remote stop request failed',
+            'Pending operation failed',
             error,
         );
 
@@ -2594,329 +3142,786 @@ async function requestRemoteStop(
     }
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* SSE event handling                                                          */
-/* -------------------------------------------------------------------------- */
-
-async function handleSseEvent(data) {
-    if (!data) {
-        return;
+async function drainPendingQueue() {
+    if (
+        queueDrainPromise
+    ) {
+        return queueDrainPromise;
     }
 
-    if (
-        data.protocolVersion &&
-        data.protocolVersion !==
-            PROTOCOL_VERSION
-    ) {
-        setStatus(
-            'Protocol mismatch',
-            `server=${data.protocolVersion}, client=${PROTOCOL_VERSION}`,
-        );
-
-        closeSse();
-        return;
-    }
-
-    if (
-        data.type === 'shutdown'
-    ) {
-        closeSse();
-        scheduleReconnect(
-            'server shutdown',
-        );
-        return;
-    }
-
-    if (
-        data.type ===
-            'generation_stop_requested'
-    ) {
-        applyServerMeta(
-            data.state || {},
-        );
-
-        if (
-            currentState?.generation?.ownerClientId ===
-                currentClientId &&
-            currentState.generation.id ===
-                data.generation?.id
-        ) {
+    queueDrainPromise =
+        (async () => {
             try {
-                ctx?.stopGeneration?.();
+                const operations =
+                    await dbGetOperations(
+                        currentScope,
+                    );
+
+                for (
+                    const operation of
+                        operations
+                ) {
+                    const expectedEpoch =
+                        currentEpoch();
+
+                    const accepted =
+                        await sendPendingOperation(
+                            operation,
+                        );
+
+                    if (
+                        expectedEpoch !==
+                        currentEpoch()
+                    ) {
+                        return;
+                    }
+
+                    if (
+                        !accepted
+                    ) {
+                        break;
+                    }
+                }
+
+                const remaining =
+                    await dbGetOperations(
+                        currentScope,
+                    );
+
+                if (
+                    !remaining.length
+                ) {
+                    currentState.pendingCount =
+                        0;
+                } else {
+                    currentState.pendingCount =
+                        remaining.length;
+                }
+            } finally {
+                queueDrainPromise =
+                    null;
+            }
+        })();
+
+    return queueDrainPromise;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Resync                                                                     */
+/* -------------------------------------------------------------------------- */
+
+async function resyncCurrentScope(
+    reason = 'manual',
+) {
+    if (
+        !currentScope ||
+        !pluginAvailable
+    ) {
+        return false;
+    }
+
+    if (
+        resyncPromise
+    ) {
+        return resyncPromise;
+    }
+
+    const expectedEpoch =
+        currentEpoch();
+
+    resyncPromise =
+        (async () => {
+            const previousEventSource =
+                eventSource;
+
+            closeSse();
+
+            try {
+                setStatus(
+                    'Resyncing',
+                    reason,
+                );
+
+                const result =
+                    await api(
+                        '/state',
+                        {
+                            method:
+                                'POST',
+
+                            body: {
+                                protocolVersion:
+                                    PROTOCOL_VERSION,
+
+                                clientId,
+
+                                deviceId,
+
+                                scope:
+                                    currentScope,
+                            },
+                        },
+                    );
+
+                if (
+                    expectedEpoch !==
+                    currentEpoch()
+                ) {
+                    return false;
+                }
+
+                const serverState =
+                    result.state;
+
+                applyStateCursor(
+                    serverState,
+                );
+
+                currentState =
+                    currentState ||
+                    {};
+
+                currentState.generation =
+                    serverState.generation
+                        ? clone(
+                            serverState.generation,
+                        )
+                        : null;
+
+                const serverSnapshot =
+                    serverState.snapshot
+                        ? normalizeSnapshot(
+                            serverState.snapshot,
+                        )
+                        : null;
+
+                currentState.serverSnapshot =
+                    serverSnapshot;
+
+                const pending =
+                    await dbGetOperations(
+                        currentScope,
+                    );
+
+                currentState.pendingCount =
+                    pending.length;
+
+                if (
+                    pending.length
+                ) {
+                    /*
+                     * Preserve the local pending intent, rebase it against the
+                     * authoritative server state, then save the resulting local
+                     * state through ST.
+                     */
+                    const rebased =
+                        await rebasePendingQueue(
+                            serverSnapshot,
+                            lastRevision,
+                        );
+
+                    if (
+                        rebased
+                    ) {
+                        await applySnapshotLocally(
+                            rebased,
+                            {
+                                persist:
+                                    true,
+
+                                reason:
+                                    'pending-rebase',
+                            },
+                        );
+                    }
+
+                    await drainPendingQueue();
+                } else if (
+                    serverSnapshot
+                ) {
+                    /*
+                     * With no pending operation, determine whether the local
+                     * browser state is simply stale or requires an explicit
+                     * out-of-band conflict choice.
+                     */
+                    const localSnapshot =
+                        makeLocalSnapshot();
+
+                    const localHash =
+                        localSnapshot
+                            ? await sha256(
+                                localSnapshot,
+                            )
+                            : null;
+
+                    const priorCursor =
+                        await dbGetMeta(
+                            stableStringify(
+                                currentScope,
+                            ),
+                        );
+
+                    const serverWon =
+                        Boolean(
+                            priorCursor?.epoch &&
+                            priorCursor.epoch ===
+                                serverState.epoch &&
+                            Number(
+                                priorCursor.revision,
+                            ) <
+                                Number(
+                                    serverState.revision,
+                                ),
+                        );
+
+                    if (
+                        localHash !==
+                        serverState.snapshotHash
+                    ) {
+                        if (
+                            serverWon
+                        ) {
+                            await applySnapshotLocally(
+                                serverSnapshot,
+                                {
+                                    persist:
+                                        true,
+
+                                    reason:
+                                        'server-newer',
+                                },
+                            );
+                        } else {
+                            showDivergenceChoice(
+                                localSnapshot,
+                                serverSnapshot,
+                            );
+                        }
+                    }
+                }
+
+                await persistCursor();
+
+                /*
+                 * Reconnect with an explicit fresh cursor now that state and
+                 * revision are known.
+                 */
+                connectSse();
+
+                setStatus(
+                    'Live',
+                    `revision ${lastRevision}`,
+                );
+
+                return true;
             } catch (error) {
                 warn(
-                    'Failed to execute remote stop',
+                    'Resync failed',
                     error,
                 );
-            }
-        }
 
-        setStatus(
-            'Stop requested',
-            'owner is stopping generation',
-        );
-
-        return;
-    }
-
-    if (
-        data.type ===
-            'generation_claimed'
-    ) {
-        applyServerMeta(
-            data.state || {},
-        );
-
-        if (
-            data.generation?.ownerClientId !==
-                currentClientId
-        ) {
-            if (
-                generationCandidate &&
-                !localGenerationClaimLost
-            ) {
-                localGenerationClaimLost =
-                    true;
-
-                try {
-                    ctx?.stopGeneration?.();
-                } catch {
-                    // ignored
+                if (
+                    previousEventSource
+                ) {
+                    // intentionally not reused; a fresh connection is safer
                 }
+
+                scheduleReconnect(
+                    error.code ||
+                        'resync-failed',
+                );
+
+                return false;
+            } finally {
+                resyncPromise =
+                    null;
             }
+        })();
 
-            setStatus(
-                'Remote generation',
-                'another client is generating',
-            );
-        }
+    return resyncPromise;
+}
 
-        return;
+function scheduleResync(
+    reason,
+) {
+    if (
+        resyncTimer
+    ) {
+        clearTimeout(
+            resyncTimer,
+        );
     }
 
-    if (
-        data.type ===
-            'generation_abandoned'
-    ) {
-        applyServerMeta(
-            data.state || {},
-        );
+    resyncTimer =
+        setTimeout(
+            () => {
+                resyncTimer =
+                    null;
 
-        currentState.generation =
-            null;
+                void resyncCurrentScope(
+                    reason,
+                );
+            },
+            RESYNC_DELAY_MS,
+        );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Divergence choice                                                          */
+/* -------------------------------------------------------------------------- */
+
+function showDivergenceChoice(
+    localSnapshot,
+    serverSnapshot,
+) {
+    setStatus(
+        'Sync conflict',
+        'The browser and server contain different state',
+        [
+            {
+                label:
+                    'Use server',
+
+                run:
+                    async () => {
+                        await applySnapshotLocally(
+                            serverSnapshot,
+                            {
+                                persist:
+                                    true,
+
+                                reason:
+                                    'user-chose-server',
+                            },
+                        );
+                    },
+            },
+            {
+                label:
+                    'Use current chat',
+
+                run:
+                    async () => {
+                        await reconcileLocalToServer(
+                            localSnapshot,
+                        );
+                    },
+            },
+        ],
+    );
+}
+
+async function reconcileLocalToServer(
+    snapshot,
+) {
+    try {
+        const result =
+            await api(
+                '/event',
+                {
+                    method:
+                        'POST',
+
+                    body: {
+                        protocolVersion:
+                            PROTOCOL_VERSION,
+
+                        clientId,
+
+                        deviceId,
+
+                        scope:
+                            currentScope,
+
+                        opId:
+                            uuid(),
+
+                        type:
+                            'reconcile_local',
+
+                        baseRevision:
+                            lastRevision,
+
+                        snapshot,
+                    },
+                },
+            );
 
         if (
-            generationCandidate &&
-            !localGenerationClaimLost
+            result.state
         ) {
-            localGenerationClaimLost =
-                true;
+            applyStateCursor(
+                result.state,
+            );
 
-            try {
-                ctx?.stopGeneration?.();
-            } catch {
-                // ignored
-            }
+            currentState.serverSnapshot =
+                result.state.snapshot
+                    ? normalizeSnapshot(
+                        result.state
+                            .snapshot,
+                    )
+                    : currentState
+                        .serverSnapshot;
         }
 
         setStatus(
-            'Generation released',
-            'owner lost/lease expired',
+            'Reconciled',
+            'Current SillyTavern chat is now authoritative',
+        );
+    } catch (error) {
+        warn(
+            'Local reconciliation failed',
+            error,
         );
 
-        return;
+        await resyncCurrentScope(
+            'local reconciliation failed',
+        );
     }
+}
 
-    if (
-        data.type ===
-            'generation_terminal'
-    ) {
-        applyServerMeta(
-            data.state || {},
-        );
 
-        if (data.snapshot) {
-            await applyAuthoritativeSnapshot(
-                data.snapshot,
+/* -------------------------------------------------------------------------- */
+/* Plugin dependency                                                           */
+/* -------------------------------------------------------------------------- */
+
+async function checkPlugin() {
+    try {
+        const result =
+            await api(
+                '/health',
                 {
-                    serverState:
-                        data.state,
+                    method:
+                        'GET',
+                },
+            );
 
-                    persist:
-                        true,
-
-                    reason:
-                        `remote ${
-                            data.payload?.status
-                            || 'generation terminal'
-                        }`,
+        if (
+            Number(
+                result.protocolVersion,
+            ) !==
+            PROTOCOL_VERSION
+        ) {
+            throw Object.assign(
+                new Error(
+                    'Protocol mismatch',
+                ),
+                {
+                    code:
+                        'protocol_mismatch',
                 },
             );
         }
 
-        currentState.generation =
+        principalKey =
+            result.userKey ||
             null;
 
-        return;
-    }
+        pluginAvailable =
+            true;
 
-    if (data.state) {
-        applyServerMeta(
-            data.state,
+        return result;
+    } catch (error) {
+        pluginAvailable =
+            false;
+
+        principalKey =
+            null;
+
+        closeSse();
+
+        clearHeartbeat();
+
+        setStatus(
+            error.code ===
+                'protocol_mismatch'
+                ? 'Plugin incompatible'
+                : 'Server plugin required',
+
+            error.code ===
+                'protocol_mismatch'
+                ? `Expected protocol ${PROTOCOL_VERSION}`
+                : 'Multi-Client Sync server plugin is required',
         );
+
+        schedulePluginRetry();
+
+        return null;
     }
-
-    const incomingSnapshot =
-        data.snapshot ||
-        data.event?.snapshot;
-
-    if (!incomingSnapshot) {
-        const incomingType =
-            data.type ||
-            data.event?.type ||
-            'remote update';
-
-        if (
-            incomingType ===
-                'generation_stream'
-        ) {
-            try {
-                const state =
-                    await api(
-                        `/state?clientId=${
-                            encodeURIComponent(
-                                currentClientId,
-                            )
-                        }&scope=${
-                            encodeURIComponent(
-                                JSON.stringify(
-                                    currentScope,
-                                ),
-                            )
-                        }`,
-                    );
-
-                if (
-                    state.state?.snapshot
-                ) {
-                    await applyAuthoritativeSnapshot(
-                        state.state.snapshot,
-                        {
-                            serverState:
-                                state.state,
-
-                            persist:
-                                !state.state.generation,
-
-                            reason:
-                                'stream-recovery',
-                        },
-                    );
-                }
-            } catch (error) {
-                warn(
-                    'Stream recovery state fetch failed',
-                    error,
-                );
-            }
-        }
-
-        return;
-    }
-
-    const sourceClientId =
-        data.sourceClientId ??
-        data.event?.sourceClientId;
-
-    if (
-        sourceClientId ===
-        currentClientId
-    ) {
-        currentState.serverSnapshot =
-            normalizeSnapshot(
-                incomingSnapshot,
-            );
-
-        return;
-    }
-
-    if (
-        !currentScope ||
-        !currentState
-    ) {
-        return;
-    }
-
-    if (
-        !sameScope(
-            incomingSnapshot,
-            currentScope,
-        ) &&
-        incomingSnapshot.scopeType
-    ) {
-        return;
-    }
-
-    const incomingType =
-        data.type ||
-        data.event?.type ||
-        'remote update';
-
-    const isStream =
-        incomingType ===
-            'generation_stream';
-
-    await applyAuthoritativeSnapshot(
-        incomingSnapshot,
-        {
-            serverState:
-                data.state,
-
-            persist:
-                !isStream,
-
-            reason:
-                incomingType,
-        },
-    );
 }
 
-function connectSse() {
-    closeSse();
-
+function schedulePluginRetry() {
     if (
-        !currentScope ||
-        destroyed ||
+        pluginRetryTimer ||
+        stopping ||
         !getSettings().enabled
     ) {
         return;
     }
 
+    pluginRetryTimer =
+        setTimeout(
+            async () => {
+                pluginRetryTimer =
+                    null;
+
+                if (
+                    await checkPlugin()
+                ) {
+                    const scope =
+                        getCurrentScope();
+
+                    if (
+                        scope
+                    ) {
+                        await switchScope(
+                            scope,
+                        );
+                    }
+                }
+            },
+            PLUGIN_RETRY_MS,
+        );
+}
+
+async function ensureConnected() {
+    if (
+        stopping ||
+        !getSettings().enabled
+    ) {
+        return false;
+    }
+
+    if (
+        pluginAvailable &&
+        currentScope &&
+        currentState
+    ) {
+        return true;
+    }
+
+    const plugin =
+        await checkPlugin();
+
+    if (
+        !plugin
+    ) {
+        return false;
+    }
+
     const scope =
-        encodeURIComponent(
-            JSON.stringify(
-                currentScope,
-            ),
+        getCurrentScope();
+
+    if (
+        !scope
+    ) {
+        return false;
+    }
+
+    if (
+        !sameScope(
+            currentScope,
+            scope,
+        ) ||
+        !currentState
+    ) {
+        await switchScope(
+            scope,
+        );
+    }
+
+    return Boolean(
+        pluginAvailable &&
+        currentScope &&
+        currentState,
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Heartbeat                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function clearHeartbeat() {
+    if (
+        heartbeatTimer
+    ) {
+        clearInterval(
+            heartbeatTimer,
         );
 
-    const url =
+        heartbeatTimer =
+            null;
+    }
+}
+
+function startHeartbeat() {
+    clearHeartbeat();
+
+    heartbeatTimer =
+        setInterval(
+            async () => {
+                if (
+                    !currentScope ||
+                    !pluginAvailable ||
+                    stopping
+                ) {
+                    return;
+                }
+
+                try {
+                    const result =
+                        await api(
+                            '/heartbeat',
+                            {
+                                method:
+                                    'POST',
+
+                                body: {
+                                    protocolVersion:
+                                        PROTOCOL_VERSION,
+
+                                    clientId,
+
+                                    deviceId,
+
+                                    scope:
+                                        currentScope,
+
+                                    generationId:
+                                        isLocalGenerationOwner()
+                                            ? currentState
+                                                .generation
+                                                .id
+                                            : null,
+                                },
+                            },
+                        );
+
+                    if (
+                        result.subscriptionToken
+                    ) {
+                        subscriptionToken =
+                            result.subscriptionToken;
+                    }
+
+                    if (
+                        result.state
+                    ) {
+                        applyStateCursor(
+                            result.state,
+                        );
+
+                        currentState.generation =
+                            result.state
+                                .generation
+                                ? clone(
+                                    result.state
+                                        .generation,
+                                )
+                                : null;
+
+                        /*
+                         * If the server says the generation disappeared while
+                         * this client still thinks ST is generating, fence it.
+                         */
+                        if (
+                            localGenerationId &&
+                            !currentState.generation
+                        ) {
+                            localGenerationLost =
+                                true;
+
+                            try {
+                                ctx.stopGeneration?.();
+                            } catch {
+                                // ignored
+                            }
+                        }
+                    }
+
+                    await persistCursor();
+                } catch (error) {
+                    if (
+                        [
+                            'not_member',
+                            'membership_expired',
+                            'scope_not_found',
+                        ].includes(
+                            error.code,
+                        )
+                    ) {
+                        await reconnectScope(
+                            'heartbeat recovery',
+                        );
+                    }
+                }
+            },
+            HEARTBEAT_MS,
+        );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* SSE                                                                         */
+/* -------------------------------------------------------------------------- */
+
+function closeSse() {
+    if (
+        eventSource
+    ) {
+        try {
+            eventSource.close();
+        } catch {
+            // ignored
+        }
+    }
+
+    eventSource =
+        null;
+}
+
+function connectSse() {
+    if (
+        stopping ||
+        !pluginAvailable ||
+        !currentScope ||
+        !subscriptionToken
+    ) {
+        return;
+    }
+
+    closeSse();
+
+    let url =
         `${location.origin}${PLUGIN_BASE}/events`
-        + `?clientId=${encodeURIComponent(currentClientId)}`
-        + `&deviceId=${encodeURIComponent(currentDeviceId)}`
-        + `&scope=${scope}`;
+        + `?token=${encodeURIComponent(
+            subscriptionToken,
+        )}`;
+
+    if (
+        lastEventId
+    ) {
+        url +=
+            `&since=${encodeURIComponent(
+                lastEventId,
+            )}`;
+    }
 
     try {
         eventSource =
             new EventSource(
                 url,
                 {
-                    withCredentials: true,
+                    withCredentials:
+                        true,
                 },
             );
     } catch (error) {
         warn(
-            'EventSource creation failed',
+            'Could not create EventSource',
             error,
         );
 
@@ -2937,29 +3942,100 @@ function connectSse() {
                     );
 
                 if (
-                    data.epoch &&
-                    currentState.serverEpoch &&
-                    data.epoch !==
-                        currentState.serverEpoch
+                    data.protocolVersion !==
+                    PROTOCOL_VERSION
                 ) {
-                    void resyncCurrentScope(
-                        'server epoch changed',
+                    pluginAvailable =
+                        false;
+
+                    closeSse();
+
+                    setStatus(
+                        'Plugin incompatible',
+                        `Server protocol ${data.protocolVersion}`,
                     );
+
+                    schedulePluginRetry();
+
+                    return;
                 }
 
-                applyServerMeta(
-                    data,
+                if (
+                    lastEpoch &&
+                    data.epoch &&
+                    lastEpoch !==
+                        data.epoch
+                ) {
+                    /*
+                     * Server restart.
+                     */
+                    lastEventId =
+                        null;
+
+                    lastSeq =
+                        0;
+
+                    lastRevision =
+                        0;
+                }
+
+                /*
+                 * If we have an explicit cursor from persistence, preserve it
+                 * so historical replay can happen. Otherwise establish the
+                 * current cursor from hello.
+                 */
+                if (
+                    !lastEventId
+                ) {
+                    lastEpoch =
+                        data.epoch;
+
+                    lastSeq =
+                        Number(
+                            data.seq,
+                        ) || 0;
+
+                    lastRevision =
+                        Number(
+                            data.revision,
+                        ) || 0;
+
+                    lastEventId =
+                        data.lastEventId ||
+                        (
+                            lastEpoch &&
+                            lastSeq
+                                ? `${lastEpoch}:${lastSeq}`
+                                : null
+                        );
+                } else {
+                    lastEpoch =
+                        data.epoch;
+                }
+
+                if (
+                    currentState
+                ) {
+                    currentState.generation =
+                        data.generation
+                            ? clone(
+                                data.generation,
+                            )
+                            : currentState
+                                .generation;
+                }
+
+                void persistCursor();
+
+                setStatus(
+                    'Live',
+                    `revision ${lastRevision}`,
                 );
 
                 reconnectAttempt =
                     0;
-
-                setStatus(
-                    'Live',
-                    `rev ${currentState.serverRevision}`,
-                );
             } catch (error) {
-                log(
+                warn(
                     'Invalid SSE hello',
                     error,
                 );
@@ -2968,49 +4044,57 @@ function connectSse() {
     );
 
     eventSource.addEventListener(
-        'sync',
+        'replay',
         event => {
-            try {
-                const data =
-                    JSON.parse(
-                        event.data,
-                    );
+            void handleReplayEvent(
+                event,
+            );
+        },
+    );
 
-                void handleSseEvent(
-                    data,
-                );
-            } catch (error) {
-                warn(
-                    'Invalid SSE sync event',
-                    error,
-                );
-            }
+    eventSource.addEventListener(
+        'replay_complete',
+        () => {
+            void resyncCurrentScope(
+                'replay complete',
+            );
         },
     );
 
     eventSource.addEventListener(
         'resync_required',
         event => {
+            let reason =
+                'server requested resync';
+
             try {
                 const data =
                     JSON.parse(
                         event.data,
                     );
 
-                void resyncCurrentScope(
+                reason =
                     data.reason ||
-                    'server requested resync',
-                );
-            } catch (error) {
-                warn(
-                    'Invalid SSE resync event',
-                    error,
-                );
-
-                void resyncCurrentScope(
-                    'malformed resync event',
-                );
+                    reason;
+            } catch {
+                // ignored
             }
+
+            lastEventId =
+                null;
+
+            void resyncCurrentScope(
+                reason,
+            );
+        },
+    );
+
+    eventSource.addEventListener(
+        'sync',
+        event => {
+            void handleLiveEvent(
+                event,
+            );
         },
     );
 
@@ -3019,352 +4103,740 @@ function connectSse() {
         () => {
             closeSse();
 
+            setStatus(
+                'Server restarting',
+                'Synchronization will reconnect automatically',
+            );
+
             scheduleReconnect(
                 'server shutdown',
             );
         },
     );
 
-    eventSource.onerror = () => {
-        closeSse();
-
-        scheduleReconnect(
-            'SSE disconnected',
-        );
-    };
+    eventSource.onerror =
+        () => {
+            scheduleResync(
+                'SSE error',
+            );
+        };
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* Server state/reconnect                                                       */
-/* -------------------------------------------------------------------------- */
-
-async function resyncCurrentScope(
-    reason = 'manual',
+async function handleReplayEvent(
+    event,
 ) {
-    if (
-        !currentScope ||
-        !currentState
-    ) {
-        return;
-    }
-
     try {
-        const response =
-            await api(
-                `/state?clientId=${
-                    encodeURIComponent(
-                        currentClientId,
-                    )
-                }&scope=${
-                    encodeURIComponent(
-                        JSON.stringify(
-                            currentScope,
-                        ),
-                    )
-                }`,
+        const data =
+            JSON.parse(
+                event.data,
             );
 
-        if (response.state) {
-            applyServerMeta(
-                response.state,
+        if (
+            lastEpoch &&
+            data.epoch !==
+                lastEpoch
+        ) {
+            await resyncCurrentScope(
+                'replay epoch mismatch',
             );
 
-            if (
-                response.state.snapshot
-            ) {
-                await applyAuthoritativeSnapshot(
-                    response.state.snapshot,
-                    {
-                        serverState:
-                            response.state,
-
-                        reason,
-                    },
-                );
-            }
+            return;
         }
 
-        const pending =
-            await loadPending(
-                currentScope,
+        const seq =
+            Number(
+                data.seq,
             );
 
-        currentState.pending =
-            pending;
-
-        if (pending) {
-            await sendPending(
-                pending,
+        if (
+            !Number.isSafeInteger(
+                seq,
+            )
+        ) {
+            await resyncCurrentScope(
+                'invalid replay sequence',
             );
+
+            return;
         }
 
-        connectSse();
+        if (
+            lastSeq > 0 &&
+            seq >
+                lastSeq + 1
+        ) {
+            await resyncCurrentScope(
+                'replay sequence gap',
+            );
 
-        reconnectAttempt =
-            0;
+            return;
+        }
+
+        if (
+            seq <=
+            lastSeq
+        ) {
+            return;
+        }
+
+        lastSeq =
+            seq;
+
+        lastRevision =
+            Number(
+                data.revision,
+            );
+
+        lastEpoch =
+            data.epoch;
+
+        lastEventId =
+            data.id ||
+            `${lastEpoch}:${lastSeq}`;
+
+        await persistCursor();
     } catch (error) {
         warn(
-            'Resync failed',
+            'Replay event processing failed',
             error,
         );
 
-        scheduleReconnect(
-            error.code ||
-            'resync_failed',
+        await resyncCurrentScope(
+            'replay parse failure',
         );
     }
 }
 
-async function joinAndConnect(
-    scope,
-    {
-        reconnect = false,
-    } = {},
+
+/* -------------------------------------------------------------------------- */
+/* Live event handling                                                        */
+/* -------------------------------------------------------------------------- */
+
+async function handleLiveEvent(
+    event,
 ) {
-    if (
-        !scope ||
-        destroyed ||
-        !getSettings().enabled
-    ) {
-        return;
-    }
+    const expectedEpoch =
+        currentEpoch();
 
-    const thisEpoch =
-        scopeEpoch;
+    try {
+        const data =
+            JSON.parse(
+                event.data,
+            );
 
-    const response =
-        await api('/join', {
-            method: 'POST',
+        if (
+            expectedEpoch !==
+                currentEpoch()
+        ) {
+            return;
+        }
 
-            body: JSON.stringify({
-                protocolVersion:
-                    PROTOCOL_VERSION,
+        if (
+            data.epoch !==
+            lastEpoch &&
+            lastEpoch
+        ) {
+            await resyncCurrentScope(
+                'live epoch mismatch',
+            );
 
-                clientId:
-                    currentClientId,
+            return;
+        }
 
-                deviceId:
-                    currentDeviceId,
+        const seq =
+            Number(
+                data.seq,
+            );
 
-                scope,
-            }),
-        });
+        const revision =
+            Number(
+                data.revision ||
+                data.state?.revision,
+            );
 
-    if (
-        thisEpoch !== scopeEpoch ||
-        !sameScope(
-            scope,
-            currentScope,
-        )
-    ) {
-        return;
-    }
+        const baseRevision =
+            Number(
+                data.baseRevision,
+            );
 
-    const serverState =
-        response.state;
+        if (
+            !Number.isSafeInteger(
+                seq,
+            ) ||
+            !Number.isSafeInteger(
+                revision,
+            )
+        ) {
+            await resyncCurrentScope(
+                'invalid live event sequence',
+            );
 
-    if (!currentState) {
-        currentState = {
-            serverRevision:
-                Number(
-                    serverState?.revision,
-                ) || 0,
+            return;
+        }
 
-            serverSeq:
-                Number(
-                    serverState?.seq,
-                ) || 0,
+        /*
+         * Ignore duplicates.
+         */
+        if (
+            seq <=
+            lastSeq
+        ) {
+            return;
+        }
 
-            serverEpoch:
-                serverState?.epoch ||
-                null,
+        /*
+         * Require exact contiguous ordering.
+         */
+        if (
+            lastSeq > 0 &&
+            seq !==
+                lastSeq + 1
+        ) {
+            await resyncCurrentScope(
+                'live sequence gap',
+            );
 
-            serverSnapshot:
-                serverState?.snapshot
-                    ? normalizeSnapshot(
-                        serverState.snapshot,
-                    )
-                    : null,
+            return;
+        }
 
-            snapshotHash:
-                serverState?.snapshotHash
-                || null,
+        /*
+         * Every accepted mutation advances revision by one.
+         */
+        if (
+            lastRevision > 0 &&
+            (
+                baseRevision !==
+                lastRevision ||
+                revision !==
+                lastRevision + 1
+            )
+        ) {
+            await resyncCurrentScope(
+                'live revision conflict',
+            );
 
-            generation:
-                serverState?.generation
-                    ? clone(
-                        serverState.generation,
-                    )
-                    : null,
+            return;
+        }
 
-            pending:
-                null,
+        const sourceClientId =
+            data.sourceClientId;
 
-            suppressLocalEvents:
-                false,
+        const isLocalSource =
+            sourceClientId ===
+            clientId;
 
-            conflictCount:
-                0,
-        };
-    } else {
-        applyServerMeta(
-            serverState || {},
+        const isStream =
+            data.type ===
+            'generation_stream';
+
+        if (
+            data.state
+        ) {
+            applyStateCursor(
+                data.state,
+            );
+        }
+
+        if (
+            isLocalSource
+        ) {
+            /*
+             * We already have our own local state. The accepted server event
+             * becomes the new authoritative server base.
+             */
+            const localSnapshot =
+                makeLocalSnapshot();
+
+            if (
+                localSnapshot
+            ) {
+                currentState.serverSnapshot =
+                    clone(
+                        localSnapshot,
+                    );
+            }
+
+            if (
+                data.state
+            ) {
+                currentState.generation =
+                    data.state
+                        .generation
+                        ? clone(
+                            data.state
+                                .generation,
+                        )
+                        : null;
+            }
+        } else {
+            const pending =
+                await dbGetOperations(
+                    currentScope,
+                );
+
+            if (
+                pending.length
+            ) {
+                /*
+                 * Remote authority moved forward while this client has local
+                 * pending work. Preserve local intent, rebase it, then retry.
+                 */
+                if (
+                    data.patch?.kind ===
+                        'full'
+                ) {
+                    const remoteSnapshot =
+                        normalizeSnapshot(
+                            data.patch
+                                .snapshot,
+                        );
+
+                    currentState.serverSnapshot =
+                        remoteSnapshot;
+
+                    const rebased =
+                        await rebasePendingQueue(
+                            remoteSnapshot,
+                            revision,
+                        );
+
+                    if (
+                        rebased
+                    ) {
+                        await applySnapshotLocally(
+                            rebased,
+                            {
+                                persist:
+                                    true,
+
+                                reason:
+                                    'remote-with-pending',
+                            },
+                        );
+                    }
+
+                    void drainPendingQueue();
+                } else {
+                    await resyncCurrentScope(
+                        'remote event with pending operations',
+                    );
+
+                    return;
+                }
+            } else if (
+                data.patch
+            ) {
+                const patch =
+                    data.patch;
+
+                if (
+                    patch.kind ===
+                    'full'
+                ) {
+                    currentState.serverSnapshot =
+                        normalizeSnapshot(
+                            patch.snapshot,
+                        );
+
+                    await applySnapshotLocally(
+                        patch.snapshot,
+                        {
+                            persist:
+                                !isStream,
+
+                            reason:
+                                data.type,
+                        },
+                    );
+                } else {
+                    currentState.serverSnapshot =
+                        applyPatchToSnapshot(
+                            currentState.serverSnapshot,
+                            patch,
+                        );
+
+                    await applyPatchLocally(
+                        patch,
+                        {
+                            persist:
+                                !isStream,
+
+                            reason:
+                                data.type,
+                        },
+                    );
+                }
+            }
+        }
+
+        /*
+         * Generation control is handled separately.
+         */
+        await handleGenerationEvent(
+            data,
         );
 
+        lastSeq =
+            seq;
+
+        lastRevision =
+            revision;
+
+        lastEpoch =
+            data.epoch ||
+            lastEpoch;
+
+        lastEventId =
+            data.id ||
+            `${lastEpoch}:${lastSeq}`;
+
+        await persistCursor();
+
         if (
-            serverState?.snapshot
+            data.state
+                ?.generation
         ) {
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    serverState.snapshot,
+            currentState.generation =
+                clone(
+                    data.state
+                        .generation,
+                );
+        } else if (
+            [
+                'generation_terminal',
+                'generation_abandoned',
+            ].includes(
+                data.type,
+            )
+        ) {
+            currentState.generation =
+                null;
+        }
+
+        if (
+            !data.state
+                ?.generation &&
+            !isLocalGenerationOwner()
+        ) {
+            setStatus(
+                'Synced',
+                `revision ${lastRevision}`,
+            );
+        }
+    } catch (error) {
+        warn(
+            'Live synchronization event failed',
+            error,
+        );
+
+        await resyncCurrentScope(
+            'live event failure',
+        );
+    }
+}
+
+function applyPatchToSnapshot(
+    current,
+    patch,
+) {
+    if (
+        !current
+    ) {
+        return null;
+    }
+
+    const snapshot =
+        clone(current);
+
+    if (
+        patch.kind ===
+        'append'
+    ) {
+        snapshot.chat.splice(
+            Number(
+                patch.startIndex,
+            ),
+            0,
+            ...(
+                patch.messages ||
+                []
+            ).map(
+                clone,
+            ),
+        );
+    }
+
+    if (
+        patch.kind ===
+        'patch'
+    ) {
+        for (
+            const change of
+                patch.changes ||
+                []
+        ) {
+            const index =
+                Number(
+                    change.index,
+                );
+
+            if (
+                Number.isInteger(
+                    index,
+                ) &&
+                index >= 1
+            ) {
+                snapshot.chat[index] =
+                    clone(
+                        change.message,
+                    );
+            }
+        }
+    }
+
+    if (
+        patch.chatMetadata
+    ) {
+        snapshot.chatMetadata =
+            clone(
+                patch.chatMetadata,
+            );
+
+        if (
+            snapshot.chat[0]
+        ) {
+            snapshot.chat[0]
+                .chat_metadata =
+                clone(
+                    patch.chatMetadata,
                 );
         }
     }
 
-    /*
-     * If the server already has canonical state, use it on initial join unless
-     * there is a durable local pending mutation.
-     */
-    if (serverState?.snapshot) {
-        const localSnapshot =
-            makeSnapshot();
+    return snapshot;
+}
 
-        if (
-            !currentState.serverSnapshot
-        ) {
-            currentState.serverSnapshot =
-                normalizeSnapshot(
-                    serverState.snapshot,
-                );
-        }
 
-        const localHash =
-            localSnapshot
-                ? await snapshotHash(
-                    localSnapshot,
+/* -------------------------------------------------------------------------- */
+/* Generation SSE handling                                                    */
+/* -------------------------------------------------------------------------- */
+
+async function handleGenerationEvent(
+    data,
+) {
+    if (
+        data.type ===
+        'generation_claimed'
+    ) {
+        const generation =
+            data.generation ||
+            data.state?.generation ||
+            null;
+
+        currentState.generation =
+            generation
+                ? clone(
+                    generation,
                 )
                 : null;
 
-        const remoteHash =
-            serverState.snapshotHash;
+        if (
+            generation &&
+            generation.ownerClientId !==
+                clientId &&
+            localGenerationId
+        ) {
+            localGenerationLost =
+                true;
+
+            try {
+                ctx.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+        }
+
+        return;
+    }
+
+    if (
+        data.type ===
+        'generation_started'
+    ) {
+        if (
+            data.generation
+        ) {
+            currentState.generation =
+                clone(
+                    data.generation,
+                );
+        }
 
         if (
-            remoteHash &&
-            localHash &&
-            remoteHash !== localHash &&
-            !reconnect
+            data.generation
+                ?.ownerClientId !==
+                clientId &&
+            localGenerationId
         ) {
-            const pending =
-                await loadPending(
-                    scope,
-                );
+            localGenerationLost =
+                true;
 
-            if (!pending) {
-                await applyAuthoritativeSnapshot(
-                    serverState.snapshot,
-                    {
-                        serverState,
-                        reason:
-                            'initial authoritative state',
-                    },
+            try {
+                ctx.stopGeneration?.();
+            } catch {
+                // ignored
+            }
+        }
+
+        return;
+    }
+
+    if (
+        data.type ===
+        'generation_stop_requested'
+    ) {
+        const generation =
+            data.generation ||
+            data.state?.generation ||
+            currentState.generation;
+
+        if (
+            generation &&
+            generation.ownerClientId ===
+                clientId &&
+            generation.id ===
+                localGenerationId
+        ) {
+            localStopRequested =
+                true;
+
+            setStatus(
+                'Stop requested',
+                'Stopping local generation',
+            );
+
+            try {
+                ctx.stopGeneration?.();
+            } catch (error) {
+                warn(
+                    'Remote stop could not be executed',
+                    error,
                 );
             }
         }
-    } else {
-        /*
-         * First client for this scope bootstraps canonical server state.
-         */
-        const snapshot =
-            makeSnapshot();
 
-        if (snapshot) {
-            const idsChanged =
-                snapshot.idsChanged;
+        currentState.generation =
+            generation
+                ? clone(
+                    generation,
+                )
+                : null;
 
-            delete snapshot.idsChanged;
+        return;
+    }
 
-            currentState.pending = {
-                scope:
-                    clone(scope),
+    if (
+        data.type ===
+            'generation_abandoned' ||
+        data.type ===
+            'generation_terminal'
+    ) {
+        const generation =
+            data.generation ||
+            null;
 
-                opId:
-                    randomId(),
+        if (
+            generation?.ownerClientId ===
+                clientId &&
+            generation.id ===
+                localGenerationId
+        ) {
+            localGenerationLost =
+                true;
 
-                type:
-                    'snapshot_bootstrap',
-
-                payload: {
-                    bootstrap:
-                        true,
-                },
-
-                baseRevision:
-                    0,
-
-                baseSnapshot:
-                    clone(snapshot),
-
-                snapshot,
-
-                conflicts: [],
-            };
-
-            await savePending(
-                currentState.pending,
-            );
-
-            if (idsChanged) {
-                await persistCurrentChat(
-                    'bootstrap-message-ids',
-                );
+            if (
+                !localStopRequested
+            ) {
+                try {
+                    ctx.stopGeneration?.();
+                } catch {
+                    // ignored
+                }
             }
+        }
 
-            await sendPending(
-                currentState.pending,
+        currentState.generation =
+            data.type ===
+                'generation_terminal' ||
+                data.type ===
+                    'generation_abandoned'
+                ? null
+                : generation;
+
+        if (
+            generation?.id
+        ) {
+            generationTerminalizing.delete(
+                generation.id,
             );
         }
-    }
 
-    const pending =
-        await loadPending(
-            scope,
-        );
-
-    currentState.pending =
-        pending;
-
-    if (pending) {
-        await sendPending(
-            pending,
-        );
-    }
-
-    connectSse();
-    startHeartbeat();
-
-    if (reconnect) {
-        setStatus(
-            'Live',
-            `reconnected; rev ${currentState.serverRevision}`,
-        );
+        return;
     }
 }
 
-async function switchScope(
-    nextScope,
+
+/* -------------------------------------------------------------------------- */
+/* Generation stream pipeline                                                 */
+/* -------------------------------------------------------------------------- */
+
+function queueStreamUpdate(
+    reason = 'token',
 ) {
-    const previousScope =
-        currentScope;
+    if (
+        !isLocalGenerationOwner()
+    ) {
+        return;
+    }
 
-    scopeEpoch += 1;
+    latestStreamSnapshot =
+        makeLocalSnapshot();
 
-    const myEpoch =
-        scopeEpoch;
+    latestStreamReason =
+        reason;
 
-    clearReconnectTimer();
-    closeSse();
-    clearHeartbeat();
+    if (
+        streamTimer
+    ) {
+        return;
+    }
+
+    streamTimer =
+        setTimeout(
+            () => {
+                streamTimer =
+                    null;
+
+                void flushStreamUpdate();
+            },
+            STREAM_FLUSH_MS,
+        );
+}
+
+async function flushStreamUpdate() {
+    if (
+        streamFlushPromise ||
+        !isLocalGenerationOwner() ||
+        !latestStreamSnapshot
+    ) {
+        return;
+    }
+
+    const snapshot =
+        latestStreamSnapshot;
+
+    const reason =
+        latestStreamReason;
 
     latestStreamSnapshot =
         null;
@@ -3372,79 +4844,1192 @@ async function switchScope(
     latestStreamReason =
         null;
 
-    if (pendingStreamTimer) {
-        clearTimeout(
-            pendingStreamTimer,
-        );
-    }
+    const generation =
+        currentState.generation;
 
-    pendingStreamTimer =
-        null;
+    const streamSeq =
+        Number(
+            generation.streamSeq ||
+                0,
+        ) + 1;
 
-    currentScope =
-        nextScope
-            ? clone(nextScope)
-            : null;
+    const expectedEpoch =
+        currentEpoch();
 
-    currentState =
-        null;
+    streamFlushPromise =
+        (async () => {
+            try {
+                const result =
+                    await api(
+                        '/event',
+                        {
+                            method:
+                                'POST',
 
-    generationCandidate =
-        null;
+                            body: {
+                                protocolVersion:
+                                    PROTOCOL_VERSION,
 
-    localGenerationClaimLost =
-        false;
+                                clientId,
 
-    lastGenerationStatus =
-        null;
+                                deviceId,
 
-    if (previousScope) {
-        try {
-            await api('/leave', {
-                method: 'POST',
+                                scope:
+                                    currentScope,
 
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
+                                opId:
+                                    uuid(),
 
-                    clientId:
-                        currentClientId,
+                                type:
+                                    'generation_stream',
 
-                    deviceId:
-                        currentDeviceId,
+                                generationId:
+                                    generation.id,
 
-                    scope:
-                        previousScope,
-                }),
-            });
-        } catch (error) {
-            log(
-                'Leave failed',
-                error,
-            );
-        }
+                                streamSeq,
+
+                                baseRevision:
+                                    lastRevision,
+
+                                payload: {
+                                    reason,
+                                },
+
+                                snapshot,
+                            },
+                        },
+                    );
+
+                if (
+                    expectedEpoch !==
+                    currentEpoch()
+                ) {
+                    return;
+                }
+
+                if (
+                    result.state
+                ) {
+                    applyStateCursor(
+                        result.state,
+                    );
+
+                    currentState.generation =
+                        result.state
+                            .generation
+                            ? clone(
+                                result.state
+                                    .generation,
+                            )
+                            : null;
+                }
+
+                if (
+                    result.state
+                        ?.generation
+                        ?.ownerClientId !==
+                    clientId
+                ) {
+                    localGenerationLost =
+                        true;
+
+                    try {
+                        ctx.stopGeneration?.();
+                    } catch {
+                        // ignored
+                    }
+                }
+
+                await persistCursor();
+            } catch (error) {
+                if (
+                    [
+                        'generation_stale',
+                        'generation_not_owner',
+                        'generation_expired',
+                    ].includes(
+                        error.code,
+                    )
+                ) {
+                    localGenerationLost =
+                        true;
+
+                    try {
+                        ctx.stopGeneration?.();
+                    } catch {
+                        // ignored
+                    }
+                } else if (
+                    error.code ===
+                        'stale_revision' ||
+                    error.code ===
+                        'stream_sequence_gap'
+                ) {
+                    await resyncCurrentScope(
+                        `generation stream ${error.code}`,
+                    );
+                } else {
+                    warn(
+                        'Generation stream failed',
+                        error,
+                    );
+                }
+            } finally {
+                streamFlushPromise =
+                    null;
+
+                if (
+                    latestStreamSnapshot &&
+                    isLocalGenerationOwner()
+                ) {
+                    void flushStreamUpdate();
+                }
+            }
+        })();
+
+    return streamFlushPromise;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Generation terminal                                                        */
+/* -------------------------------------------------------------------------- */
+
+async function finishGeneration(
+    status,
+) {
+    const generation =
+        currentState?.generation;
+
+    if (
+        !generation ||
+        !isLocalGenerationOwner()
+    ) {
+        return;
     }
 
     if (
-        myEpoch !== scopeEpoch ||
-        !currentScope ||
-        destroyed ||
+        generationTerminalizing.has(
+            generation.id,
+        )
+    ) {
+        return;
+    }
+
+    generationTerminalizing.add(
+        generation.id,
+    );
+
+    try {
+        await flushStreamUpdate();
+
+        while (
+            streamFlushPromise
+        ) {
+            await new Promise(
+                resolve =>
+                    setTimeout(
+                        resolve,
+                        25,
+                    ),
+            );
+        }
+
+        await saveCurrentChat(
+            'generation-terminal',
+        );
+
+        const snapshot =
+            makeLocalSnapshot();
+
+        if (!snapshot) {
+            return;
+        }
+
+        const generationId =
+            generation.id;
+
+        try {
+            const result =
+                await api(
+                    '/event',
+                    {
+                        method:
+                            'POST',
+
+                        body: {
+                            protocolVersion:
+                                PROTOCOL_VERSION,
+
+                            clientId,
+
+                            deviceId,
+
+                            scope:
+                                currentScope,
+
+                            opId:
+                                uuid(),
+
+                            type:
+                                'generation_terminal',
+
+                            generationId,
+
+                            status,
+
+                            baseRevision:
+                                lastRevision,
+
+                            snapshot,
+                        },
+                    },
+                );
+
+            if (
+                result.state
+            ) {
+                applyStateCursor(
+                    result.state,
+                );
+
+                currentState.generation =
+                    result.state
+                        .generation
+                        ? clone(
+                            result.state
+                                .generation,
+                        )
+                        : null;
+            }
+
+            await persistCursor();
+
+            localGenerationId =
+                null;
+
+            localGenerationLost =
+                false;
+
+            localStopRequested =
+                false;
+
+            setStatus(
+                'Synced',
+                `${status}; revision ${lastRevision}`,
+            );
+        } catch (error) {
+            if (
+                error.code ===
+                'st_not_persisted'
+            ) {
+                /*
+                 * One deliberate retry after another ST save.
+                 */
+                await saveCurrentChat(
+                    'generation-terminal-retry',
+                );
+
+                const retrySnapshot =
+                    makeLocalSnapshot();
+
+                const retry =
+                    await api(
+                        '/event',
+                        {
+                            method:
+                                'POST',
+
+                            body: {
+                                protocolVersion:
+                                    PROTOCOL_VERSION,
+
+                                clientId,
+
+                                deviceId,
+
+                                scope:
+                                    currentScope,
+
+                                opId:
+                                    uuid(),
+
+                                type:
+                                    'generation_terminal',
+
+                                generationId,
+
+                                status,
+
+                                baseRevision:
+                                    lastRevision,
+
+                                snapshot:
+                                    retrySnapshot,
+                            },
+                        },
+                    );
+
+                if (
+                    retry.state
+                ) {
+                    applyStateCursor(
+                        retry.state,
+                    );
+
+                    currentState.generation =
+                        retry.state
+                            .generation
+                            ? clone(
+                                retry.state
+                                    .generation,
+                            )
+                            : null;
+                }
+
+                await persistCursor();
+
+                localGenerationId =
+                    null;
+
+                localGenerationLost =
+                    false;
+
+                localStopRequested =
+                    false;
+
+                return;
+            }
+
+            if (
+                error.code ===
+                'stale_revision'
+            ) {
+                await resyncCurrentScope(
+                    'generation terminal stale revision',
+                );
+            } else {
+                warn(
+                    'Generation terminal failed',
+                    error,
+                );
+            }
+        }
+    } finally {
+        generationTerminalizing.delete(
+            generation.id,
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Chat mutation event handlers                                               */
+/* -------------------------------------------------------------------------- */
+
+function scheduleMutation(
+    type,
+    payload = {},
+) {
+    if (
+        applyingRemoteDepth >
+            0 ||
+        !pluginAvailable ||
+        !getSettings().enabled ||
+        !currentScope
+    ) {
+        return;
+    }
+
+    if (
+        currentState?.generation &&
+        !isLocalGenerationOwner()
+    ) {
+        return;
+    }
+
+    if (
+        isLocalGenerationOwner()
+    ) {
+        queueStreamUpdate(
+            type,
+        );
+
+        return;
+    }
+
+    if (
+        resyncTimer
+    ) {
+        clearTimeout(
+            resyncTimer,
+        );
+    }
+
+    resyncTimer =
+        setTimeout(
+            () => {
+                resyncTimer =
+                    null;
+
+                void enqueueLocalMutation(
+                    type,
+                    payload,
+                );
+            },
+            RESYNC_DELAY_MS,
+        );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* ST listeners                                                               */
+/* -------------------------------------------------------------------------- */
+
+function bindStEvent(
+    eventName,
+    handler,
+) {
+    if (
+        !eventName ||
+        !ctx?.eventSource
+    ) {
+        return;
+    }
+
+    ctx.eventSource.on(
+        eventName,
+        handler,
+    );
+
+    stListeners.push([
+        eventName,
+        handler,
+    ]);
+}
+
+function unbindStEvents() {
+    if (
+        !ctx?.eventSource
+    ) {
+        return;
+    }
+
+    for (
+        const [
+            eventName,
+            handler,
+        ] of stListeners
+    ) {
+        try {
+            ctx.eventSource.removeListener(
+                eventName,
+                handler,
+            );
+        } catch {
+            // ignored
+        }
+    }
+
+    stListeners = [];
+}
+
+function bindStEvents() {
+    const e =
+        ctx?.eventTypes;
+
+    if (!e) {
+        return;
+    }
+
+    bindStEvent(
+        e.MESSAGE_SENT,
+        () =>
+            scheduleMutation(
+                'message_sent',
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_RECEIVED,
+        () =>
+            scheduleMutation(
+                'message_received',
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_EDITED,
+        (...args) =>
+            scheduleMutation(
+                'message_edited',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_DELETED,
+        (...args) =>
+            scheduleMutation(
+                'message_deleted',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_UPDATED,
+        (...args) =>
+            scheduleMutation(
+                'message_updated',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_SWIPED,
+        (...args) =>
+            scheduleMutation(
+                'message_swiped',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_SWIPE_DELETED,
+        (...args) =>
+            scheduleMutation(
+                'message_swipe_deleted',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_FILE_EMBEDDED,
+        (...args) =>
+            scheduleMutation(
+                'message_file_embedded',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.FILE_ATTACHMENT_DELETED,
+        (...args) =>
+            scheduleMutation(
+                'file_attachment_deleted',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MEDIA_ATTACHMENT_DELETED,
+        (...args) =>
+            scheduleMutation(
+                'media_attachment_deleted',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_REASONING_EDITED,
+        (...args) =>
+            scheduleMutation(
+                'message_reasoning_edited',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.MESSAGE_REASONING_DELETED,
+        (...args) =>
+            scheduleMutation(
+                'message_reasoning_deleted',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.STREAM_REASONING_DONE,
+        (...args) =>
+            scheduleMutation(
+                'stream_reasoning_done',
+                {
+                    args,
+                },
+            ),
+    );
+
+    bindStEvent(
+        e.TOOL_CALLS_PERFORMED,
+        (...args) =>
+            scheduleMutation(
+                'tool_calls_performed',
+                {
+                    args,
+                },
+            ),
+    );
+
+    /*
+     * MORE_MESSAGES_LOADED is not a mutation.
+     */
+    bindStEvent(
+        e.MORE_MESSAGES_LOADED,
+        () =>
+            scheduleResync(
+                'more messages loaded',
+            ),
+    );
+
+    bindStEvent(
+        e.CHAT_LOADED,
+        () =>
+            void handleChatLifecycle(
+                'chat_loaded',
+            ),
+    );
+
+    bindStEvent(
+        e.CHAT_CHANGED,
+        () =>
+            void handleChatLifecycle(
+                'chat_changed',
+            ),
+    );
+
+    bindStEvent(
+        e.CHAT_CREATED,
+        () =>
+            void handleChatLifecycle(
+                'chat_created',
+            ),
+    );
+
+    bindStEvent(
+        e.CHAT_DELETED,
+        () =>
+            void handleChatLifecycle(
+                'chat_deleted',
+            ),
+    );
+
+    bindStEvent(
+        e.CHAT_RENAMED,
+        () =>
+            void handleChatLifecycle(
+                'chat_renamed',
+            ),
+    );
+
+    bindStEvent(
+        e.GROUP_CHAT_CREATED,
+        () =>
+            void handleChatLifecycle(
+                'group_chat_created',
+            ),
+    );
+
+    bindStEvent(
+        e.GROUP_CHAT_DELETED,
+        () =>
+            void handleChatLifecycle(
+                'group_chat_deleted',
+            ),
+    );
+
+    bindStEvent(
+        e.GROUP_UPDATED,
+        () =>
+            void handleChatLifecycle(
+                'group_updated',
+            ),
+    );
+
+
+    /*
+     * Fallback generation path.
+     *
+     * The stronger path is generate_interceptor above.
+     */
+    bindStEvent(
+        e.GENERATION_STARTED,
+        async type => {
+            if (
+                applyingRemoteDepth >
+                    0 ||
+                !getSettings().enabled
+            ) {
+                return;
+            }
+
+            const available =
+                await ensureConnected();
+
+            if (!available) {
+                return;
+            }
+
+            const generation =
+                activeGeneration();
+
+            if (
+                generation &&
+                !isLocalGenerationOwner()
+            ) {
+                localGenerationLost =
+                    true;
+
+                try {
+                    ctx.stopGeneration?.();
+                } catch {
+                    // ignored
+                }
+
+                return;
+            }
+
+            if (
+                isLocalGenerationOwner()
+            ) {
+                if (
+                    generation.state !==
+                    'streaming'
+                ) {
+                    try {
+                        const result =
+                            await api(
+                                '/event',
+                                {
+                                    method:
+                                        'POST',
+
+                                    body: {
+                                        protocolVersion:
+                                            PROTOCOL_VERSION,
+
+                                        clientId,
+
+                                        deviceId,
+
+                                        scope:
+                                            currentScope,
+
+                                        opId:
+                                            uuid(),
+
+                                        type:
+                                            'generation_started',
+
+                                        baseRevision:
+                                            lastRevision,
+
+                                        generationId:
+                                            generation.id,
+                                    },
+                                },
+                            );
+
+                        if (
+                            result.state
+                        ) {
+                            applyStateCursor(
+                                result.state,
+                            );
+
+                            currentState.generation =
+                                result.state
+                                    .generation
+                                    ? clone(
+                                        result.state
+                                            .generation,
+                                    )
+                                    : null;
+                        }
+                    } catch (error) {
+                        warn(
+                            'Fallback generation start failed',
+                            error,
+                        );
+
+                        localGenerationLost =
+                            true;
+
+                        try {
+                            ctx.stopGeneration?.();
+                        } catch {
+                            // ignored
+                        }
+                    }
+                }
+
+                return;
+            }
+
+            const claimed =
+                await claimGeneration(
+                    type,
+                    getLastMessageSyncId(),
+                );
+
+            if (!claimed) {
+                try {
+                    ctx.stopGeneration?.();
+                } catch {
+                    // ignored
+                }
+
+                return;
+            }
+
+            try {
+                const result =
+                    await api(
+                        '/event',
+                        {
+                            method:
+                                'POST',
+
+                            body: {
+                                protocolVersion:
+                                    PROTOCOL_VERSION,
+
+                                clientId,
+
+                                deviceId,
+
+                                scope:
+                                    currentScope,
+
+                                opId:
+                                    uuid(),
+
+                                type:
+                                    'generation_started',
+
+                                baseRevision:
+                                    lastRevision,
+
+                                generationId:
+                                    currentState
+                                        .generation
+                                        .id,
+                            },
+                        },
+                    );
+
+                if (
+                    result.state
+                ) {
+                    applyStateCursor(
+                        result.state,
+                    );
+                }
+            } catch (error) {
+                warn(
+                    'Generation start failed',
+                    error,
+                );
+
+                localGenerationLost =
+                    true;
+
+                try {
+                    ctx.stopGeneration?.();
+                } catch {
+                    // ignored
+                }
+            }
+        },
+    );
+
+    bindStEvent(
+        e.STREAM_TOKEN_RECEIVED,
+        () =>
+            queueStreamUpdate(
+                'token',
+            ),
+    );
+
+    bindStEvent(
+        e.GENERATION_STOPPED,
+        async () => {
+            if (
+                isLocalGenerationOwner()
+            ) {
+                localStopRequested =
+                    true;
+
+                await finishGeneration(
+                    'stopped',
+                );
+            }
+        },
+    );
+
+    bindStEvent(
+        e.GENERATION_ENDED,
+        async () => {
+            if (
+                !isLocalGenerationOwner()
+            ) {
+                return;
+            }
+
+            if (
+                finalizationTimer
+            ) {
+                clearTimeout(
+                    finalizationTimer,
+                );
+            }
+
+            finalizationTimer =
+                setTimeout(
+                    () => {
+                        finalizationTimer =
+                            null;
+
+                        void finishGeneration(
+                            localStopRequested
+                                ? 'stopped'
+                                : 'completed',
+                        );
+                    },
+                    250,
+                );
+        },
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Chat lifecycle                                                              */
+/* -------------------------------------------------------------------------- */
+
+async function handleChatLifecycle(
+    reason,
+) {
+    if (
+        applyingRemoteDepth >
+            0 ||
+        stopping ||
         !getSettings().enabled
     ) {
         return;
     }
 
-    const repairedBranchIntegrity =
-        repairBranchIntegrity();
+    const nextScope =
+        getCurrentScope();
 
-    if (repairedBranchIntegrity) {
-        await persistCurrentChat(
-            'branch-integrity-repair',
+    if (
+        !nextScope
+    ) {
+        await switchScope(
+            null,
         );
+
+        return;
+    }
+
+    if (
+        !sameScope(
+            currentScope,
+            nextScope,
+        )
+    ) {
+        await switchScope(
+            nextScope,
+        );
+
+        return;
+    }
+
+    if (
+        pluginAvailable
+    ) {
+        scheduleResync(
+            reason,
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Scope switching                                                             */
+/* -------------------------------------------------------------------------- */
+
+async function switchScope(
+    nextScope,
+) {
+    const previousScope =
+        currentScope;
+
+    scopeEpoch +=
+        1;
+
+    const expectedEpoch =
+        scopeEpoch;
+
+    clearHeartbeat();
+    closeSse();
+
+    if (
+        reconnectTimer
+    ) {
+        clearTimeout(
+            reconnectTimer,
+        );
+
+        reconnectTimer =
+            null;
+    }
+
+    if (
+        resyncTimer
+    ) {
+        clearTimeout(
+            resyncTimer,
+        );
+
+        resyncTimer =
+            null;
+    }
+
+    if (
+        streamTimer
+    ) {
+        clearTimeout(
+            streamTimer,
+        );
+
+        streamTimer =
+            null;
+    }
+
+    if (
+        finalizationTimer
+    ) {
+        clearTimeout(
+            finalizationTimer,
+        );
+
+        finalizationTimer =
+            null;
+    }
+
+    latestStreamSnapshot =
+        null;
+
+    latestStreamReason =
+        null;
+
+    currentScope =
+        nextScope
+            ? clone(
+                nextScope,
+            )
+            : null;
+
+    currentState =
+        null;
+
+    subscriptionToken =
+        null;
+
+    localGenerationId =
+        null;
+
+    localGenerationLost =
+        false;
+
+    localStopRequested =
+        false;
+
+    lastEventId =
+        null;
+
+    lastEpoch =
+        null;
+
+    lastSeq =
+        0;
+
+    lastRevision =
+        0;
+
+    if (
+        previousScope &&
+        pluginAvailable
+    ) {
+        try {
+            await api(
+                '/leave',
+                {
+                    method:
+                        'POST',
+
+                    body: {
+                        protocolVersion:
+                            PROTOCOL_VERSION,
+
+                        clientId,
+
+                        deviceId,
+
+                        scope:
+                            previousScope,
+                    },
+                },
+            );
+        } catch {
+            /*
+             * Leave is best-effort. Server membership expiry is the crash-safe
+             * fallback.
+             */
+        }
+    }
+
+    if (
+        expectedEpoch !==
+        scopeEpoch ||
+        !currentScope ||
+        stopping ||
+        !getSettings().enabled
+    ) {
+        return;
+    }
+
+    const available =
+        await checkPlugin();
+
+    if (
+        !available
+    ) {
+        return;
     }
 
     try {
-        await joinAndConnect(
+        await joinCurrentScope(
             currentScope,
         );
     } catch (error) {
@@ -3454,305 +6039,535 @@ async function switchScope(
         );
 
         setStatus(
-            'Offline',
+            'Sync unavailable',
             error.message ||
-            error.code ||
-            'join failed',
+                error.code ||
+                'join failed',
         );
 
         scheduleReconnect(
-            error.code ||
             'join failed',
         );
     }
 }
 
-async function syncCurrentScope(
-    {
-        force = false,
-    } = {},
-) {
-    if (
-        !ctx ||
-        !getSettings().enabled
-    ) {
-        return;
-    }
-
-    const nextScope =
-        getScope();
-
-    if (
-        !force &&
-        sameScope(
-            nextScope,
-            currentScope,
-        ) &&
-        currentState
-    ) {
-        return;
-    }
-
-    await switchScope(
-        nextScope,
-    );
-}
-
 
 /* -------------------------------------------------------------------------- */
-/* ST event handling                                                           */
+/* Join                                                                      */
 /* -------------------------------------------------------------------------- */
 
-function eventMessageId(args) {
-    const first =
-        args?.[0];
-
-    if (
-        typeof first === 'number' &&
-        Number.isInteger(first)
-    ) {
-        return first;
-    }
-
-    if (
-        typeof first === 'string' &&
-        /^\d+$/.test(first)
-    ) {
-        return Number(first);
-    }
-
-    if (
-        first &&
-        typeof first.messageId === 'number'
-    ) {
-        return first.messageId;
-    }
-
-    return null;
-}
-
-function onMessageMutation(
-    type,
-    ...args
+async function joinCurrentScope(
+    scope,
 ) {
-    if (
-        !currentScope ||
-        !currentState ||
-        currentState.suppressLocalEvents
-    ) {
-        return;
-    }
+    const expectedEpoch =
+        currentEpoch();
 
-    const owner =
-        currentState.generation?.ownerClientId ===
-            currentClientId &&
-        !localGenerationClaimLost;
-
-    /*
-     * During a local generation, message updates are stream state rather than
-     * ordinary mutations, preventing concurrent revision races.
-     */
-    if (
-        currentState.generation &&
-        owner
-    ) {
-        void queueStreamSnapshot(
-            type,
+    const previousCursor =
+        await dbGetMeta(
+            stableStringify(
+                scope,
+            ),
         );
 
-        return;
-    }
+    const result =
+        await api(
+            '/join',
+            {
+                method:
+                    'POST',
 
-    /*
-     * A remote generation owns the mutation lock.
-     */
-    if (currentState.generation) {
-        return;
-    }
+                body: {
+                    protocolVersion:
+                        PROTOCOL_VERSION,
 
-    const messageId =
-        eventMessageId(
-            args,
-        );
+                    clientId,
 
-    enqueueSnapshotMutationSoon(
-        type,
-        messageId === null
-            ? {}
-            : { messageId },
-    );
-}
+                    deviceId,
 
-async function onGenerationStarted() {
-    if (
-        !currentScope ||
-        !currentState ||
-        !getSettings().enabled
-    ) {
-        return;
-    }
-
-    /*
-     * If a remote owner already exists, stop the local ST generation immediately.
-     * The server remains the final race arbiter.
-     */
-    if (
-        currentState.generation &&
-        currentState.generation.ownerClientId !==
-            currentClientId
-    ) {
-        localGenerationClaimLost =
-            true;
-
-        try {
-            ctx?.stopGeneration?.();
-        } catch {
-            // ignored
-        }
-
-        setStatus(
-            'Generation busy',
-            'Remote client owns generation',
-        );
-
-        return;
-    }
-
-    const claimed =
-        await claimGeneration();
-
-    if (!claimed) {
-        return;
-    }
-
-    await queueStreamSnapshot(
-        'generation_started',
-    );
-}
-
-function onStreamToken() {
-    if (
-        !currentState?.generation ||
-        currentState.generation.ownerClientId !==
-            currentClientId ||
-        localGenerationClaimLost
-    ) {
-        return;
-    }
-
-    void queueStreamSnapshot(
-        'token',
-    );
-}
-
-async function onGenerationStopped() {
-    if (!currentState?.generation) {
-        return;
-    }
-
-    if (
-        currentState.generation.ownerClientId !==
-            currentClientId ||
-        localGenerationClaimLost
-    ) {
-        return;
-    }
-
-    localStopIssued =
-        true;
-
-    clearTimeout(
-        finalizeTimer,
-    );
-
-    finalizeTimer =
-        null;
-
-    await finishGeneration(
-        'stopped',
-    );
-}
-
-async function onGenerationEnded() {
-    if (!currentState?.generation) {
-        return;
-    }
-
-    if (
-        currentState.generation.ownerClientId !==
-            currentClientId ||
-        localGenerationClaimLost
-    ) {
-        return;
-    }
-
-    clearTimeout(
-        finalizeTimer,
-    );
-
-    finalizeTimer =
-        setTimeout(
-            async () => {
-                finalizeTimer =
-                    null;
-
-                await finishGeneration(
-                    localStopIssued
-                        ? 'stopped'
-                        : 'completed',
-                );
+                    scope,
+                },
             },
-            FINALIZE_DELAY_MS,
         );
-}
 
-function onChatChanged() {
-    void syncCurrentScope({
-        force: true,
-    });
-}
+    if (
+        expectedEpoch !==
+            currentEpoch() ||
+        !sameScope(
+            currentScope,
+            scope,
+        )
+    ) {
+        return;
+    }
 
-async function onChatLifecycle(
-    type,
-) {
+    principalKey =
+        result.principalKey;
+
+    subscriptionToken =
+        result.subscriptionToken;
+
+    currentState = {
+        serverSnapshot:
+            result.state
+                ?.snapshot
+                ? normalizeSnapshot(
+                    result.state
+                        .snapshot,
+                )
+                : null,
+
+        generation:
+            result.state
+                ?.generation
+                ? clone(
+                    result.state
+                        .generation,
+                )
+                : null,
+
+        pendingCount:
+            0,
+
+        serverEpoch:
+            result.state?.epoch ||
+            null,
+    };
+
+    applyStateCursor(
+        result.state,
+    );
+
     /*
-     * Event arguments differ across ST versions, so reconciliation is based on
-     * the actual live context rather than trusting an event payload.
+     * Preserve older replay cursor if it belongs to the same server epoch.
      */
     if (
-        type === 'chat_deleted' ||
-        type === 'group_chat_deleted'
+        previousCursor?.lastEpoch &&
+        previousCursor.lastEpoch ===
+            result.state?.epoch &&
+        Number.isSafeInteger(
+            Number(
+                previousCursor.lastSeq,
+            ),
+        ) &&
+        Number(
+            previousCursor.lastSeq,
+        ) <
+            Number(
+                result.state.seq,
+            )
     ) {
-        const active =
-            getScope();
+        lastEpoch =
+            previousCursor.lastEpoch;
 
-        if (
-            !active &&
-            currentScope
-        ) {
-            setStatus(
-                'Chat changed',
-                'Active chat no longer exists',
+        lastSeq =
+            Number(
+                previousCursor.lastSeq,
             );
 
-            closeSse();
-            clearHeartbeat();
+        lastRevision =
+            Number(
+                previousCursor.lastRevision,
+            ) || 0;
 
-            return;
-        }
+        lastEventId =
+            previousCursor.lastEventId ||
+            null;
     }
 
-    await syncCurrentScope({
-        force: true,
-    });
+
+    const pending =
+        await dbGetOperations(
+            scope,
+        );
+
+    currentState.pendingCount =
+        pending.length;
+
+    /*
+     * Make sure the local browser state uses stable IDs before comparing hashes.
+     */
+    const migrated =
+        ensureMessageIds(
+            ctx.chat,
+        );
+
+    if (
+        migrated
+    ) {
+        await saveCurrentChat(
+            'stable-message-id-migration',
+        );
+    }
+
+    const localSnapshot =
+        makeLocalSnapshot();
+
+    const localHash =
+        localSnapshot
+            ? await sha256(
+                localSnapshot,
+            )
+            : null;
+
+    const serverSnapshot =
+        currentState.serverSnapshot;
+
+
+    /*
+     * No server state yet.
+     *
+     * If ST already has a real file, the server's JOIN has normally populated
+     * the state. So this branch mainly covers a newly created unsaved chat.
+     */
+    if (
+        !serverSnapshot &&
+        localSnapshot &&
+        !pending.length
+    ) {
+        const bootstrap =
+            {
+                principalKey,
+
+                opId:
+                    uuid(),
+
+                localSeq:
+                    ++localSequence,
+
+                scope:
+                    clone(scope),
+
+                type:
+                    'bootstrap',
+
+                payload: {},
+
+                snapshot:
+                    clone(
+                        localSnapshot,
+                    ),
+
+                baseSnapshot:
+                    clone(
+                        localSnapshot,
+                    ),
+
+                baseRevision:
+                    0,
+
+                coalescible:
+                    false,
+            };
+
+        await dbPutOperation(
+            bootstrap,
+        );
+
+        await drainPendingQueue();
+    } else if (
+        serverSnapshot &&
+        !pending.length
+    ) {
+        /*
+         * With no local pending operations, decide whether server state should
+         * win automatically or whether the local browser contains an out-of-
+         * band change requiring an explicit user choice.
+         */
+        if (
+            localHash !==
+            result.state.snapshotHash
+        ) {
+            const serverWasNewer =
+                Boolean(
+                    previousCursor?.lastEpoch &&
+                    previousCursor
+                        .lastEpoch ===
+                        result.state
+                            .epoch &&
+                    Number(
+                        previousCursor
+                            .lastRevision,
+                    ) <
+                        Number(
+                            result.state
+                                .revision,
+                        ),
+                );
+
+            if (
+                serverWasNewer
+            ) {
+                await applySnapshotLocally(
+                    serverSnapshot,
+                    {
+                        persist:
+                            true,
+
+                        reason:
+                            'server-newer-on-join',
+                    },
+                );
+            } else {
+                showDivergenceChoice(
+                    localSnapshot,
+                    serverSnapshot,
+                );
+            }
+        }
+    } else if (
+        serverSnapshot &&
+        pending.length
+    ) {
+        /*
+         * Keep the local pending intent, but rebase it against current server
+         * authority before transmitting it.
+         */
+        const rebased =
+            await rebasePendingQueue(
+                serverSnapshot,
+                lastRevision,
+            );
+
+        if (
+            rebased
+        ) {
+            await applySnapshotLocally(
+                rebased,
+                {
+                    persist:
+                        true,
+
+                    reason:
+                        'join-pending-rebase',
+                },
+            );
+        }
+
+        await drainPendingQueue();
+    }
+
+    /*
+     * If server reported a genuine persisted-file divergence, keep it visible
+     * rather than silently declaring victory.
+     */
+    if (
+        result.divergence
+            ?.detected &&
+        !pending.length
+    ) {
+        setStatus(
+            'Sync conflict',
+            'Server mirror and current ST chat differ',
+            [
+                {
+                    label:
+                        'Use server',
+
+                    run:
+                        () =>
+                            applySnapshotLocally(
+                                serverSnapshot,
+                                {
+                                    persist:
+                                        true,
+
+                                    reason:
+                                        'server-divergence-choice',
+                                },
+                            ),
+                },
+                {
+                    label:
+                        'Use current',
+
+                    run:
+                        () =>
+                            reconcileLocalToServer(
+                                makeLocalSnapshot(),
+                            ),
+                },
+            ],
+        );
+    }
+
+    connectSse();
+
+    startHeartbeat();
+
+    await persistCursor();
+
+    setStatus(
+        'Live',
+        `revision ${lastRevision}`,
+    );
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Same-browser transport                                                      */
+/* Reconnect                                                                  */
 /* -------------------------------------------------------------------------- */
 
-async function onRemoteBroadcast(
+function scheduleReconnect(
+    reason = 'disconnect',
+) {
+    if (
+        stopping ||
+        reconnectTimer ||
+        !currentScope
+    ) {
+        return;
+    }
+
+    const delay =
+        Math.min(
+            MAX_RECONNECT_MS,
+
+            500 *
+                (
+                    2 **
+                    Math.min(
+                        reconnectAttempt,
+                        6,
+                    )
+                ) +
+
+                Math.floor(
+                    Math.random() *
+                        400,
+                ),
+        );
+
+    reconnectAttempt +=
+        1;
+
+    setStatus(
+        'Reconnecting',
+        `${reason}; ${Math.ceil(
+            delay / 1000,
+        )}s`,
+    );
+
+    reconnectTimer =
+        setTimeout(
+            async () => {
+                reconnectTimer =
+                    null;
+
+                await reconnectScope(
+                    reason,
+                );
+            },
+            delay,
+        );
+}
+
+async function reconnectScope(
+    reason = 'reconnect',
+) {
+    if (
+        !currentScope ||
+        stopping
+    ) {
+        return false;
+    }
+
+    const available =
+        await checkPlugin();
+
+    if (
+        !available
+    ) {
+        return false;
+    }
+
+    try {
+        await switchScope(
+            currentScope,
+        );
+
+        return true;
+    } catch (error) {
+        warn(
+            'Reconnect failed',
+            reason,
+            error,
+        );
+
+        scheduleReconnect(
+            reason,
+        );
+
+        return false;
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* BroadcastChannel                                                           */
+/* -------------------------------------------------------------------------- */
+
+function startBroadcastChannel() {
+    if (
+        broadcastChannel
+    ) {
+        return;
+    }
+
+    try {
+        broadcastChannel =
+            new BroadcastChannel(
+                `${EXTENSION_ID}:v4`,
+            );
+
+        broadcastChannel.addEventListener(
+            'message',
+            event => {
+                void handleBroadcastMessage(
+                    event.data,
+                );
+            },
+        );
+    } catch (error) {
+        log(
+            'BroadcastChannel unavailable',
+            error,
+        );
+
+        broadcastChannel =
+            null;
+    }
+}
+
+function broadcastLocalChange(
+    type,
+) {
+    try {
+        broadcastChannel?.postMessage(
+            {
+                protocolVersion:
+                    PROTOCOL_VERSION,
+
+                sourceClientId:
+                    clientId,
+
+                sourceDeviceId:
+                    deviceId,
+
+                scope:
+                    currentScope,
+
+                type,
+
+                kind:
+                    'local_change',
+            },
+        );
+    } catch {
+        // ignored
+    }
+}
+
+async function handleBroadcastMessage(
     message,
 ) {
     if (
@@ -3765,7 +6580,7 @@ async function onRemoteBroadcast(
 
     if (
         message.sourceClientId ===
-        currentClientId
+        clientId
     ) {
         return;
     }
@@ -3779,420 +6594,282 @@ async function onRemoteBroadcast(
         return;
     }
 
+    /*
+     * BroadcastChannel is intentionally never applied as authority.
+     * It simply asks the current browser tab to reconcile from the server.
+     */
     if (
         message.kind ===
-            'generation_owner' ||
-        message.kind ===
-            'accepted' ||
-        message.kind ===
-            'generation_terminal'
+        'local_change'
     ) {
-        if (message.state) {
-            applyServerMeta(
-                message.state,
-            );
-        }
-
-        return;
-    }
-
-    if (
-        message.kind ===
-            'local_pending'
-    ) {
-        /*
-         * A same-browser peer changed the scope. Let the server/SSE state remain
-         * authoritative; a cheap state refresh catches the change even before
-         * the SSE delivery reaches us.
-         */
-        if (
-            message.type &&
-            currentState
-        ) {
-            void resyncCurrentScope(
-                'same-browser peer pending',
-            );
-        }
+        scheduleResync(
+            `same-browser peer: ${
+                message.type ||
+                'change'
+            }`,
+        );
     }
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Listener lifecycle                                                          */
+/* Browser lifecycle                                                          */
 /* -------------------------------------------------------------------------- */
 
-function bindEvent(
-    name,
-    handler,
-) {
-    const source =
-        ctx?.eventSource;
+function bindBrowserEvents() {
+    const online =
+        () => {
+            void reconnectScope(
+                'browser online',
+            );
+        };
 
-    if (
-        !source ||
-        !name
+    const pageShow =
+        () => {
+            scheduleResync(
+                'pageshow',
+            );
+        };
+
+    const visibility =
+        () => {
+            if (
+                document.visibilityState ===
+                'visible'
+            ) {
+                scheduleResync(
+                    'visibility resume',
+                );
+            }
+        };
+
+    window.addEventListener(
+        'online',
+        online,
+    );
+
+    window.addEventListener(
+        'pageshow',
+        pageShow,
+    );
+
+    document.addEventListener(
+        'visibilitychange',
+        visibility,
+    );
+
+    browserListeners.push(
+        [
+            'window',
+            'online',
+            online,
+        ],
+        [
+            'window',
+            'pageshow',
+            pageShow,
+        ],
+        [
+            'document',
+            'visibilitychange',
+            visibility,
+        ],
+    );
+}
+
+function unbindBrowserEvents() {
+    for (
+        const [
+            target,
+            event,
+            handler,
+        ] of browserListeners
     ) {
-        return;
-    }
-
-    source.on(
-        name,
-        handler,
-    );
-
-    listeners.push([
-        name,
-        handler,
-    ]);
-}
-
-function bindEvents() {
-    const eventTypes =
-        ctx?.eventTypes ||
-        ctx?.event_types;
-
-    if (!eventTypes) {
-        return;
-    }
-
-    bindEvent(
-        eventTypes.MESSAGE_SENT,
-        (...args) =>
-            onMessageMutation(
-                'message_sent',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_RECEIVED,
-        (...args) =>
-            onMessageMutation(
-                'message_received',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_EDITED,
-        (...args) =>
-            onMessageMutation(
-                'message_edited',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_DELETED,
-        (...args) =>
-            onMessageMutation(
-                'message_deleted',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_UPDATED,
-        (...args) =>
-            onMessageMutation(
-                'message_updated',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_SWIPED,
-        (...args) =>
-            onMessageMutation(
-                'message_swiped',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_SWIPE_DELETED,
-        (...args) =>
-            onMessageMutation(
-                'message_swipe_deleted',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_FILE_EMBEDDED,
-        (...args) =>
-            onMessageMutation(
-                'message_file_embedded',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_REASONING_EDITED,
-        (...args) =>
-            onMessageMutation(
-                'message_reasoning_edited',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MESSAGE_REASONING_DELETED,
-        (...args) =>
-            onMessageMutation(
-                'message_reasoning_deleted',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.TOOL_CALLS_PERFORMED,
-        (...args) =>
-            onMessageMutation(
-                'tool_calls_performed',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.MEDIA_ATTACHMENT_DELETED,
-        (...args) =>
-            onMessageMutation(
-                'media_attachment_deleted',
-                ...args,
-            ),
-    );
-
-    bindEvent(
-        eventTypes.CHAT_CHANGED,
-        onChatChanged,
-    );
-
-    bindEvent(
-        eventTypes.CHAT_CREATED,
-        () =>
-            void onChatLifecycle(
-                'chat_created',
-            ),
-    );
-
-    bindEvent(
-        eventTypes.CHAT_DELETED,
-        () =>
-            void onChatLifecycle(
-                'chat_deleted',
-            ),
-    );
-
-    bindEvent(
-        eventTypes.CHAT_RENAMED,
-        () =>
-            void onChatLifecycle(
-                'chat_renamed',
-            ),
-    );
-
-    bindEvent(
-        eventTypes.GROUP_CHAT_CREATED,
-        () =>
-            void onChatLifecycle(
-                'group_chat_created',
-            ),
-    );
-
-    bindEvent(
-        eventTypes.GROUP_CHAT_DELETED,
-        () =>
-            void onChatLifecycle(
-                'group_chat_deleted',
-            ),
-    );
-
-    bindEvent(
-        eventTypes.GROUP_UPDATED,
-        () =>
-            void onChatLifecycle(
-                'group_updated',
-            ),
-    );
-
-    bindEvent(
-        eventTypes.GENERATION_STARTED,
-        onGenerationStarted,
-    );
-
-    /*
-     * Current ST has STREAM_TOKEN_RECEIVED and a deprecated alias.
-     * Bind only one if available.
-     */
-    bindEvent(
-        eventTypes.STREAM_TOKEN_RECEIVED ||
-            eventTypes.SMOOTH_STREAM_TOKEN_RECEIVED,
-        onStreamToken,
-    );
-
-    /*
-     * A message_received can be the final generated message after the stream.
-     */
-    bindEvent(
-        eventTypes.GENERATION_STOPPED,
-        onGenerationStopped,
-    );
-
-    bindEvent(
-        eventTypes.GENERATION_ENDED,
-        onGenerationEnded,
-    );
-}
-
-function unbindEvents() {
-    if (!ctx?.eventSource) {
-        return;
-    }
-
-    for (const [
-        name,
-        handler,
-    ] of listeners) {
         try {
-            ctx.eventSource.removeListener(
-                name,
-                handler,
-            );
+            if (
+                target ===
+                'window'
+            ) {
+                window.removeEventListener(
+                    event,
+                    handler,
+                );
+            } else {
+                document.removeEventListener(
+                    event,
+                    handler,
+                );
+            }
         } catch {
             // ignored
         }
     }
 
-    listeners = [];
+    browserListeners =
+        [];
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Startup/shutdown                                                            */
+/* Start / stop                                                               */
 /* -------------------------------------------------------------------------- */
 
-function initBroadcastChannel() {
-    try {
-        broadcastChannel =
-            new BroadcastChannel(
-                CHANNEL_NAME,
-            );
-
-        broadcastChannel.addEventListener(
-            'message',
-            event =>
-                void onRemoteBroadcast(
-                    event.data,
-                ),
-        );
-    } catch (error) {
-        broadcastChannel = null;
-
-        log(
-            'BroadcastChannel unavailable; server-only transport',
-            error,
-        );
-    }
-}
-
-async function start() {
+async function startInternal() {
     if (
-        initialized &&
-        !destroyed
+        started &&
+        !stopping
     ) {
-        if (!currentScope) {
-            await syncCurrentScope({
-                force: true,
-            });
-        }
-
         return;
     }
 
+    stopping =
+        false;
+
     ctx =
-        safeGetContext();
+        SillyTavern.getContext();
 
     if (!ctx) {
         return;
     }
 
-    destroyed =
-        false;
-
-    loadIdentity();
-
     getSettings();
 
-    renderUi();
+    ensureUi();
 
     setStatus(
         'Starting',
-        'initializing sync',
+        'Checking synchronization server',
     );
 
-    initBroadcastChannel();
-    bindEvents();
+    bindStEvents();
+    bindBrowserEvents();
+    startBroadcastChannel();
 
-    initialized =
+    started =
         true;
 
-    await syncCurrentScope({
-        force: true,
-    });
-}
+    await checkPlugin();
 
-async function stop() {
-    destroyed =
-        true;
+    if (
+        !pluginAvailable
+    ) {
+        return;
+    }
 
-    clearReconnectTimer();
-    clearHeartbeat();
-    closeSse();
+    const scope =
+        getCurrentScope();
 
-    clearTimeout(
-        localMutationTimer,
-    );
-
-    clearTimeout(
-        finalizeTimer,
-    );
-
-    if (pendingStreamTimer) {
-        clearTimeout(
-            pendingStreamTimer,
+    if (
+        scope
+    ) {
+        await switchScope(
+            scope,
+        );
+    } else {
+        setStatus(
+            'Ready',
+            'Open a chat to start synchronization',
         );
     }
+}
 
-    localMutationTimer = null;
-    finalizeTimer = null;
-    pendingStreamTimer = null;
+async function stopInternal() {
+    stopping =
+        true;
 
-    try {
-        if (currentScope) {
-            await api('/leave', {
-                method: 'POST',
+    scopeEpoch +=
+        1;
 
-                body: JSON.stringify({
-                    protocolVersion:
-                        PROTOCOL_VERSION,
+    clearHeartbeat();
 
-                    clientId:
-                        currentClientId,
+    closeSse();
 
-                    deviceId:
-                        currentDeviceId,
+    if (
+        reconnectTimer
+    ) {
+        clearTimeout(
+            reconnectTimer,
+        );
 
-                    scope:
-                        currentScope,
-                }),
-            });
-        }
-    } catch {
-        // best effort during teardown
+        reconnectTimer =
+            null;
     }
 
-    unbindEvents();
+    if (
+        pluginRetryTimer
+    ) {
+        clearTimeout(
+            pluginRetryTimer,
+        );
+
+        pluginRetryTimer =
+            null;
+    }
+
+    if (
+        resyncTimer
+    ) {
+        clearTimeout(
+            resyncTimer,
+        );
+
+        resyncTimer =
+            null;
+    }
+
+    if (
+        streamTimer
+    ) {
+        clearTimeout(
+            streamTimer,
+        );
+
+        streamTimer =
+            null;
+    }
+
+    if (
+        finalizationTimer
+    ) {
+        clearTimeout(
+            finalizationTimer,
+        );
+
+        finalizationTimer =
+            null;
+    }
+
+    try {
+        if (
+            currentScope &&
+            pluginAvailable
+        ) {
+            await api(
+                '/leave',
+                {
+                    method:
+                        'POST',
+
+                    body: {
+                        protocolVersion:
+                            PROTOCOL_VERSION,
+
+                        clientId,
+
+                        deviceId,
+
+                        scope:
+                            currentScope,
+                    },
+                },
+            );
+        }
+    } catch {
+        // best effort
+    }
+
+    unbindStEvents();
+    unbindBrowserEvents();
 
     try {
         broadcastChannel?.close();
@@ -4209,166 +6886,167 @@ async function stop() {
     currentState =
         null;
 
-    initialized =
+    subscriptionToken =
+        null;
+
+    pluginAvailable =
         false;
 
-    setStatus(
-        'Disabled',
-        'synchronization stopped',
-    );
+    principalKey =
+        null;
+
+    localGenerationId =
+        null;
+
+    localGenerationLost =
+        false;
+
+    localStopRequested =
+        false;
+
+    started =
+        false;
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Lifecycle hooks                                                             */
+/* Extension lifecycle hooks                                                  */
 /* -------------------------------------------------------------------------- */
 
-export async function onInstall() {
-    const c =
-        safeGetContext();
+export async function init() {
+    if (
+        startPromise
+    ) {
+        return startPromise;
+    }
 
-    if (!c) {
+    startPromise =
+        startInternal()
+            .finally(
+                () => {
+                    if (
+                        !started
+                    ) {
+                        startPromise =
+                            null;
+                    }
+                },
+            );
+
+    return startPromise;
+}
+
+export async function onInstall() {
+    ctx =
+        SillyTavern.getContext();
+
+    if (!ctx) {
         return;
     }
 
-    ctx = c;
-
-    const settingsRoot =
-        c.extensionSettings || {};
-
-    if (!settingsRoot[MODULE]) {
-        settingsRoot[MODULE] =
+    if (
+        !ctx.extensionSettings[
+            EXTENSION_ID
+        ]
+    ) {
+        ctx.extensionSettings[
+            EXTENSION_ID
+        ] =
             structuredClone(
-                DEFAULTS,
+                DEFAULT_SETTINGS,
             );
 
-        c.saveSettingsDebounced?.();
+        ctx.saveSettingsDebounced?.();
     }
 }
 
-export async function onActivate() {
-    await start();
+export async function onUpdate() {
+    /*
+     * IndexedDB versioning is intentionally non-destructive.
+     * Existing queued operations survive extension upgrades.
+     */
+    return init();
 }
 
 export async function onEnable() {
-    getSettings().enabled =
+    const settings =
+        getSettings();
+
+    settings.enabled =
         true;
 
-    await start();
+    ctx?.saveSettingsDebounced?.();
+
+    return init();
 }
 
 export async function onDisable() {
-    getSettings().enabled =
+    const settings =
+        getSettings();
+
+    settings.enabled =
         false;
 
     ctx?.saveSettingsDebounced?.();
 
-    await stop();
+    await stopInternal();
+
+    setStatus(
+        'Disabled',
+        'Multi-client synchronization is disabled',
+    );
 }
 
 export async function onDelete() {
-    await stop();
+    await stopInternal();
 }
 
 export async function onClean() {
     try {
-        const db =
-            await openDb();
-
-        await new Promise(
-            (resolve, reject) => {
-                const tx =
-                    db.transaction(
-                        'kv',
-                        'readwrite',
-                    );
-
-                tx.objectStore(
-                    'kv',
-                ).clear();
-
-                tx.oncomplete =
-                    resolve;
-
-                tx.onerror =
-                    () => reject(
-                        tx.error,
-                    );
-            },
-        );
-
-        db.close();
-    } catch (error) {
-        log(
-            'Clean extension data failed',
-            error,
-        );
+        await dbClearAll();
+    } catch {
+        // ignored
     }
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Compatibility bootstrap                                                     */
+/* Minimal startup bootstrap                                                  */
 /* -------------------------------------------------------------------------- */
 
 /*
- * Also works when the existing manifest does not yet declare lifecycle hooks.
- * If the manifest later maps activate/enable/disable/etc. to the exported
- * hooks above, initialization remains idempotent.
+ * ST's current extension lifecycle invokes exported hooks from the manifest.
+ * Keep an idempotent fallback for existing manifests that only load index.js.
  */
 void (async () => {
     try {
-        const waitForApp = () => {
-            const c =
-                safeGetContext();
+        const eventTypes =
+            SillyTavern
+                .getContext?.()
+                ?.eventTypes;
 
-            if (!c) {
-                return false;
-            }
+        if (
+            eventTypes?.APP_READY
+        ) {
+            const eventSource =
+                SillyTavern
+                    .getContext()
+                    .eventSource;
 
-            const eventTypes =
-                c.eventTypes ||
-                c.event_types;
-
-            if (
-                eventTypes?.APP_READY
-            ) {
-                c.eventSource.once(
-                    eventTypes.APP_READY,
-                    () => void start(),
-                );
-            } else {
-                void start();
-            }
-
-            return true;
-        };
-
-        if (!waitForApp()) {
-            if (
-                document.readyState ===
-                    'loading'
-            ) {
-                document.addEventListener(
-                    'DOMContentLoaded',
-                    () => {
-                        void waitForApp();
-                    },
-                    { once: true },
-                );
-            } else {
-                setTimeout(
-                    () => {
-                        void waitForApp();
-                    },
-                    0,
-                );
-            }
+            eventSource.once(
+                eventTypes.APP_READY,
+                () => {
+                    void init();
+                },
+            );
+        } else {
+            void init();
         }
-    } catch (error) {
-        console.error(
-            '[MultiClientSync] startup failed',
-            error,
-        );
+    } catch {
+        try {
+            void init();
+        } catch {
+            // ignored
+        }
     }
 })();
