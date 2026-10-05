@@ -154,13 +154,86 @@ function normalizeSnapshot(snapshot) {
 
 function scopeFromContext() {
     if (!ctx) return null;
-    const isGroup = ctx.groupId !== undefined && ctx.groupId !== null && String(ctx.groupId) !== '';
-    const ownerId = isGroup ? String(ctx.groupId) : String(ctx.characters?.[ctx.characterId]?.avatar || '');
-    const chatId = String(ctx.chatId || ctx.getCurrentChatId?.() || '');
-    if (!ownerId || !chatId) return null;
-    const meta = ctx.chatMetadata || {};
-    const branchId = meta?.main_chat && meta?.integrity ? String(meta.integrity) : '';
-    return { kind: isGroup ? 'group' : 'character', ownerId, chatId, branchId };
+
+    const rawGroupId = ctx.groupId;
+    const isGroup =
+        rawGroupId !== undefined &&
+        rawGroupId !== null &&
+        String(rawGroupId) !== '';
+
+    let chatId = '';
+
+    try {
+        chatId = String(
+            ctx.getCurrentChatId?.() ||
+            ctx.chatId ||
+            ''
+        );
+    } catch {
+        chatId = String(
+            ctx.chatId || ''
+        );
+    }
+
+    if (!chatId) {
+        return null;
+    }
+
+    if (isGroup) {
+        return {
+            kind: 'group',
+            ownerId: String(rawGroupId),
+            chatId,
+            branchId: String(
+                ctx.chatMetadata?.main_chat || ''
+            ),
+        };
+    }
+
+    // SillyTavern's characterId is the string index of the
+    // currently selected character. Prefer its avatar as the
+    // stable identity, but fall back to characterId so that
+    // lazy-loaded/missing character data does not make the
+    // extension think there is no active chat.
+    const characterIndex =
+        ctx.characterId;
+
+    if (
+        characterIndex === undefined ||
+        characterIndex === null ||
+        String(characterIndex) === ''
+    ) {
+        return null;
+    }
+
+    const character =
+        ctx.characters?.[characterIndex];
+
+    const ownerId =
+        String(
+            character?.avatar ||
+            `character:${characterIndex}`
+        );
+
+    if (!ownerId) {
+        return null;
+    }
+
+    // For a branch/checkpoint, main_chat identifies the parent
+    // chat. Otherwise this is the normal chat scope.
+    const branchId =
+        ctx.chatMetadata?.main_chat
+            ? String(
+                ctx.chatMetadata.main_chat
+            )
+            : '';
+
+    return {
+        kind: 'character',
+        ownerId,
+        chatId,
+        branchId,
+    };
 }
 function encodeScope(scope) {
     return btoa(unescape(encodeURIComponent(JSON.stringify(scope))))
@@ -1074,22 +1147,82 @@ async function leaveCurrentScope() {
     renderBanner('');
 }
 async function switchScope(reason = 'scope-change') {
-    const nextScope = scopeFromContext();
-    const nextKey = makeScopeKey(nextScope);
-    if (nextKey === scopeKeyValue) return;
-    ++scopeEpoch;
-    const epoch = scopeEpoch;
-    await leaveCurrentScope();
-    currentScope = nextScope;
-    scopeKeyValue = nextKey;
-    previousChatId = ctx?.chatId || null;
+    const nextScope =
+        scopeFromContext();
+
+    const nextKey =
+        makeScopeKey(nextScope);
+
+    // No active chat yet. This can legitimately happen during
+    // application startup before ST finishes loading the chat.
+    // Do not permanently settle into "no active chat".
     if (!nextScope) {
-        statusText('No active chat');
+        statusText(
+            'Waiting for active chat…'
+        );
+
+        if (
+            settings.enabled &&
+            settings.autoConnect &&
+            !scopeRetryTimer
+        ) {
+            scopeRetryTimer =
+                setTimeout(() => {
+                    scopeRetryTimer = null;
+
+                    switchScope(
+                        'startup-retry'
+                    ).catch(error =>
+                        warn(
+                            'startup scope retry failed',
+                            error,
+                        )
+                    );
+                }, 500);
+        }
+
         return;
     }
-    log('switch scope', reason, nextScope);
+
+    if (
+        nextKey === scopeKeyValue &&
+        currentScope
+    ) {
+        return;
+    }
+
+    ++scopeEpoch;
+
+    const epoch =
+        scopeEpoch;
+
+    await leaveCurrentScope();
+
+    currentScope =
+        nextScope;
+
+    scopeKeyValue =
+        nextKey;
+
+    previousChatId =
+        ctx?.chatId || null;
+
+    log(
+        'switch scope',
+        reason,
+        nextScope
+    );
+
     await ensureIdsPersisted();
-    if (settings.enabled && settings.autoConnect) await openScope(epoch);
+
+    if (
+        settings.enabled &&
+        settings.autoConnect
+    ) {
+        await openScope(
+            epoch
+        );
+    }
 }
 
 async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
@@ -1348,6 +1481,8 @@ function wireEvents() {
         registeredEventHandlers.push([eventType, fn]);
     };
 
+    listen(types.APP_INITIALIZED, () => switchScope('APP_INITIALIZED'));
+    listen(types.APP_READY, () => switchScope('APP_READY'));
     listen(types.CHAT_CHANGED, () => switchScope('CHAT_CHANGED'));
     listen(types.CHAT_LOADED, () => switchScope('CHAT_LOADED'));
     listen(types.MESSAGE_SENT, publishAfterLocalEvent);
