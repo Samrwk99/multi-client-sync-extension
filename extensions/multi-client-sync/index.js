@@ -1,9 +1,9 @@
 const EXTENSION_ID = 'multi-client-sync';
 const PLUGIN_BASE = '/api/plugins/multi-client-sync';
-const PROTOCOL = 8;
-const SCHEMA = 8;
+const PROTOCOL = 9;
+const SCHEMA = 9;
 const DB_NAME = 'multi-client-sync';
-const DB_VERSION = 8;
+const DB_VERSION = 9;
 const DEVICE_STORAGE_KEY = `${EXTENSION_ID}:device-id`;
 const OFFLINE_PRINCIPAL_STORAGE_KEY = `${EXTENSION_ID}:offline-principal`;
 const OFFLINE_PRINCIPAL_BINDING_STORAGE_KEY = `${EXTENSION_ID}:offline-principal-binding`;
@@ -11,6 +11,8 @@ const MAX_QUEUE = 1_000;
 const SNAPSHOT_CAPTURE_DELAY = 100;
 const STREAM_CAPTURE_INTERVAL = 200;
 const REMOTE_APPLY_TIMEOUT = 15_000;
+const STREAM_RENDER_INTERVAL = 150;
+const GENERATION_INPUT_MAX_RETRIES = 3;
 
 const defaultSettings = Object.freeze({
     enabled: true,
@@ -33,6 +35,7 @@ let startPromise = null;
 let serverAvailable = false;
 let serverCompatible = false;
 let serverUserId = null;
+let serverInstanceId = null;
 let currentScope = null;
 let currentState = null;
 let scopeEpoch = 0;
@@ -68,6 +71,10 @@ let lastError = '';
 let generationHeartbeatFailures = 0;
 let generationFinishRetryTimer = null;
 let deferredCaptureReason = null;
+let streamRenderTimer = null;
+let streamRenderPending = false;
+let generationInputOpId = null;
+let scopeTransitionChain = Promise.resolve();
 
 function getContext() { return SillyTavern.getContext(); }
 function log(...args) { if (settings?.debug) console.debug(`[${EXTENSION_ID}]`, ...args); }
@@ -88,15 +95,35 @@ async function sha256(value) {
     return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
+function canonicalize(value, seen = new WeakSet()) {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) throw new Error('Non-finite number is not JSON-compatible');
+        return value;
+    }
+    if (typeof value !== 'object') throw new Error('Unsupported non-JSON value');
+    if (seen.has(value)) throw new Error('Cyclic value is not JSON-compatible');
+    seen.add(value);
+    try {
+        if (Array.isArray(value)) return value.map(item => canonicalize(item, seen));
+        const out = {};
+        for (const key of Object.keys(value).sort()) {
+            if (forbiddenKeys.has(key)) throw new Error(`Forbidden object key: ${key}`);
+            out[key] = canonicalize(value[key], seen);
+        }
+        return out;
+    } finally {
+        seen.delete(value);
+    }
+}
+function canonicalJson(value) { return JSON.stringify(canonicalize(value)); }
+
 function sameScope(a, b) {
-    return !!a
-        && !!b
-        && scopeKey(a) === scopeKey(b)
-        && String(a.parentChatId || '') === String(b.parentChatId || '');
+    return !!a && !!b && scopeKey(a) === scopeKey(b);
 }
 function scopeKey(scope) {
     if (!scope) return '';
-    return JSON.stringify([scope.kind, scope.kind === 'character' ? scope.character : scope.groupId, scope.chatId, scope.branchId || 'main']);
+    return canonicalJson([scope.kind, scope.kind === 'character' ? scope.character : scope.groupId, scope.chatId]);
 }
 function scopeIsCurrent(expectedEpoch, expectedScope) {
     return expectedEpoch === scopeEpoch && currentScope && (!expectedScope || sameScope(expectedScope, currentScope));
@@ -164,7 +191,7 @@ function referenceKey(message) {
         for (const key of UNSYNCED_MESSAGE_FIELDS) delete out[key];
         if (isObject(out.extra)) for (const key of UNSYNCED_EXTRA_FIELDS) delete out.extra[key];
     }
-    return JSON.stringify(out);
+    return canonicalJson(out);
 }
 
 function alignMessageIdsToReference(referenceSnapshot) {
@@ -194,13 +221,15 @@ function alignMessageIdsToReference(referenceSnapshot) {
         bucket.push(id);
         buckets.set(key, bucket);
     }
-    const usedIds = new Set(reference.map(stableMessageId).filter(Boolean));
+    const usedIds = new Set(
+        ctx.chat.map(stableMessageId).filter(Boolean),
+    );
     for (const local of ctx.chat) {
         if (!isObject(local) || stableMessageId(local)) continue;
         const bucket = buckets.get(referenceKey(local));
         while (bucket?.length && usedIds.has(bucket[0])) bucket.shift();
         const id = bucket?.shift();
-        if (!id) continue;
+        if (!id || usedIds.has(id)) continue;
         if (!isObject(local.extra)) local.extra = {};
         if (!isObject(local.extra.multi_client_sync)) local.extra.multi_client_sync = {};
         local.extra.multi_client_sync.messageId = id;
@@ -330,10 +359,10 @@ function projectSnapshotForDigest(snapshot, mode = 'full') {
     }
     return out;
 }
-async function snapshotDigest(snapshot, mode = 'full') { return sha256(JSON.stringify(projectSnapshotForDigest(snapshot, mode))); }
+async function snapshotDigest(snapshot, mode = 'full') { return sha256(canonicalJson(projectSnapshotForDigest(snapshot, mode))); }
 function snapshotEquivalent(a, b) {
-    return JSON.stringify(projectSnapshotForDigest(a || [], settings?.syncSwipes ? 'full' : 'relevant'))
-        === JSON.stringify(projectSnapshotForDigest(b || [], settings?.syncSwipes ? 'full' : 'relevant'));
+    return canonicalJson(projectSnapshotForDigest(a || [], settings?.syncSwipes ? 'full' : 'relevant'))
+        === canonicalJson(projectSnapshotForDigest(b || [], settings?.syncSwipes ? 'full' : 'relevant'));
 }
 
 function settingsRef() {
@@ -468,7 +497,7 @@ function updateInfo() {
     const generationText = generation
         ? (generation.ownerClientId === clientId && generation.ownerDeviceId === deviceId ? `generation ${generation.phase} · this tab` : `generation ${generation.phase} · another tab`)
         : 'idle';
-    info.textContent = `Scope: ${scope} · revision ${Number(currentState?.revision || 0)} · ${generationText}${lastError ? ` · ${lastError}` : ''}`;
+    info.textContent = `Scope: ${scope} · revision ${Number(currentState?.revision || 0)} · ${generationText} · server ${String(serverInstanceId || 'unknown').slice(0, 12)}${lastError ? ` · ${lastError}` : ''}`;
 }
 function updateUi() {
     if (!settings?.enabled) { setStatus('disabled', 'disabled'); updateInfo(); updateSendLock(); return; }
@@ -538,6 +567,7 @@ async function checkHealth() {
     try {
         const result = await api('/health');
         serverAvailable = !!result.ok;
+        serverInstanceId = result.serverInstanceId || serverInstanceId;
         serverCompatible = serverAvailable && Number(result.protocol) === PROTOCOL && Number(result.schema) === SCHEMA;
         let offlinePrincipalConflict = false;
         let offlinePrincipalMigrationFailed = false;
@@ -858,7 +888,27 @@ async function saveCurrentChat() {
     if (typeof ctx.saveChatConditional === 'function') return ctx.saveChatConditional();
     return ctx.saveChat?.();
 }
-async function applySnapshotLocally(snapshot, metadata, expectedEpoch, reason, expectedScope, { persist = true } = {}) {
+
+async function saveCurrentChatVerified(expectedEpoch = scopeEpoch, expectedScope = currentScope) {
+    if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+    await saveCurrentChat();
+    if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+    const data = await api('/state', {
+        method: 'POST',
+        body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope: expectedScope, clientId, deviceId }),
+    });
+    if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+    const mode = settings.syncSwipes ? 'full' : 'relevant';
+    const expectedDigest = await snapshotDigest(localSnapshot(), mode);
+    if (expectedDigest && data.host?.snapshotDigest && mode === 'full' && expectedDigest !== data.host.snapshotDigest) throw new Error('Native SillyTavern chat save could not be verified.');
+    if (expectedDigest && data.host?.relevantSnapshotDigest && mode === 'relevant' && expectedDigest !== data.host.relevantSnapshotDigest) throw new Error('Native SillyTavern chat save could not be verified.');
+    if (settings.syncMetadata) {
+        const metadataDigest = await sha256(canonicalJson(localMetadata()));
+        if (metadataDigest && data.host?.metadataDigest && metadataDigest !== data.host.metadataDigest) throw new Error('Native SillyTavern metadata save could not be verified.');
+    }
+    return true;
+}
+async function applySnapshotLocally(snapshot, metadata, expectedEpoch, reason, expectedScope, { persist = false } = {}) {
     if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
     ctx = getContext();
     const localBefore = Array.isArray(ctx.chat) ? clone(ctx.chat) : [];
@@ -874,7 +924,7 @@ async function applySnapshotLocally(snapshot, metadata, expectedEpoch, reason, e
         await ctx.printMessages?.();
         if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
         if (persist) {
-            await saveCurrentChat();
+            await saveCurrentChatVerified(expectedEpoch, expectedScope);
             hostMessageIdsDirty = false;
         }
         log('chat applied', reason, persist ? 'persisted' : 'preview');
@@ -983,12 +1033,12 @@ async function enqueueMutationLocked(reason, expectedEpoch, scopeAtStart) {
     const baseMetadata = clone(baseState.chatMetadata || {});
     const snapshot = settings.syncMessages ? durableLocalSnapshot() : clone(baseSnapshot);
     if (settings.syncMessages && hostMessageIdsDirty) {
-        try { await saveCurrentChat(); hostMessageIdsDirty = false; } catch (error) { warn('Could not persist message IDs', error); return; }
+        try { await saveCurrentChatVerified(expectedEpoch, scopeAtStart); hostMessageIdsDirty = false; } catch (error) { warn('Could not persist message IDs', error); return; }
     }
     if (!scopeIsCurrent(expectedEpoch, scopeAtStart)) return;
 
     const metadata = settings.syncMetadata ? localMetadata() : undefined;
-    if (snapshotEquivalent(snapshot, baseSnapshot) && (!settings.syncMetadata || JSON.stringify(metadata) === JSON.stringify(baseMetadata))) return;
+    if (snapshotEquivalent(snapshot, baseSnapshot) && (!settings.syncMetadata || canonicalJson(metadata) === canonicalJson(baseMetadata))) return;
 
     const localSequence = await nextLocalSequence(scopeAtStart);
     const operation = {
@@ -1023,8 +1073,8 @@ async function rebaseOperation(operation, serverState) {
     let mergedMetadata = clone(serverState.chatMetadata || {});
     if (hasMetadata) {
         const base = operation.baseMetadata || {}, local = operation.chatMetadata || {}, remote = serverState.chatMetadata || {};
-        if (JSON.stringify(local) === JSON.stringify(base)) mergedMetadata = clone(remote);
-        else if (JSON.stringify(remote) === JSON.stringify(base)) mergedMetadata = clone(local);
+        if (canonicalJson(local) === canonicalJson(base)) mergedMetadata = clone(remote);
+        else if (canonicalJson(remote) === canonicalJson(base)) mergedMetadata = clone(local);
         else mergedMetadata = mergeMetadataThreeWay(base, local, remote);
     }
     operation.baseRevision = Number(serverState.revision);
@@ -1039,9 +1089,9 @@ async function applyRebasedOperationLocally(operation, expectedEpoch) {
     if (!scopeIsCurrent(expectedEpoch, operation.scope)) return;
     if (operation.type === 'metadata') {
         const messages = settings.syncMessages ? durableLocalSnapshot() : (currentState?.snapshot || []);
-        await applySnapshotLocally(messages, operation.chatMetadata ?? currentState?.chatMetadata ?? {}, expectedEpoch, 'queue-rebase-metadata', operation.scope, { persist: true });
+        await applySnapshotLocally(messages, operation.chatMetadata ?? currentState?.chatMetadata ?? {}, expectedEpoch, 'queue-rebase-metadata', operation.scope, { persist: false });
     } else {
-        await applySnapshotLocally(operation.snapshot, operation.chatMetadata ?? currentState?.chatMetadata ?? {}, expectedEpoch, 'queue-rebase', operation.scope, { persist: true });
+        await applySnapshotLocally(operation.snapshot, operation.chatMetadata ?? currentState?.chatMetadata ?? {}, expectedEpoch, 'queue-rebase', operation.scope, { persist: false });
     }
     if (currentState?.generation && currentGenerationIsRemote()) await applyGenerationPreview(currentState.generation, expectedEpoch, 'queue-rebase-generation-preview');
 }
@@ -1080,7 +1130,11 @@ async function flushQueue(expectedEpoch = scopeEpoch) {
                     const digestMode = settings.syncSwipes ? 'full' : 'relevant';
                     const digest = await snapshotDigest(durableLocalSnapshot(), digestMode);
                     if (digest) { payload.hostSnapshotDigest = digest; payload.hostSnapshotDigestMode = digestMode; payload.syncSwipes = !!settings.syncSwipes; }
-                } else if (operation.type === 'metadata') payload.chatMetadata = clone(operation.chatMetadata || {});
+                } else if (operation.type === 'metadata') {
+                    payload.chatMetadata = clone(operation.chatMetadata || {});
+                    const metadataDigest = await sha256(canonicalJson(localMetadata()));
+                    if (metadataDigest) payload.hostMetadataDigest = metadataDigest;
+                }
 
                 const result = await api('/event', { method: 'POST', body: JSON.stringify(eventBody(operation.type, payload)) });
                 if (!scopeIsCurrent(expectedEpoch)) { operation.inFlight = false; await putOperation(operation); return; }
@@ -1116,9 +1170,11 @@ async function setServerState(state, cursor = {}, { preview = true } = {}) {
     if (!state || !currentScope) return;
     const token = currentState?.subscriptionToken;
     const previous = currentState || {};
+    serverInstanceId = state.serverInstanceId || serverInstanceId;
     const merged = {
         ...clone(previous),
         ...clone(state),
+        serverInstanceId: state.serverInstanceId || previous.serverInstanceId || serverInstanceId,
     };
     const epochChanged = !!previous.epoch && !!merged.epoch && previous.epoch !== merged.epoch;
     if (!epochChanged && Object.prototype.hasOwnProperty.call(state, 'generation') && state.generation && previous.generation && state.generation.id === previous.generation.id) {
@@ -1154,7 +1210,7 @@ async function localDiffersFromBase() {
     const localMeta = settings.syncMetadata ? localMetadata() : null;
     const remoteMeta = currentState.chatMetadata || {};
     return (settings.syncMessages && !snapshotEquivalent(local, remoteBase))
-        || (settings.syncMetadata && JSON.stringify(localMeta) !== JSON.stringify(remoteMeta));
+        || (settings.syncMetadata && canonicalJson(localMeta) !== canonicalJson(remoteMeta));
 }
 
 async function protectRemoteApply(expectedEpoch, incomingState) {
@@ -1180,13 +1236,13 @@ async function handleRemoteEvent(event, state, expectedEpoch) {
     if (event.type === 'metadata') {
         if (!settings.syncMetadata || !(await protectRemoteApply(expectedEpoch, state))) return;
         const messages = settings.syncMessages ? clone(currentState?.snapshot || localSnapshot()) : localSnapshot();
-        await applySnapshotLocally(messages, state?.chatMetadata || event.chatMetadata || {}, expectedEpoch, 'remote-metadata', currentScope, { persist: true });
+        await applySnapshotLocally(messages, state?.chatMetadata || event.chatMetadata || {}, expectedEpoch, 'remote-metadata', currentScope, { persist: false });
         return;
     }
 
     if (['snapshot', 'reconcile_local', 'bootstrap'].includes(event.type)) {
         if (!settings.syncMessages || !(await protectRemoteApply(expectedEpoch, state)) ) return;
-        await applySnapshotLocally(state?.snapshot || [], settings.syncMetadata ? (state?.chatMetadata || {}) : localMetadata(), expectedEpoch, `remote-${event.type}`, currentScope, { persist: true });
+        await applySnapshotLocally(state?.snapshot || [], settings.syncMetadata ? (state?.chatMetadata || {}) : localMetadata(), expectedEpoch, `remote-${event.type}`, currentScope, { persist: false });
         return;
     }
 
@@ -1199,6 +1255,16 @@ async function handleRemoteEvent(event, state, expectedEpoch) {
                 : null,
         };
         if (currentGenerationIsRemote()) await applyActiveGenerationPreview(currentState.generation, expectedEpoch, `remote-${event.type}`, state?.chatMetadata || currentState?.chatMetadata);
+        updateUi(); updateInfo();
+        return;
+    }
+
+    if (event.type === 'generation_input') {
+        if (!settings.syncMessages || !(await protectRemoteApply(expectedEpoch, state))) return;
+        const inputSnapshot = Array.isArray(event.snapshot) ? event.snapshot : state?.snapshot;
+        if (inputSnapshot) await applySnapshotLocally(inputSnapshot, settings.syncMetadata ? (event.chatMetadata || state?.chatMetadata || {}) : localMetadata(), expectedEpoch, 'remote-generation-input', currentScope, { persist: false });
+        const generation = clone(event.generation || state?.generation || currentState?.generation || null);
+        currentState = { ...(currentState || {}), generation, snapshot: Array.isArray(inputSnapshot) ? clone(inputSnapshot) : currentState?.snapshot, chatMetadata: event.chatMetadata || state?.chatMetadata || currentState?.chatMetadata || {} };
         updateUi(); updateInfo();
         return;
     }
@@ -1229,16 +1295,16 @@ async function handleRemoteEvent(event, state, expectedEpoch) {
         const localBeforeTerminal = settings.syncMessages ? durableLocalSnapshot() : [];
         const localMetadataBeforeTerminal = settings.syncMetadata ? localMetadata() : {};
         const localSnapshotChanged = settings.syncMessages && !snapshotEquivalent(localBeforeTerminal, serverBaseSnapshot);
-        const localMetadataChanged = settings.syncMetadata && JSON.stringify(localMetadataBeforeTerminal) !== JSON.stringify(serverBaseMetadata);
+        const localMetadataChanged = settings.syncMetadata && canonicalJson(localMetadataBeforeTerminal) !== canonicalJson(serverBaseMetadata);
         let desiredSnapshot = Array.isArray(finalSnapshot) ? clone(finalSnapshot) : serverBaseSnapshot;
         let desiredMetadata = clone(finalMetadata);
         if (localSnapshotChanged && Array.isArray(finalSnapshot)) desiredSnapshot = mergeSnapshots(serverBaseSnapshot, localBeforeTerminal, finalSnapshot);
         if (localMetadataChanged) desiredMetadata = mergeMetadataThreeWay(serverBaseMetadata, localMetadataBeforeTerminal, finalMetadata);
 
         if (settings.syncMessages && Array.isArray(desiredSnapshot)) {
-            await applySnapshotLocally(desiredSnapshot, desiredMetadata, expectedEpoch, 'remote-generation-terminal', currentScope, { persist: true });
+            await applySnapshotLocally(desiredSnapshot, desiredMetadata, expectedEpoch, 'remote-generation-terminal', currentScope, { persist: false });
         } else if (settings.syncMetadata) {
-            await applySnapshotLocally(localSnapshot(), desiredMetadata, expectedEpoch, 'remote-generation-terminal-metadata', currentScope, { persist: true });
+            await applySnapshotLocally(localSnapshot(), desiredMetadata, expectedEpoch, 'remote-generation-terminal-metadata', currentScope, { persist: false });
         }
 
         currentState = {
@@ -1271,6 +1337,9 @@ async function handleRemoteEvent(event, state, expectedEpoch) {
         updateUi(); updateInfo();
         return;
     }
+
+    if (event.type === 'chat_renamed') { await handleRemoteChatRenamed(event, expectedEpoch); return; }
+    if (event.type === 'chat_deleted' || event.type === 'group_chat_deleted') { await handleRemoteChatDeleted(event, expectedEpoch); return; }
 
     if (event.type === 'group_settings') {
         await applyGroupSettings(event.groupSettings, expectedEpoch);
@@ -1313,8 +1382,20 @@ async function applyRemoteGenerationStream(event, expectedEpoch, serverState = n
     }
 
     currentState = { ...(currentState || {}), generation: nextGeneration };
-    await applyGenerationPreview(nextGeneration, expectedEpoch, 'remote-generation-stream', serverState?.chatMetadata || currentState?.chatMetadata || localMetadata());
+    scheduleFollowerGenerationRender(nextGeneration, expectedEpoch, serverState?.chatMetadata || currentState?.chatMetadata || localMetadata());
     updateUi(); updateInfo();
+}
+
+function scheduleFollowerGenerationRender(generation, expectedEpoch, metadata = null) {
+    if (streamRenderPending) return;
+    streamRenderPending = true;
+    if (streamRenderTimer) clearTimeout(streamRenderTimer);
+    streamRenderTimer = setTimeout(async () => {
+        streamRenderTimer = null;
+        streamRenderPending = false;
+        if (!scopeIsCurrent(expectedEpoch) || !generation) return;
+        try { await applyGenerationPreview(generation, expectedEpoch, 'remote-generation-stream', metadata); } catch (error) { warn('follower generation render failed', error); }
+    }, STREAM_RENDER_INTERVAL);
 }
 
 function durableLocalSnapshotForComparison() { return durableLocalSnapshot(); }
@@ -1328,6 +1409,7 @@ async function resyncCurrentScope(options = {}) {
         if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
 
         const serverState = clone(data.state);
+        const previousState = clone(currentState || {});
         alignMessageIdsToReference(serverState.snapshot || []);
         if (hostMessageIdsDirty && settings.syncMessages) {
             try { await saveCurrentChat(); hostMessageIdsDirty = false; } catch {}
@@ -1341,7 +1423,7 @@ async function resyncCurrentScope(options = {}) {
         const remote = applySyncProjection(serverState.snapshot || []);
         const remoteGeneration = !!serverState.generation && (serverState.generation.ownerClientId !== clientId || serverState.generation.ownerDeviceId !== deviceId);
         const hasLocalDivergence = (settings.syncMessages && !snapshotEquivalent(local, remote))
-            || (settings.syncMetadata && JSON.stringify(localMetadata()) !== JSON.stringify(serverState.chatMetadata || {}));
+            || (settings.syncMetadata && canonicalJson(localMetadata()) !== canonicalJson(serverState.chatMetadata || {}));
 
         if (remoteGeneration && !options.discardLocal) {
             // During another client's live generation, the durable server snapshot is authoritative.
@@ -1349,27 +1431,28 @@ async function resyncCurrentScope(options = {}) {
             if (settings.syncMessages) {
                 await applySnapshotLocally(remote, settings.syncMetadata ? (serverState.chatMetadata || {}) : localMetadata(), expectedEpoch, 'resync-active-generation', expectedScope, { persist: false });
             } else if (settings.syncMetadata) {
-                await applySnapshotLocally(localSnapshot(), serverState.chatMetadata || {}, expectedEpoch, 'resync-active-generation-metadata', expectedScope, { persist: true });
+                await applySnapshotLocally(localSnapshot(), serverState.chatMetadata || {}, expectedEpoch, 'resync-active-generation-metadata', expectedScope, { persist: false });
             }
         } else if (options.discardLocal) {
+            for (const operation of queue) if (!operation.inFlight) await deleteOperation(operation);
             if (settings.syncMessages) {
-                await applySnapshotLocally(remote, settings.syncMetadata ? (serverState.chatMetadata || {}) : localMetadata(), expectedEpoch, 'resync-discard-local', expectedScope, { persist: true });
+                await applySnapshotLocally(remote, settings.syncMetadata ? (serverState.chatMetadata || {}) : localMetadata(), expectedEpoch, 'resync-discard-local', expectedScope, { persist: false });
             } else if (settings.syncMetadata) {
-                await applySnapshotLocally(localSnapshot(), serverState.chatMetadata || {}, expectedEpoch, 'resync-discard-local-metadata', expectedScope, { persist: true });
+                await applySnapshotLocally(localSnapshot(), serverState.chatMetadata || {}, expectedEpoch, 'resync-discard-local-metadata', expectedScope, { persist: false });
             }
         } else if (queue.length || options.preferLocal || hasLocalDivergence) {
-            const base = queue.length ? (queue[0].baseSnapshot || []) : (currentState?.snapshot || remote);
+            const base = queue.length ? (queue[0].baseSnapshot || []) : (previousState?.snapshot || remote);
             const merged = settings.syncMessages ? mergeSnapshots(base, local, remote) : local;
             if (settings.syncMessages) {
-                await applySnapshotLocally(merged, settings.syncMetadata ? mergeMetadataThreeWay(currentState?.chatMetadata || {}, localMetadata(), serverState.chatMetadata || {}) : localMetadata(), expectedEpoch, 'resync-merge', expectedScope, { persist: true });
+                await applySnapshotLocally(merged, settings.syncMetadata ? mergeMetadataThreeWay(previousState?.chatMetadata || {}, localMetadata(), serverState.chatMetadata || {}) : localMetadata(), expectedEpoch, 'resync-merge', expectedScope, { persist: false });
             } else if (settings.syncMetadata) {
-                await applySnapshotLocally(localSnapshot(), serverState.chatMetadata || {}, expectedEpoch, 'resync-merge-metadata', expectedScope, { persist: true });
+                await applySnapshotLocally(localSnapshot(), serverState.chatMetadata || {}, expectedEpoch, 'resync-merge-metadata', expectedScope, { persist: false });
             }
             if (!queue.length && (settings.syncMessages || settings.syncMetadata)) await enqueueMutation('resync-merge', expectedEpoch);
         } else if (settings.syncMessages || settings.syncMetadata) {
             const messages = settings.syncMessages ? remote : localSnapshot();
             const metadata = settings.syncMetadata ? (serverState.chatMetadata || {}) : localMetadata();
-            await applySnapshotLocally(messages, metadata, expectedEpoch, 'resync', expectedScope, { persist: true });
+            await applySnapshotLocally(messages, metadata, expectedEpoch, 'resync', expectedScope, { persist: false });
         }
 
         if (currentScope?.kind === 'group' && settings.syncGroupSettings && serverState.groupSettings) await applyGroupSettings(serverState.groupSettings, expectedEpoch);
@@ -1429,6 +1512,13 @@ async function connectSse() {
 async function handleSseData(type, data, lastEventId, expectedEpoch, expectedScope) {
     if (!scopeIsCurrent(expectedEpoch, expectedScope)) return;
     if (type === 'hello') {
+        const serverChanged = !!serverInstanceId && !!data.serverInstanceId && serverInstanceId !== data.serverInstanceId;
+        if (serverChanged && currentState?.generation) {
+            await writeMeta(expectedScope, { lastEventId: 0 });
+            await resyncCurrentScope();
+            return;
+        }
+        serverInstanceId = data.serverInstanceId || serverInstanceId;
         if (currentState?.epoch && data.epoch && currentState.epoch !== data.epoch) { await writeMeta(expectedScope, { lastEventId: 0 }); await resyncCurrentScope(); return; }
         sseHelloEventId = Number(data.eventId || 0);
         currentState = { ...(currentState || {}), epoch: data.epoch, revision: Math.max(Number(currentState?.revision || 0), Number(data.revision || 0)), generation: clone(data.generation || null) };
@@ -1468,11 +1558,38 @@ async function handleSseData(type, data, lastEventId, expectedEpoch, expectedSco
 async function joinScope(scope, expectedEpoch) {
     if (!scope || !serverCompatible || !settings.enabled || !scopeIsCurrent(expectedEpoch, scope)) return false;
     const previousMeta = await readMeta(scope);
+    if (settings.syncMessages) {
+        ensureHostMessageIds();
+        if (hostMessageIdsDirty) {
+            try { await saveCurrentChat(); hostMessageIdsDirty = false; } catch (error) { warn('pre-join message-ID save failed', error); }
+        }
+    }
     try {
         const result = await api('/join', { method: 'POST', body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope, clientId, deviceId }) });
         if (!scopeIsCurrent(expectedEpoch, scope)) return false;
         serverUserId = String(result.userId || serverUserId || '');
-        currentState = { ...clone(result.state), subscriptionToken: result.subscriptionToken };
+        currentState = { ...clone(result.state), subscriptionToken: result.subscriptionToken, serverInstanceId: result.state?.serverInstanceId || result.serverInstanceId || serverInstanceId };
+        serverInstanceId = result.state?.serverInstanceId || result.serverInstanceId || serverInstanceId;
+        if (result.state?.deleted) {
+            await handleRemoteChatDeleted({ type: 'chat_deleted' }, expectedEpoch);
+            return true;
+        }
+        if (result.state?.renamedTo?.scope?.chatId && String(result.state.renamedTo.scope.chatId) !== String(scope.chatId)) {
+            await handleRemoteChatRenamed({ newChatId: String(result.state.renamedTo.scope.chatId) }, expectedEpoch);
+            return true;
+        }
+        if (result.host?.missingMessageIds && settings.syncMessages) {
+            ensureHostMessageIds();
+            if (hostMessageIdsDirty) {
+                try { await saveCurrentChatVerified(expectedEpoch, scope); hostMessageIdsDirty = false; } catch (error) { warn('host synchronization ID persistence failed', error); }
+            }
+            if (Number(result.state?.revision || 0) === 0) {
+                await enqueueMutation('host-message-id-bootstrap', expectedEpoch);
+                await flushQueue(expectedEpoch);
+                const refreshed = await refreshServerState(expectedEpoch);
+                if (refreshed) result.state = refreshed;
+            }
+        }
         const sameEpoch = previousMeta.epoch === result.state.epoch;
         await writeMeta(scope, {
             lastEventId: sameEpoch ? Number(previousMeta.lastEventId || 0) : 0,
@@ -1499,21 +1616,21 @@ async function joinScope(scope, expectedEpoch) {
             if (settings.syncMessages) {
                 await applySnapshotLocally(remote, settings.syncMetadata ? (result.state.chatMetadata || {}) : localMetadata(), expectedEpoch, 'join-active-generation', scope, { persist: false });
             } else if (settings.syncMetadata) {
-                await applySnapshotLocally(localSnapshot(), result.state.chatMetadata || {}, expectedEpoch, 'join-active-generation-metadata', scope, { persist: true });
+                await applySnapshotLocally(localSnapshot(), result.state.chatMetadata || {}, expectedEpoch, 'join-active-generation-metadata', scope, { persist: false });
             }
         } else if (differs) {
             const base = queue.length ? (queue[0].baseSnapshot || []) : (sameEpoch ? previousMeta.baseSnapshot || [] : remote);
             const merged = mergeSnapshots(base, local, remote);
             if (settings.syncMessages) {
-                await applySnapshotLocally(merged, settings.syncMetadata ? mergeMetadataThreeWay(currentState?.chatMetadata || {}, localMetadata(), result.state.chatMetadata || {}) : localMetadata(), expectedEpoch, 'join-merge', scope, { persist: true });
+                await applySnapshotLocally(merged, settings.syncMetadata ? mergeMetadataThreeWay(currentState?.chatMetadata || {}, localMetadata(), result.state.chatMetadata || {}) : localMetadata(), expectedEpoch, 'join-merge', scope, { persist: false });
             } else if (settings.syncMetadata) {
-                await applySnapshotLocally(localSnapshot(), result.state.chatMetadata || {}, expectedEpoch, 'join-merge-metadata', scope, { persist: true });
+                await applySnapshotLocally(localSnapshot(), result.state.chatMetadata || {}, expectedEpoch, 'join-merge-metadata', scope, { persist: false });
             }
             if (!queue.length && (settings.syncMessages || settings.syncMetadata)) await enqueueMutation('join-merge', expectedEpoch);
         } else if (settings.syncMessages || settings.syncMetadata) {
             const messages = settings.syncMessages ? remote : localSnapshot();
             const metadata = settings.syncMetadata ? (result.state.chatMetadata || {}) : localMetadata();
-            await applySnapshotLocally(messages, metadata, expectedEpoch, 'join', scope, { persist: true });
+            await applySnapshotLocally(messages, metadata, expectedEpoch, 'join', scope, { persist: false });
         }
 
         if (currentScope?.kind === 'group' && settings.syncGroupSettings && result.state.groupSettings) await applyGroupSettings(result.state.groupSettings, expectedEpoch);
@@ -1593,21 +1710,76 @@ async function sendHeartbeat() {
     const expectedEpoch = scopeEpoch;
     const expectedScope = clone(currentScope);
     try {
-        const result = await api('/heartbeat', { method: 'POST', body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope: expectedScope, clientId, deviceId }) });
+        const result = await api('/heartbeat', {
+            method: 'POST',
+            body: JSON.stringify({
+                protocol: PROTOCOL,
+                schema: SCHEMA,
+                scope: expectedScope,
+                clientId,
+                deviceId,
+            }),
+        });
         if (!scopeIsCurrent(expectedEpoch, expectedScope)) return;
-        const hadGeneration = !!currentState?.generation;
-        currentState = { ...(currentState || {}), generation: clone(result.generation || null), revision: Math.max(Number(currentState?.revision || 0), Number(result.revision || 0)) };
-        if (localGeneration && !result.generation) {
-            localGenerationLost = true;
-            stopGenerationHeartbeat();
-            try { ctx.stopGeneration?.(); } catch {}
-        } else if (result.generation && currentGenerationIsRemote()) {
-            await applyActiveGenerationPreview(result.generation, expectedEpoch, 'heartbeat-generation-preview', currentState?.chatMetadata);
-        } else if (hadGeneration && !result.generation) {
-            await resyncCurrentScope({ discardLocal: true });
+
+        const previousGeneration = clone(currentState?.generation || null);
+        const returnedGeneration = clone(result.generation || null);
+
+        currentState = {
+            ...(currentState || {}),
+            generation: returnedGeneration,
+            revision: Math.max(
+                Number(currentState?.revision || 0),
+                Number(result.revision || 0),
+            ),
+        };
+
+        if (localGeneration) {
+            if (
+                returnedGeneration
+                && returnedGeneration.id === localGeneration.id
+                && returnedGeneration.ownerClientId === clientId
+                && returnedGeneration.ownerDeviceId === deviceId
+            ) {
+                localGenerationLost = false;
+                await applyActiveGenerationPreview(
+                    returnedGeneration,
+                    expectedEpoch,
+                    'heartbeat-generation-preview',
+                    currentState?.chatMetadata,
+                );
+            } else if (!returnedGeneration) {
+                // The lease may have expired while the owner is still generating.
+                // Attempt to reclaim the exact same generation instead of killing a
+                // potentially valid native generation on a transient heartbeat race.
+                const reclaimed = await reclaimGeneration(
+                    expectedEpoch,
+                    expectedScope,
+                );
+                if (!reclaimed && previousGeneration?.id === localGeneration?.id) {
+                    warn('generation lease disappeared and could not be reclaimed');
+                    await stopLostGeneration();
+                }
+            } else {
+                await stopLostGeneration();
+            }
+        } else if (
+            returnedGeneration
+            && returnedGeneration.ownerClientId !== clientId
+            && returnedGeneration.ownerDeviceId !== deviceId
+        ) {
+            await applyActiveGenerationPreview(
+                returnedGeneration,
+                expectedEpoch,
+                'heartbeat-remote-generation-preview',
+                currentState?.chatMetadata,
+            );
         }
+
         updateUi();
-    } catch { scheduleReconnect(expectedEpoch); }
+    } catch {
+        scheduleReconnect(expectedEpoch);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1632,34 +1804,223 @@ async function stopLostGeneration() {
     stopGenerationHeartbeat();
     try { ctx.stopGeneration?.(); } catch {}
     updateUi(); updateInfo();
-
-    // Restore the last authoritative durable chat locally. The server lease may
-    // remain visible for a few seconds until it expires; that is preferable to
-    // allowing this client to commit a stale partial generation.
     if (lostScope && scopeIsCurrent(expectedEpoch, lostScope)) {
         try { await resyncCurrentScope({ discardLocal: true }); } catch {}
+    }
+}
+async function reclaimGeneration(expectedEpoch = scopeEpoch, expectedScope = currentScope) {
+    if (
+        !localGeneration
+        || !expectedScope
+        || !scopeIsCurrent(expectedEpoch, expectedScope)
+        || !serverCompatible
+        || !settings.coordinateGeneration
+    ) return false;
+
+    const generationId = localGeneration.id;
+    const generationType = localGeneration.type || 'normal';
+    const scopeAtStart = clone(expectedScope);
+    try {
+        const result = await api('/event', {
+            method: 'POST',
+            body: JSON.stringify(eventBody('generation_claim', {
+                opId: `reclaim_${generationId}`,
+                generationId,
+                generationType,
+            }, scopeAtStart)),
+        });
+
+        if (!scopeIsCurrent(expectedEpoch, scopeAtStart)) return false;
+
+        localGenerationLost = false;
+        generationStartedAcknowledged = false;
+        currentState = {
+            ...(currentState || {}),
+            generation: clone(result.generation),
+        };
+        startGenerationHeartbeat();
+
+        // The native Generate() is already underway, so re-enter the server-side
+        // started phase immediately and let the next captured stream update carry
+        // the current complete message to followers.
+        const started = await acknowledgeGenerationStarted(
+            generationType,
+            scopeAtStart,
+        );
+        if (!started) return false;
+
+        updateUi();
+        updateInfo();
+        return true;
+    } catch (error) {
+        if (error.code === 'generation_busy') {
+            return false;
+        }
+        if (error.code === 'client_id_conflict' || error.code === 'not_member') {
+            return false;
+        }
+        warn('generation reclaim failed', error);
+        return false;
+    }
+}
+async function confirmGenerationAfterHeartbeatFailure(expectedEpoch, expectedScope) {
+    if (!localGeneration || !scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+    try {
+        const data = await api('/state', {
+            method: 'POST',
+            body: JSON.stringify({
+                protocol: PROTOCOL,
+                schema: SCHEMA,
+                scope: expectedScope,
+                clientId,
+                deviceId,
+            }),
+        });
+        if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+        const generation = data.state?.generation || null;
+        currentState = {
+            ...(currentState || {}),
+            ...clone(data.state || {}),
+        };
+
+        if (
+            generation
+            && generation.id === localGeneration.id
+            && generation.ownerClientId === clientId
+            && generation.ownerDeviceId === deviceId
+        ) {
+            localGenerationLost = false;
+            generationHeartbeatFailures = 0;
+            return true;
+        }
+
+        if (!generation) {
+            return reclaimGeneration(expectedEpoch, expectedScope);
+        }
+
+        return false;
+    } catch {
+        return false;
     }
 }
 async function renewGeneration() {
     if (!localGeneration || localGenerationLost || !currentScope) return;
     const expectedEpoch = scopeEpoch;
     const expectedScope = clone(currentScope);
+    const generationId = localGeneration.id;
     try {
-        const result = await api('/heartbeat', { method: 'POST', body: JSON.stringify({ protocol: PROTOCOL, schema: SCHEMA, scope: expectedScope, clientId, deviceId, generationId: localGeneration.id }) });
+        const result = await api('/heartbeat', {
+            method: 'POST',
+            body: JSON.stringify({
+                protocol: PROTOCOL,
+                schema: SCHEMA,
+                scope: expectedScope,
+                clientId,
+                deviceId,
+                generationId,
+            }),
+        });
         if (!scopeIsCurrent(expectedEpoch, expectedScope)) return;
         generationHeartbeatFailures = 0;
         const generation = result.generation || null;
-        currentState = { ...(currentState || {}), generation: clone(generation) };
-        if (!generation || generation.id !== localGeneration.id || generation.ownerClientId !== clientId || generation.ownerDeviceId !== deviceId) {
-            await stopLostGeneration();
+        currentState = {
+            ...(currentState || {}),
+            generation: clone(generation),
+            revision: Math.max(
+                Number(currentState?.revision || 0),
+                Number(result.revision || 0),
+            ),
+        };
+
+        if (!generation) {
+            const reclaimed = await reclaimGeneration(expectedEpoch, expectedScope);
+            if (!reclaimed) await stopLostGeneration();
             return;
         }
+
+        if (
+            generation.id !== generationId
+            || generation.ownerClientId !== clientId
+            || generation.ownerDeviceId !== deviceId
+        ) {
+            const reclaimed = await confirmGenerationAfterHeartbeatFailure(expectedEpoch, expectedScope);
+            if (!reclaimed) await stopLostGeneration();
+            return;
+        }
+
+        localGenerationLost = false;
         updateUi();
     } catch (error) {
         generationHeartbeatFailures++;
-        if (['generation_mismatch', 'no_generation', 'not_generation_owner'].includes(error.code) || generationHeartbeatFailures >= 3) await stopLostGeneration();
+
+        if (
+            ['generation_mismatch', 'no_generation', 'not_generation_owner'].includes(error.code)
+        ) {
+            const reclaimed = await reclaimGeneration(expectedEpoch, expectedScope);
+            if (!reclaimed) await stopLostGeneration();
+            return;
+        }
+
+        if (generationHeartbeatFailures >= 3) {
+            const confirmed = await confirmGenerationAfterHeartbeatFailure(expectedEpoch, expectedScope);
+            if (!confirmed) await stopLostGeneration();
+        }
     }
 }
+async function sendGenerationInput(expectedEpoch = scopeEpoch, expectedScope = currentScope) {
+    if (!localGeneration || localGenerationLost || !expectedScope || !settings.coordinateGeneration || !scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+    const generationId = localGeneration.id;
+    ensureHostMessageIds();
+    if (hostMessageIdsDirty) {
+        try {
+            await saveCurrentChatVerified(expectedEpoch, expectedScope);
+            hostMessageIdsDirty = false;
+        } catch (error) {
+            warn('generation input message-ID save failed', error);
+            return false;
+        }
+    }
+    const snapshot = localSnapshot();
+    const metadata = localMetadata();
+    const digestMode = settings.syncSwipes ? 'full' : 'relevant';
+    const digest = await snapshotDigest(snapshot, digestMode);
+    const metadataDigest = settings.syncMetadata ? await sha256(canonicalJson(metadata)) : null;
+    const opId = generationInputOpId || `input_${generationId}`;
+    generationInputOpId = opId;
+    for (let attempt = 0; attempt < GENERATION_INPUT_MAX_RETRIES; attempt++) {
+        try {
+            const result = await api('/event', {
+                method: 'POST',
+                body: JSON.stringify(eventBody('generation_input', {
+                    opId,
+                    generationId,
+                    baseRevision: Number(currentState?.revision || 0),
+                    snapshot,
+                    chatMetadata: metadata,
+                    syncSwipes: !!settings.syncSwipes,
+                    ...(digest ? { hostSnapshotDigest: digest, hostSnapshotDigestMode: digestMode } : {}),
+                    ...(metadataDigest ? { hostMetadataDigest: metadataDigest } : {}),
+                }, expectedScope)),
+            });
+            if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+            await setServerState(result.state, { epoch: result.epoch, revision: result.revision, lastEventId: result.eventId });
+            return true;
+        } catch (error) {
+            if (error.code === 'revision_conflict' || error.code === 'stale_host' || error.code === 'stale_host_metadata') {
+                await refreshServerState(expectedEpoch);
+                continue;
+            }
+            if (attempt < GENERATION_INPUT_MAX_RETRIES - 1 && (!error.status || error.status >= 500)) {
+                await sleep(100 * (attempt + 1));
+                continue;
+            }
+            warn('generation input synchronization failed', error);
+            return false;
+        }
+    }
+    return false;
+}
+
 async function claimGeneration(generationType = 'normal') {
     if (!settings.coordinateGeneration || !currentScope || !serverCompatible) return true;
     if (localGeneration && !localGenerationLost) return true;
@@ -1679,6 +2040,7 @@ async function claimGeneration(generationType = 'normal') {
             localGeneration = { id: generationId, type: generationType, terminalOpId: `terminal_${generationId}` };
             localGenerationLost = false;
             generationStartedAcknowledged = false;
+            generationInputOpId = null;
             streamMessageFingerprints.clear();
             currentState = { ...(currentState || {}), generation: clone(result.generation) };
             startGenerationHeartbeat();
@@ -1700,14 +2062,10 @@ async function claimGeneration(generationType = 'normal') {
 async function acknowledgeGenerationStarted(type) {
     if (!localGeneration || localGenerationLost || generationStartedAcknowledged || !currentScope) return !!localGeneration;
     const scopeAtStart = clone(currentScope);
-    let messageId = null;
-    ensureHostMessageIds();
-    const last = ctx.chat?.at?.(-1);
-    if (last && last.is_user !== true) messageId = stableMessageId(last);
     const opId = `start_${localGeneration.id}`;
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
-            const result = await api('/event', { method: 'POST', body: JSON.stringify(eventBody('generation_started', { opId, generationId: localGeneration.id, generationType: type || localGeneration.type || 'normal', ...(messageId ? { messageId } : {}) }, scopeAtStart)) });
+            const result = await api('/event', { method: 'POST', body: JSON.stringify(eventBody('generation_started', { opId, generationId: localGeneration.id, generationType: type || localGeneration.type || 'normal' }, scopeAtStart)) });
             if (!scopeIsCurrent(scopeEpoch, scopeAtStart)) return false;
             generationStartedAcknowledged = true;
             currentState = { ...(currentState || {}), generation: clone(result.generation) };
@@ -1726,6 +2084,56 @@ async function acknowledgeGenerationStarted(type) {
     }
     return false;
 }
+
+async function attemptTerminalRecovery(status, generationId, expectedEpoch, expectedScope) {
+    if (!expectedScope || !scopeIsCurrent(expectedEpoch, expectedScope) || !localGeneration || localGeneration.id !== generationId) return false;
+    ensureHostMessageIds();
+    const refreshed = await refreshServerState(expectedEpoch);
+    if (!refreshed) return false;
+    try {
+        await saveCurrentChatVerified(expectedEpoch, expectedScope);
+        hostMessageIdsDirty = false;
+    } catch {
+        return false;
+    }
+    const snapshot = localSnapshot();
+    const metadata = localMetadata();
+    const digestMode = settings.syncSwipes ? 'full' : 'relevant';
+    const digest = await snapshotDigest(snapshot, digestMode);
+    const metadataDigest = settings.syncMetadata ? await sha256(canonicalJson(metadata)) : null;
+    try {
+        const result = await api('/event', {
+            method: 'POST',
+            body: JSON.stringify(eventBody('generation_terminal_recover', {
+                opId: localGeneration.terminalOpId || `terminal_${generationId}`,
+                generationId,
+                baseRevision: Number(refreshed.revision || 0),
+                status,
+                snapshot,
+                chatMetadata: metadata,
+                syncSwipes: !!settings.syncSwipes,
+                ...(digest ? { hostSnapshotDigest: digest, hostSnapshotDigestMode: digestMode } : {}),
+                ...(metadataDigest ? { hostMetadataDigest: metadataDigest } : {}),
+            }, expectedScope)),
+        });
+        if (!scopeIsCurrent(expectedEpoch, expectedScope)) return false;
+        await setServerState(result.state, { epoch: result.epoch, revision: result.revision, lastEventId: result.eventId });
+        stopGenerationHeartbeat();
+        localGeneration = null;
+        localGenerationLost = false;
+        generationStartedAcknowledged = false;
+        streamMessageFingerprints.clear();
+        void flushQueue(expectedEpoch);
+        return true;
+    } catch (error) {
+        if (['generation_busy', 'generation_recovery_unavailable'].includes(error.code)) return false;
+        if (error.code === 'revision_conflict') {
+            await refreshServerState(expectedEpoch);
+        }
+        return false;
+    }
+}
+
 async function finishGeneration(status = 'completed') {
     if (finishingGeneration) return;
     if (!localGeneration || localGenerationLost || !currentScope || !serverCompatible) return;
@@ -1745,7 +2153,7 @@ async function finishGeneration(status = 'completed') {
         if (!scopeIsCurrent(expectedEpoch, scopeAtStart) || localGeneration?.id !== generationId) return;
         ensureHostMessageIds();
         try {
-            await saveCurrentChat();
+            await saveCurrentChatVerified(expectedEpoch, scopeAtStart);
             hostMessageIdsDirty = false;
         } catch (error) {
             warn('final native chat save failed', error);
@@ -1787,6 +2195,7 @@ async function finishGeneration(status = 'completed') {
                 return;
             } catch (error) {
                 if (['generation_mismatch', 'no_generation', 'not_generation_owner'].includes(error.code)) {
+                    if (await attemptTerminalRecovery(status, generationId, expectedEpoch, scopeAtStart)) return;
                     await stopLostGeneration();
                     return;
                 }
@@ -1810,7 +2219,7 @@ async function sendGenerationStream(message, expectedEpoch = scopeEpoch, expecte
     const normalized = normalizeSnapshot([message])[0];
     const messageId = stableMessageId(normalized);
     if (!messageId) return false;
-    const fingerprint = JSON.stringify(projectSnapshotForDigest([normalized], settings.syncSwipes ? 'full' : 'relevant'));
+    const fingerprint = canonicalJson(projectSnapshotForDigest([normalized], settings.syncSwipes ? 'full' : 'relevant'));
     if (streamMessageFingerprints.get(messageId) === fingerprint) return true;
     const nextSequence = Number(currentState?.generation?.streamSeq || 0) + 1;
     const opId = `stream_${generationId}_${nextSequence}`;
@@ -1923,7 +2332,7 @@ async function createNativeBranch() {
         const bookmarks = await import('/scripts/bookmarks.js');
         const childChatId = await bookmarks.createBranch(index, {});
         if (!childChatId || !scopeIsCurrent(expectedEpoch, parentScope)) return;
-        await saveCurrentChat();
+        await saveCurrentChatVerified(expectedEpoch, parentScope);
         await enqueueMutation('native-branch-created', expectedEpoch);
         await flushQueue(expectedEpoch);
         await announceNativeChild(parentScope, String(childChatId), 'branch', expectedEpoch);
@@ -1938,7 +2347,7 @@ async function createNativeCheckpoint() {
         const bookmarks = await import('/scripts/bookmarks.js');
         const childChatId = await bookmarks.createNewBookmark(index);
         if (!childChatId || !scopeIsCurrent(expectedEpoch, parentScope)) return;
-        await saveCurrentChat();
+        await saveCurrentChatVerified(expectedEpoch, parentScope);
         await enqueueMutation('native-checkpoint-created', expectedEpoch);
         await flushQueue(expectedEpoch);
         await announceNativeChild(parentScope, String(childChatId), 'checkpoint', expectedEpoch);
@@ -1980,7 +2389,7 @@ async function publishGroupSettings(expectedEpoch = scopeEpoch) {
     if (!settings.syncGroupSettings || generationActive() || !currentScope || currentScope.kind !== 'group' || !serverCompatible || !scopeIsCurrent(expectedEpoch)) return;
     const snapshot = currentGroupSettings();
     if (!snapshot) return;
-    if (JSON.stringify(snapshot) === JSON.stringify(currentState?.groupSettings || {})) return;
+    if (canonicalJson(snapshot) === canonicalJson(currentState?.groupSettings || {})) return;
     try {
         const result = await api('/event', { method: 'POST', body: JSON.stringify(eventBody('group_settings', { opId: randomId('op_'), baseRevision: Number(currentState?.revision || 0), groupSettings: snapshot })) });
         if (scopeIsCurrent(expectedEpoch)) await setServerState(result.state, { epoch: result.epoch, revision: result.revision, lastEventId: result.eventId });
@@ -2010,7 +2419,13 @@ async function handleChatChanged() {
     if (applyingRemoteDepth) return;
     const nextScope = getCurrentScope();
     if (sameScope(nextScope, currentScope)) { scheduleLocalCapture('chat-changed'); return; }
-    await switchScope(nextScope);
+    const requested = clone(nextScope);
+    scopeTransitionChain = scopeTransitionChain.catch(() => {}).then(async () => {
+        const latest = getCurrentScope();
+        if (!sameScope(latest, requested) && !(requested === null && latest === null)) return;
+        await switchScope(requested);
+    });
+    await scopeTransitionChain;
 }
 function flushDeferredCapture() {
     if (generationActive() || !deferredCaptureReason) return;
@@ -2044,13 +2459,90 @@ function bindBrowserEvent(name, fn, options) { window.addEventListener(name, fn,
 function unbindBrowserEvents() { for (const binding of browserBindings) window.removeEventListener(binding.name, binding.fn, binding.options); browserBindings = []; }
 function bindStEvent(name, handler) {
     if (!name || !ctx?.eventSource) return;
-    const wrapped = (...args) => void handler(...args);
+    const wrapped = (...args) => {
+        try {
+            Promise.resolve(handler(...args)).catch(error => warn(`ST event handler failed: ${name}`, error));
+        } catch (error) {
+            warn(`ST event handler failed: ${name}`, error);
+        }
+    };
     ctx.eventSource.on(name, wrapped);
     listenerBindings.push({ name, wrapped });
 }
 function unbindStEvents() {
     for (const binding of listenerBindings) try { ctx.eventSource?.removeListener(binding.name, binding.wrapped); } catch {}
     listenerBindings = [];
+}
+
+
+async function sendChatLifecycleEvent(type, scope, extra = {}) {
+    if (applyingRemoteDepth || !scope || !serverCompatible || !settings.enabled) return false;
+    try {
+        await api('/event', { method: 'POST', body: JSON.stringify(eventBody(type, {
+            opId: randomId('op_'),
+            baseRevision: Number(currentState?.revision || 0),
+            ...extra,
+        }, scope)) });
+        return true;
+    } catch (error) {
+        warn(`${type} synchronization failed`, error);
+        return false;
+    }
+}
+
+async function handleLocalChatRenamed(...args) {
+    if (applyingRemoteDepth || !currentState?.scope || !serverCompatible || !settings.enabled) return;
+    const oldScope = clone(currentState.scope);
+    const next = getCurrentScope();
+    if (!next || sameScope(next, oldScope)) return;
+    if (next.kind !== oldScope.kind) return;
+    if (oldScope.kind === 'character' && next.character !== oldScope.character) return;
+    if (oldScope.kind === 'group' && next.groupId !== oldScope.groupId) return;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (!scopeIsCurrent(scopeEpoch)) return;
+        const ok = await sendChatLifecycleEvent('chat_renamed', oldScope, {
+            oldChatId: oldScope.chatId,
+            newChatId: next.chatId,
+            newScope: clone(next),
+        });
+        if (ok) return;
+        await sleep(200 * (attempt + 1));
+    }
+}
+
+async function handleRemoteChatRenamed(event, expectedEpoch) {
+    if (!scopeIsCurrent(expectedEpoch) || !event.newChatId) return;
+    const target = String(event.newChatId);
+    applyingRemoteDepth++;
+    try {
+        if (currentScope.kind === 'group') {
+            const groupModule = await import('/scripts/group-chats.js');
+            if (typeof groupModule.openGroupChat === 'function') {
+                await groupModule.openGroupChat(String(currentScope.groupId), target);
+            }
+        } else if (typeof ctx.openCharacterChat === 'function') {
+            await ctx.openCharacterChat(target);
+        } else if (typeof ctx.reloadCurrentChat === 'function') {
+            await ctx.reloadCurrentChat();
+        }
+    } finally {
+        applyingRemoteDepth = Math.max(0, applyingRemoteDepth - 1);
+    }
+    await handleChatChanged();
+}
+
+async function handleRemoteChatDeleted(event, expectedEpoch) {
+    if (!scopeIsCurrent(expectedEpoch)) return;
+    applyingRemoteDepth++;
+    try {
+        if (Array.isArray(ctx.chat)) ctx.chat.splice(0, ctx.chat.length);
+        await ctx.updateChatMetadata?.({}, true);
+        await ctx.printMessages?.();
+    } finally {
+        applyingRemoteDepth = Math.max(0, applyingRemoteDepth - 1);
+    }
+    toast('warning', 'This chat was deleted on another synchronized client.');
+    await handleChatChanged();
 }
 
 function bindStEvents() {
@@ -2065,12 +2557,24 @@ function bindStEvents() {
     ];
     const swipingKeys = new Set(['MESSAGE_SWIPED', 'MESSAGE_SWIPE_DELETED', 'IMAGE_SWIPED']);
     const reasoningToolKeys = new Set(['MESSAGE_REASONING_EDITED', 'MESSAGE_REASONING_DELETED', 'TOOL_CALLS_PERFORMED']);
-    for (const key of capture) if (events[key]) bindStEvent(events[key], () => {
+    for (const key of capture) if (events[key]) bindStEvent(events[key], (...args) => {
         if (applyingRemoteDepth !== 0) return;
+        if (key === 'MESSAGE_SENT' && localGeneration && !localGenerationLost && settings.coordinateGeneration) {
+            void sendGenerationInput(scopeEpoch, clone(currentScope));
+            return;
+        }
+        if (generationActive()) {
+            deferredCaptureReason = key;
+            return;
+        }
         if (swipingKeys.has(key) && !settings.syncSwipes) return;
         if (reasoningToolKeys.has(key) && !settings.syncSwipes) return;
         scheduleLocalCapture(key);
     });
+
+    if (events.CHAT_RENAMED) bindStEvent(events.CHAT_RENAMED, (...args) => void handleLocalChatRenamed(...args));
+    if (events.CHAT_DELETED) bindStEvent(events.CHAT_DELETED, () => { if (applyingRemoteDepth === 0 && currentState?.scope) void sendChatLifecycleEvent('chat_deleted', clone(currentState.scope), { chatId: currentState.scope.chatId }); });
+    if (events.GROUP_CHAT_DELETED) bindStEvent(events.GROUP_CHAT_DELETED, () => { if (applyingRemoteDepth === 0 && currentState?.scope) void sendChatLifecycleEvent('group_chat_deleted', clone(currentState.scope), { chatId: currentState.scope.chatId }); });
 
     const chatChangedEvents = [events.CHAT_CHANGED, events.CHAT_LOADED, events.CHAT_CREATED, events.GROUP_CHAT_CREATED].filter(Boolean);
     for (const event of new Set(chatChangedEvents)) bindStEvent(event, () => void handleChatChanged());
@@ -2122,11 +2626,11 @@ function blockFollowerSendKeydown(event) {
 }
 function blockFollowerSendClick(event) {
     if (!currentGenerationIsRemote()) return;
-    const button = event.target instanceof Element ? event.target.closest('#send_but') : null;
+    const button = event.target instanceof Element ? event.target.closest('#send_but, #option_regenerate, #option_continue, #swipe_left, #swipe_right, .swipe_left, .swipe_right, #option_remove, #option_delete, #option_continue, #send_but') : null;
     if (!button) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    toast('warning', 'This chat is generating on another synchronized client.');
+    toast('info', 'This chat is generating on another synchronized client. The response is being mirrored here.');
 }
 
 async function generationInterceptor(chat, contextSize, abort, type) {
@@ -2159,7 +2663,7 @@ async function generationInterceptor(chat, contextSize, abort, type) {
         return;
     }
 
-    const generationType = groupGenerationActive ? 'group' : (type || 'normal');
+    const generationType = currentScope?.kind === 'group' ? 'group' : (type || 'normal');
 
     // For group generations, the first member claims the wrapper-level lease and
     // subsequent member Generate() calls reuse it.
@@ -2171,8 +2675,9 @@ async function generationInterceptor(chat, contextSize, abort, type) {
         return;
     }
 
-    // Synchronize the newly-sent user message before the LLM request begins.
-    await enqueueMutation('pre-generation', expectedEpoch);
+    // The current SillyTavern generation interceptor runs before the native user
+    // message is inserted. Do not snapshot the current chat here: MESSAGE_SENT
+    // will publish the actual generation input after native persistence.
     await flushQueue(expectedEpoch);
     if (!scopeIsCurrent(expectedEpoch, expectedScope)) return;
     const remaining = await listQueuedOps(expectedScope);
@@ -2229,7 +2734,7 @@ async function initialize() {
 
 async function stop() {
     ++scopeEpoch;
-    clearTimeout(captureTimer); clearTimeout(streamTimer);
+    clearTimeout(captureTimer); clearTimeout(streamTimer); clearTimeout(streamRenderTimer);
     if (generationFinishRetryTimer) clearTimeout(generationFinishRetryTimer);
     generationFinishRetryTimer = null;
     stopHeartbeat(); stopGenerationHeartbeat(); closeSse();
@@ -2239,7 +2744,7 @@ async function stop() {
     try { await leaveScope(currentScope); } catch {}
     currentScope = null; currentState = null; localGeneration = null; localGenerationLost = false;
     generationStartedAcknowledged = false; groupGenerationActive = false; groupGenerationStatus = 'completed';
-    pendingStreamMessage = null; streamMessageFingerprints.clear(); deferredCaptureReason = null; started = false; startPromise = null; flushingQueueKeys.clear(); enqueueMutationChains.clear();
+    pendingStreamMessage = null; streamMessageFingerprints.clear(); deferredCaptureReason = null; streamRenderPending = false; generationInputOpId = null; started = false; startPromise = null; flushingQueueKeys.clear(); enqueueMutationChains.clear();
     updateUi(); updateInfo();
 }
 
