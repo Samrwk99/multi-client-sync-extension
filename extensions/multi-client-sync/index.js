@@ -12,7 +12,6 @@ const REMOTE_RENDER_MS = 45;
 const STORAGE_KEY = 'multi-client-sync-settings-v1';
 const CLIENT_KEY = 'multi-client-sync-client-id-v1';
 const DEVICE_KEY = 'multi-client-sync-device-id-v1';
-const LAST_SCOPE_KEY = 'multi-client-sync-last-scope-v2';
 const BC_NAME = 'multi-client-sync';
 
 const DEFAULT_SETTINGS = {
@@ -87,6 +86,8 @@ let generationHeartbeatInFlight = null;
 let generationMismatchSince = 0;
 let generationClaimedThisPage = false;
 let generationClaimInFlightId = null;
+let generationRecoveryInFlight = null;
+let localGenerationBaseRevision = 0;
 let lastTerminatedGenerationId = null;
 let streamInFlightSeq = 0;
 let streamRetryTimer = null;
@@ -99,6 +100,7 @@ let localDirty = false;
 let localDirtyScopeKey = '';
 let streamCaptureTimer = null;
 let generationTerminalPhase = null;
+let remoteSendButtonState = null;
 
 function log(...args) {
     if (settings.debug) console.debug('[MCS]', ...args);
@@ -195,40 +197,6 @@ function localGenerationMatches(generationId, scope = null) {
     if (!localGeneration || localGeneration.generationId !== generationId) return false;
     if (scope && makeScopeKey(localGenerationScope) !== makeScopeKey(scope)) return false;
     return true;
-}
-
-function readLastScope() {
-    try {
-        const raw = sessionStorage.getItem(LAST_SCOPE_KEY);
-        if (!raw) return null;
-        const value = JSON.parse(raw);
-        if (!value || typeof value !== 'object') return null;
-        if (!value.kind || !value.ownerId || !value.chatId) return null;
-        return {
-            kind: String(value.kind),
-            ownerId: String(value.ownerId),
-            chatId: String(value.chatId),
-            branchId: value.branchId ? String(value.branchId) : '',
-        };
-    } catch {
-        return null;
-    }
-}
-
-function writeLastScope(scope) {
-    if (!scope) return;
-    try {
-        sessionStorage.setItem(LAST_SCOPE_KEY, JSON.stringify({
-            kind: String(scope.kind || ''),
-            ownerId: String(scope.ownerId || ''),
-            chatId: String(scope.chatId || ''),
-            branchId: String(scope.branchId || ''),
-            tabId,
-            savedAt: Date.now(),
-        }));
-    } catch {
-        /* ignore */
-    }
 }
 
 function safeObject(value) {
@@ -549,85 +517,6 @@ function clearGenerationTerminalTimer() {
     generationTerminalTimer = null;
 }
 
-async function maybeRestoreLastNativeScope() {
-    const saved = readLastScope();
-    if (!saved || !ctx) return false;
-
-    refreshLiveContext();
-    let current = scopeFromContext();
-    if (current && makeScopeKey(current) === makeScopeKey(saved)) return false;
-
-    // This scope is stored in sessionStorage, so it belongs to this browser tab.
-    // ST's active-character setting is shared across tabs, therefore the per-tab
-    // saved scope is preferred during activation/reload.
-
-    const deadline = Date.now() + 8_000;
-    while (Date.now() < deadline) {
-        refreshLiveContext();
-        current = scopeFromContext();
-        if (current && makeScopeKey(current) === makeScopeKey(saved)) return false;
-
-        if (saved.kind === 'group') {
-            if (Array.isArray(ctx?.groups) && ctx.groups.length) break;
-        } else if (Array.isArray(ctx?.characters) && ctx.characters.length) {
-            break;
-        }
-        await sleep(100);
-    }
-
-    // Re-check before making any native selection. Another tab may have caused
-    // ST's shared character state to settle on a real context meanwhile.
-    refreshLiveContext();
-    current = scopeFromContext();
-    if (current && makeScopeKey(current) !== makeScopeKey(saved) && String(ctx?.name2 || '').trim().toLowerCase() !== 'assistant') {
-        return false;
-    }
-
-    try {
-        nativeRestoreInProgress = true;
-
-        if (saved.kind === 'group') {
-            const groupId = saved.ownerId.startsWith('group:') ? saved.ownerId.slice(6) : saved.ownerId;
-            const group = Array.isArray(ctx?.groups)
-                ? ctx.groups.find(item => String(item?.id) === String(groupId))
-                : null;
-            if (!group || typeof ctx?.openGroupChat !== 'function') return false;
-            await ctx.openGroupChat(groupId, saved.chatId);
-        } else {
-            const desiredOwner = String(saved.ownerId);
-            const index = Array.isArray(ctx?.characters)
-                ? ctx.characters.findIndex(character =>
-                    String(character?.avatar || '') === desiredOwner ||
-                    String(character?.name || '') === desiredOwner,
-                )
-                : -1;
-
-            if (index < 0) return false;
-            if (typeof ctx?.selectCharacterById !== 'function' || typeof ctx?.openCharacterChat !== 'function') return false;
-            await ctx.selectCharacterById(index, { switchMenu: false });
-            await ctx.openCharacterChat(saved.chatId);
-        }
-
-        const convergeDeadline = Date.now() + 6_000;
-        while (Date.now() < convergeDeadline) {
-            await sleep(100);
-            const restored = scopeFromContext();
-            if (restored && makeScopeKey(restored) === makeScopeKey(saved)) {
-                writeLastScope(restored);
-                log('[MCS] restored last native scope:', restored);
-                return true;
-            }
-        }
-
-        log('[MCS] native scope restore did not converge:', { saved, current: scopeFromContext() });
-        return false;
-    } catch (error) {
-        warn('native scope restore failed', error);
-        return false;
-    } finally {
-        nativeRestoreInProgress = false;
-    }
-}
 function openDb() {
     return new Promise((resolve, reject) => {
         let settled = false;
@@ -807,6 +696,57 @@ function renderBanner(text) {
     document.body.classList.add('mcs-remote-streaming');
 }
 
+function setRemoteSendButtonMode(active) {
+    const button = document.querySelector('#send_but');
+    if (!button) {
+        remoteSendButtonState = null;
+        return;
+    }
+
+    if (active) {
+        if (!remoteSendButtonState || remoteSendButtonState.el !== button) {
+            remoteSendButtonState = {
+                el: button,
+                html: button.innerHTML,
+                title: button.getAttribute('title'),
+                ariaLabel: button.getAttribute('aria-label'),
+                disabled: !!button.disabled,
+            };
+        }
+
+        const nativeStop = document.querySelector('#mes_stop');
+        if (nativeStop) {
+            button.innerHTML = nativeStop.innerHTML;
+            const stopTitle = nativeStop.getAttribute('title') || nativeStop.getAttribute('aria-label') || 'Stop generation';
+            button.setAttribute('title', stopTitle);
+            button.setAttribute('aria-label', stopTitle);
+        } else {
+            button.innerHTML = '<i class="fa-solid fa-stop"></i>';
+            button.setAttribute('title', 'Stop generation');
+            button.setAttribute('aria-label', 'Stop generation');
+        }
+
+        button.dataset.mcsRemoteStop = '1';
+        button.classList.add('mcs-remote-stop');
+        button.classList.remove('disabled');
+        button.disabled = false;
+        return;
+    }
+
+    if (remoteSendButtonState?.el === button) {
+        button.innerHTML = remoteSendButtonState.html;
+        if (remoteSendButtonState.title == null) button.removeAttribute('title');
+        else button.setAttribute('title', remoteSendButtonState.title);
+        if (remoteSendButtonState.ariaLabel == null) button.removeAttribute('aria-label');
+        else button.setAttribute('aria-label', remoteSendButtonState.ariaLabel);
+        button.disabled = !!remoteSendButtonState.disabled;
+        remoteSendButtonState = null;
+    }
+
+    delete button.dataset.mcsRemoteStop;
+    button.classList.remove('mcs-remote-stop');
+}
+
 function setSendLock(reason = '') {
     sendLockReason = reason;
     const active = !!reason;
@@ -817,13 +757,18 @@ function setSendLock(reason = '') {
         const el = document.querySelector(selector);
         if (!el) continue;
 
-        const lockThisControl = active && (selector !== '#send_but' || remote);
+        const lockThisControl = active && (selector !== '#send_but' || (remote && !settings.remoteStop));
         if (lockThisControl) {
             if (el.dataset.mcsLocked !== '1') el.dataset.mcsPrevDisabled = el.disabled ? '1' : '0';
             el.dataset.mcsLocked = '1';
             el.title = reason;
             el.classList.add('disabled');
             if ('disabled' in el) el.disabled = true;
+        } else if (selector === '#send_but' && remote && settings.remoteStop) {
+            delete el.dataset.mcsLocked;
+            delete el.dataset.mcsPrevDisabled;
+            el.classList.remove('disabled');
+            if ('disabled' in el) el.disabled = false;
         } else if (el.dataset.mcsLocked === '1') {
             delete el.dataset.mcsLocked;
             const wasDisabled = el.dataset.mcsPrevDisabled === '1';
@@ -833,6 +778,8 @@ function setSendLock(reason = '') {
             el.classList.remove('disabled');
         }
     }
+
+    setRemoteSendButtonMode(remote && settings.remoteStop);
 }
 
 function isRemoteGenerationActive() {
@@ -885,6 +832,8 @@ function clearLocalGenerationState() {
     generationHeartbeatInFlight = null;
     generationMismatchSince = 0;
     generationClaimInFlightId = null;
+    generationRecoveryInFlight = null;
+    localGenerationBaseRevision = 0;
     streamInFlightSeq = 0;
     localStreamMessageId = null;
     localStreamMessageIndex = null;
@@ -1201,7 +1150,7 @@ async function applySnapshotNow(snapshot, { save = false, render = true, expecte
 }
 function applySnapshot(snapshot, options = {}) {
     const run = snapshotMutationChain.then(() => applySnapshotNow(snapshot, options));
-    snapshotMutationChain = run.catch(error => warn('snapshot mutation failed', error));
+    snapshotMutationChain = run.then(() => undefined, error => { warn('snapshot mutation failed', error); });
     return run;
 }
 
@@ -1209,7 +1158,10 @@ async function ensureIdsPersisted(expectedScope = currentScope) {
     refreshLiveContext();
     if (!ctx?.chat || !expectedScope || !nativeScopeStable(expectedScope)) return false;
     const changed = ensureMessageIds(ctx.chat);
-    if (changed) await safeNativeSave(expectedScope);
+    if (changed) {
+        const saved = await safeNativeSave(expectedScope);
+        if (!saved) markLocalDirty(expectedScope);
+    }
     return true;
 }
 
@@ -1232,6 +1184,10 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
         baseSnapshot: clone(baseSnap || { messages: [], metadata: {} }),
         snapshot: clone(snapshot),
     };
+
+    const existingRows = await idbList(scopeKey);
+    const last = existingRows[existingRows.length - 1];
+    if (last && last.kind === kind && deepEqual(last.snapshot, row.snapshot)) return;
 
     await idbPut(row);
     const rows = await idbList(scopeKey);
@@ -1277,7 +1233,6 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
         serverState = result.state;
         baseSnapshot = clone(result.state.snapshot);
         clearLocalDirty(scopeAtPublish);
-        writeLastScope(scopeAtPublish);
         broadcastWake('state');
         return true;
     } catch (error) {
@@ -1301,7 +1256,6 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
                 const applied = await applySnapshot(merged, { save: true, render: true, expectedScope: scopeAtPublish, clearDirty: false });
                 if (!applied) return false;
                 clearLocalDirty(scopeAtPublish);
-                writeLastScope(scopeAtPublish);
                 broadcastWake('state');
                 return true;
             } catch (retryError) {
@@ -1346,8 +1300,21 @@ async function flushQueueInternal() {
                 await idbPut(row);
             }
 
-            const result = await sendSnapshotDirect(nextSnapshot, nextRevision, row.id, scopeAtFlush);
-            if (scopeKeyValue !== scopeKeyAtFlush) return;
+            let result = null;
+            let sendError = null;
+            for (let sendAttempt = 0; sendAttempt < 3; sendAttempt += 1) {
+                try {
+                    result = await sendSnapshotDirect(nextSnapshot, nextRevision, row.id, scopeAtFlush);
+                    sendError = null;
+                    break;
+                } catch (error) {
+                    sendError = error;
+                    if (error?.status === 409) break;
+                    if (sendAttempt < 2) await sleep(150 * (sendAttempt + 1));
+                }
+            }
+            if (sendError) throw sendError;
+            if (!result || scopeKeyValue !== scopeKeyAtFlush) return;
 
             serverState = result.state;
             baseSnapshot = clone(result.state.snapshot);
@@ -1386,7 +1353,7 @@ async function flushQueueInternal() {
 }
 function flushQueue() {
     const run = queueFlushChain.then(() => flushQueueInternal());
-    queueFlushChain = run.catch(error => warn('queue flush failed', error));
+    queueFlushChain = run.then(() => undefined, error => { warn('queue flush failed', error); });
     return run;
 }
 
@@ -1442,11 +1409,9 @@ async function openScope(epoch) {
 
         serverState = result.state;
         baseSnapshot = clone(result.state.snapshot);
-        lastTerminatedGenerationId = null;
         remoteGenerationId = null;
         lastRemoteStreamSeq = -1;
         generationMismatchSince = 0;
-        writeLastScope(scopeAtJoin);
 
         // A page reload cannot continue ST's in-flight request. A generation
         // owned by this client from a previous page is therefore stale. Clear it
@@ -1888,10 +1853,23 @@ async function handleGenerationRecovered(data) {
         }
 
         if (localGeneration) {
-            const lostId = localGeneration.generationId;
-            try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
-            lastTerminatedGenerationId = lostId;
-            clearLocalGenerationState();
+            const localId = localGeneration.generationId;
+            generationMismatchSince = generationMismatchSince || Date.now();
+            // Server lease recovery is not an LLM failure. Keep the native request,
+            // pending stream, and terminal state intact while reclaiming the lease.
+            void reacquireGenerationOwnership('generation_recovered').then(recovered => {
+                if (recovered) {
+                    generationMismatchSince = 0;
+                    updateGenerationUi();
+                }
+            });
+            generationServerReadyId = generationServerReadyId || localId;
+            generationHeartbeatFailures = 0;
+            renderBanner('Reconnecting shared generation…');
+            setTimeout(() => {
+                if (localGeneration?.generationId === localId) updateGenerationUi();
+            }, 1200);
+            return;
         }
 
         generationServerReadyId = null;
@@ -1906,7 +1884,7 @@ async function handleGenerationRecovered(data) {
         generationStartPromise = null;
         generationStartPromiseId = null;
 
-        renderBanner('Generation was lost; chat was unlocked.');
+        renderBanner('Generation was recovered; shared chat was unlocked.');
         setTimeout(() => renderBanner(''), 1800);
         updateGenerationUi();
     } catch (error) {
@@ -2104,6 +2082,20 @@ async function handleGenerationTerminalEvent(data) {
 }
 function updateGenerationUi() {
     const g = serverState?.generation;
+
+    // Local ST generation remains active even during a brief server lease gap.
+    // Keep the send controls locked so another generate cannot start locally.
+    if (localGeneration && (!g || g.generationId === localGeneration.generationId)) {
+        if (generationServerReadyId === localGeneration.generationId) {
+            setSendLock('You are generating in this shared chat.');
+            renderBanner('Generating here · shared with other clients');
+        } else {
+            setSendLock('Reconnecting shared generation…');
+            renderBanner('Reconnecting shared generation…');
+        }
+        return;
+    }
+
     if (!generationActive(g)) {
         setSendLock('');
         renderBanner('');
@@ -2116,14 +2108,14 @@ function updateGenerationUi() {
         return;
     }
 
-    const mine = !!localGeneration && g.generationId === localGeneration.generationId && generationIsMine(g);
-    if (mine) {
-        setSendLock('You are generating in this shared chat.');
-        renderBanner('Generating here · shared with other clients');
-    } else {
-        setSendLock('Another client is generating this shared chat.');
-        renderBanner('Another client is generating this shared chat · live mirror');
+    if (generationIsMine(g) && !localGeneration) {
+        setSendLock('');
+        renderBanner('Recovering abandoned generation…');
+        return;
     }
+
+    setSendLock('Another client is generating this shared chat.');
+    renderBanner('Another client is generating this shared chat · live mirror');
 }
 function stopGenerationHeartbeat() {
     if (generationHeartbeatTimer) clearInterval(generationHeartbeatTimer);
@@ -2177,6 +2169,109 @@ function startHeartbeats(epoch) {
         }
     }, HEARTBEAT_MS);
 }
+async function reacquireGenerationOwnership(reason = 'recovery') {
+    if (!localGeneration || !localGenerationScope || generationRecoveryInFlight || terminalizingGenerationId) return false;
+
+    const generation = clone(localGeneration);
+    const scopeAtGeneration = clone(localGenerationScope);
+    const epochAtGeneration = localGenerationEpoch || scopeEpoch;
+    const generationId = generation.generationId;
+
+    if (!currentScopeGuard(epochAtGeneration) || !nativeScopeStable(scopeAtGeneration)) return false;
+
+    const run = (async () => {
+        try {
+            const stateResult = await api('/state', 'POST', {
+                scope: scopeAtGeneration,
+                clientId,
+                deviceId,
+            });
+
+            if (!localGenerationMatches(generationId, scopeAtGeneration) || !currentScopeGuard(epochAtGeneration)) return false;
+
+            const state = stateResult.state;
+            const current = state?.generation || null;
+
+            if (current && current.generationId === generationId && generationIsMine(current)) {
+                serverState = state;
+                localGeneration = clone(current);
+                generationMismatchSince = 0;
+                if (['started', 'streaming'].includes(current.phase)) {
+                    generationServerReadyId = generationId;
+                    return true;
+                }
+                // A recovered claim may be back in the claimed phase. Finish the
+                // normal start handshake rather than issuing a second claim.
+                generationServerReadyId = null;
+                return await ensureGenerationStarted();
+            }
+
+            if (current && generationActive(current) && current.generationId !== generationId) {
+                try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+                return false;
+            }
+
+            // Reclaim only when nobody changed the shared snapshot after our claim.
+            // A changed revision means another client has legitimately mutated the chat.
+            if (localGenerationBaseRevision && Number(state.revision || 0) !== localGenerationBaseRevision) {
+                log('[MCS] generation recovery blocked by shared revision change', {
+                    reason,
+                    expected: localGenerationBaseRevision,
+                    actual: state.revision,
+                });
+                try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+                return false;
+            }
+
+            const claimed = await api('/generation/claim', 'POST', {
+                scope: scopeAtGeneration,
+                clientId,
+                deviceId,
+                opId: newId(),
+                generationId,
+                generationType: String(generation.generationType || 'normal'),
+                baseRevision: Number(state.revision || 0),
+                snapshot: syncSnapshot(durableSnapshot()),
+            });
+
+            if (!localGenerationMatches(generationId, scopeAtGeneration) || !currentScopeGuard(epochAtGeneration)) return false;
+
+            const nextGeneration = claimed.state?.generation;
+            if (!nextGeneration || nextGeneration.generationId !== generationId || !generationIsMine(nextGeneration)) return false;
+
+            serverState = claimed.state;
+            baseSnapshot = clone(claimed.state.snapshot);
+            localGeneration = clone(nextGeneration);
+            localGenerationBaseRevision = Number(claimed.state.revision || 0);
+            generationServerReadyId = null;
+            generationMismatchSince = 0;
+            updateGenerationUi();
+
+            return await ensureGenerationStarted();
+        } catch (error) {
+            if (error?.status === 409 && error?.payload?.state) {
+                const state = error.payload.state;
+                serverState = state;
+                baseSnapshot = clone(state.snapshot);
+                const competing = state.generation;
+                if (competing && competing.generationId !== generationId) {
+                    try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+                    return false;
+                }
+            }
+            log('[MCS] generation ownership recovery failed; keeping local LLM alive', reason, error);
+            return false;
+        }
+    })();
+
+    generationRecoveryInFlight = run;
+    try {
+        return await run;
+    } finally {
+        if (generationRecoveryInFlight === run) generationRecoveryInFlight = null;
+    }
+}
+
 function startGenerationHeartbeat(epoch) {
     stopGenerationHeartbeat();
     if (!localGeneration || !localGenerationScope) return;
@@ -2294,9 +2389,12 @@ function startGenerationHeartbeat(epoch) {
                         return;
                     }
 
-                    // No confirmed competing owner. Keep ST generation alive and let
-                    // terminal recovery reconcile the final snapshot.
+                    // No confirmed competing owner. Keep ST generation alive and
+                    // try to reacquire the lease after a brief grace period.
                     generationMismatchSince = generationMismatchSince || Date.now();
+                    if (Date.now() - generationMismatchSince >= 1200) {
+                        void reacquireGenerationOwnership('heartbeat-recovery');
+                    }
                     return;
                 }
 
@@ -2438,7 +2536,7 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
 }
 function resyncCurrentScope(epoch = scopeEpoch) {
     const run = resyncChain.then(() => resyncCurrentScopeInternal(epoch));
-    resyncChain = run.catch(error => warn('resync chain failed', error));
+    resyncChain = run.then(() => undefined, error => { warn('resync chain failed', error); });
     return run;
 }
 
@@ -2496,6 +2594,8 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
     lastSseEventId = 0;
     generationMismatchSince = 0;
     generationClaimInFlightId = null;
+    generationRecoveryInFlight = null;
+    localGenerationBaseRevision = 0;
     lastTerminatedGenerationId = null;
     streamInFlightSeq = 0;
     generationTerminalPhase = null;
@@ -2560,7 +2660,7 @@ function switchScopeInternal(reason = 'scope-change') {
 }
 function switchScope(reason = 'scope-change') {
     const run = scopeSwitchChain.then(() => switchScopeInternal(reason));
-    scopeSwitchChain = run.catch(error => warn('scope switch failed', error));
+    scopeSwitchChain = run.then(() => undefined, error => { warn('scope switch failed', error); });
     return run;
 }
 
@@ -2633,10 +2733,24 @@ async function ensureGenerationStarted() {
 async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
     refreshLiveContext();
 
-    if (!settings.enabled || !settings.coordinateGeneration || applyingRemoteDepth > 0 || !currentScope) return;
+    if (!settings.enabled || !settings.coordinateGeneration || applyingRemoteDepth > 0) return;
+
+    if (!currentScope) {
+        await switchScope('generation-no-scope');
+        if (!currentScope || !serverState) {
+            abort(false);
+            statusText('Multi-Client Sync is not connected to this chat yet.', true);
+            return;
+        }
+    }
 
     const scopeAtClaim = clone(currentScope);
     const epochAtClaim = scopeEpoch;
+    if (!serverState) {
+        abort(false);
+        statusText('Multi-Client Sync is not connected to this chat.', true);
+        return;
+    }
 
     // Prevent concurrent Generate calls in the same tab from creating multiple
     // distributed leases before the first claim response arrives.
@@ -2819,6 +2933,7 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
         localGenerationScope = clone(scopeAtClaim);
         localGenerationEpoch = epochAtClaim;
         localGenerationBaseSnapshot = clone(baseSnapshot);
+        localGenerationBaseRevision = Number(claimResult.state.revision || 0);
         localGenerationLastSnapshot = clone(desired);
         localStreamMessageId = null;
         localStreamMessageIndex = null;
@@ -2955,17 +3070,21 @@ function scheduleGenerationStream(delayOverride = null) {
                         clientId,
                         deviceId,
                     }).catch(() => null);
-                    const g = confirmed?.state?.generation;
+                    const state = confirmed?.state || null;
+                    const g = state?.generation;
                     if (g?.generationId === generationId && generationIsMine(g)) {
-                        serverState = confirmed.state;
+                        serverState = state;
                         localGeneration = clone(g);
                         generationServerReadyId = ['started', 'streaming'].includes(g.phase) ? generationId : generationServerReadyId;
                         pendingStream = pendingStream || payload;
                         scheduleGenerationStream(0);
-                    } else if (!g || g.generationId !== generationId) {
-                        // Only an authoritative ownership loss may stop the native
-                        // LLM request. Generic transport failure never does.
+                    } else if (g && g.generationId !== generationId && generationActive(g)) {
                         try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+                    } else if (state && localGenerationMatches(generationId, scopeAtStream)) {
+                        pendingStream = pendingStream || payload;
+                        void reacquireGenerationOwnership('stream-ownership-loss').then(recovered => {
+                            if (recovered) scheduleGenerationStream(0);
+                        });
                     }
                 } else if (error?.status === 403 && error?.payload?.error === 'not_member') {
                     if (localGenerationMatches(generationId, scopeAtStream)) pendingStream = pendingStream || payload;
@@ -3191,6 +3310,8 @@ async function sendGenerationTerminal(phase = 'completed') {
 async function handleRemoteStopEvent(data) {
     const g = data?.generation;
     if (!g || !localGeneration || g.generationId !== localGeneration.generationId) return;
+    generationTerminalPhase = 'stopped';
+    clearGenerationTerminalTimer();
     try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
 }
 
@@ -3218,6 +3339,7 @@ function onToolEvent() {
 }
 async function onGenerationEnded() {
     if (!localGeneration) return;
+    if (generationTerminalPhase === 'stopped') return;
     const generationId = localGeneration.generationId;
     generationTerminalPhase = 'completed';
     clearGenerationTerminalTimer();
@@ -3276,7 +3398,7 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
         }
     });
 
-    publishChain = run.catch(error => warn('local publish chain failed', error));
+    publishChain = run.then(() => undefined, error => { warn('local publish chain failed', error); });
     return run;
 }
 async function handleChatLifecycleEvent() {
@@ -3386,7 +3508,8 @@ function wireUiGuards() {
         if (!isRemoteGenerationActive()) return;
         if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
         if (!(event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement)) return;
-        if (event.target.id !== 'send_textarea') return;
+        const isChatInput = event.target.id === 'send_textarea' || event.target.closest?.('#send_form, #send_form_inner');
+        if (!isChatInput) return;
 
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -3420,6 +3543,7 @@ async function requestRemoteStop() {
     if (!settings.remoteStop) return;
 
     const scopeAtRequest = clone(currentScope);
+    statusText('Stop requested…');
     await api('/generation/stop', 'POST', {
         scope: scopeAtRequest,
         clientId,
@@ -3445,10 +3569,10 @@ async function onActivate() {
     await negotiateClientId();
     await mountSettings();
 
-    // Give ST a brief chance to finish its own restore. Only if it remains in the
-    // default Assistant/empty context do we invoke our per-tab last-scope restore.
+    // Let SillyTavern own startup chat restoration. The native
+    // Auto-load Last Chat setting decides whether ST opens the previous chat.
+    // MCS only connects after ST has established whatever context it chose.
     await sleep(250);
-    await maybeRestoreLastNativeScope();
     refreshLiveContext();
 
     activationInProgress = false;
@@ -3456,15 +3580,16 @@ async function onActivate() {
     wireEvents();
     wireUiGuards();
     globalThis.multiClientSyncGenerateInterceptor = coordinatedGenerateInterceptor;
-    await switchScope('activate');
 
+    // Let SillyTavern finish its own Auto-load Last Chat decision first. MCS does
+    // not restore chats itself; it only connects to the resulting native scope.
     setTimeout(() => {
         switchScope('post-activate').catch(error => warn('post-activate scope check failed', error));
-    }, 800);
+    }, 900);
+    updateGenerationUi();
 }
 async function onEnable() {
     settings.enabled = true;
-    settings.autoConnect = true;
     saveSettings();
     refreshLiveContext();
 
@@ -3491,9 +3616,12 @@ async function onDisable() {
     currentScope = null;
     scopeKeyValue = '';
     generationClaimInFlightId = null;
+    generationRecoveryInFlight = null;
+    localGenerationBaseRevision = 0;
     lastTerminatedGenerationId = null;
     streamInFlightSeq = 0;
     clearLocalDirty();
+    setRemoteSendButtonMode(false);
     try { bc?.close?.(); } catch { /* ignore */ }
     bc = null;
 }
@@ -3645,7 +3773,6 @@ async function mountSettings() {
             scopeKeyValue = makeScopeKey(currentScope);
 
             if (currentScope && settings.enabled && settings.autoConnect) {
-                writeLastScope(currentScope);
                 await openScope(epoch);
             } else {
                 statusText('No active chat');
