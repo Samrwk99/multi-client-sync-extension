@@ -2300,12 +2300,54 @@ function applySnapshot(snapshot, options = {}) {
 
 async function ensureIdsPersisted(expectedScope = currentScope) {
     refreshLiveContext();
-    if (!ctx?.chat || !expectedScope || !nativeScopeStable(expectedScope)) return false;
-    const changed = ensureMessageIds(ctx.chat);
-    if (changed) {
-        const saved = await safeNativeSave(expectedScope);
-        if (!saved) markLocalDirty(expectedScope);
+
+    if (
+        !ctx?.chat ||
+        !Array.isArray(ctx.chat) ||
+        !expectedScope ||
+        !nativeScopeStable(expectedScope)
+    ) {
+        return false;
     }
+
+    // Existing chats can briefly expose an empty/incomplete in-memory chat
+    // while ST is still finishing the native file load. Never persist that
+    // transient state and risk triggering ST's integrity overwrite protection.
+    if (
+        expectedScope.chatId &&
+        ctx.chat.length === 0
+    ) {
+        log(
+            '[MCS] refusing to persist message IDs while an existing chat is transiently empty',
+            expectedScope,
+        );
+        return false;
+    }
+
+    const changed = ensureMessageIds(ctx.chat);
+
+    if (changed) {
+        // Re-check the native scope immediately before saving. A chat switch
+        // can happen while ensureMessageIds()/other async work is in flight.
+        refreshLiveContext();
+
+        if (
+            !nativeScopeStable(expectedScope)
+        ) {
+            markLocalDirty(expectedScope);
+            return false;
+        }
+
+        const saved =
+            await safeNativeSave(
+                expectedScope,
+            );
+
+        if (!saved) {
+            markLocalDirty(expectedScope);
+        }
+    }
+
     return true;
 }
 
@@ -6122,13 +6164,31 @@ function switchScopeInternal(reason = 'scope-change') {
             return;
         }
 
-        if (nextKey === scopeKeyValue && currentScope) {
-            if (nativeScopeStable(nextScope)) {
-                if (!serverState && settings.enabled && settings.autoConnect) await openScope(scopeEpoch);
-                else updateGenerationUi();
-            }
+if (nextKey === scopeKeyValue && currentScope) {
+    if (!nativeScopeStable(nextScope)) {
+        const stable = await waitForNativeScope(
+            nextScope,
+            5000,
+            100,
+        );
+
+        if (!stable || !currentScopeGuard(scopeEpoch)) {
             return;
         }
+    }
+
+    if (
+        !serverState &&
+        settings.enabled &&
+        settings.autoConnect
+    ) {
+        await openScope(scopeEpoch);
+    } else {
+        updateGenerationUi();
+    }
+
+    return;
+}
 
         if (localGeneration && currentScope) {
             pendingScopeSwitchReason = reason;
@@ -6144,15 +6204,33 @@ function switchScopeInternal(reason = 'scope-change') {
         clearGenerationTerminalTimer();
         await leaveCurrentScope();
 
-        currentScope = nextScope;
-        scopeKeyValue = nextKey;
-        localDirty = false;
-        localDirtyScopeKey = '';
-        lastSseEventId = 0;
-        lastSyncedMessageMap = new Map();
+currentScope = nextScope;
+scopeKeyValue = nextKey;
+localDirty = false;
+localDirtyScopeKey = '';
+lastSseEventId = 0;
+lastSyncedMessageMap = new Map();
 
-        await ensureIdsPersisted(nextScope);
-        if (settings.enabled && settings.autoConnect) await openScope(epoch);
+// CRITICAL: establish the authoritative server membership/snapshot first.
+// Do not write IDs into native ST while the native chat loader may still be
+// replacing ctx.chat or chat metadata.
+if (
+    settings.enabled &&
+    settings.autoConnect
+) {
+    await openScope(epoch);
+
+    if (
+        !currentScopeGuard(epoch) ||
+        !nativeScopeStable(nextScope)
+    ) {
+        return;
+    }
+
+    // The chat is now connected and the native scope has stabilized.
+    // Only now is it safe to persist message IDs.
+    await ensureIdsPersisted(nextScope);
+}
     })();
 }
 
@@ -7477,17 +7555,65 @@ function scheduleDeferredLocalPublish(delay = 0) {
 }
 
 async function handleChatLifecycleEvent() {
-    // The native chat-load lifetime advances before any async reconciliation
-    // so in-flight operations can detect that they now belong to a stale chat.
+    // Invalidate every in-flight operation immediately. The native chat loader
+    // may still be replacing ctx.chat / chat_metadata after the lifecycle
+    // event fires.
     ++nativeLoadEpoch;
 
-    await sleep(50);
-    refreshLiveContext();
     if (nativeRestoreInProgress) return;
+
     if (localGeneration) {
         pendingScopeSwitchReason = 'chat-lifecycle';
         return;
     }
+
+    // Do not touch/save the native chat while ST is still settling the load.
+    // A short fixed delay is insufficient because chat loading can involve
+    // asynchronous file/network/UI work.
+    refreshLiveContext();
+
+    const expectedScope = scopeFromContext();
+
+    if (!expectedScope) {
+        await sleep(100);
+        refreshLiveContext();
+    }
+
+    const stable = expectedScope
+        ? await waitForNativeScope(
+            expectedScope,
+            5000,
+            100,
+        )
+        : false;
+
+    if (nativeRestoreInProgress) return;
+
+    refreshLiveContext();
+
+    const actualScope = scopeFromContext();
+
+    if (
+        !actualScope ||
+        !stable ||
+        makeScopeKey(actualScope) !==
+            makeScopeKey(expectedScope || actualScope)
+    ) {
+        // The native loader is still transitioning. Let the subsequent
+        // lifecycle event/retry drive the next reconciliation instead of
+        // saving an incomplete chat.
+        log(
+            '[MCS] chat lifecycle ignored until native scope stabilizes',
+            {
+                expected: expectedScope,
+                actual: actualScope,
+                stable,
+            },
+        );
+
+        return;
+    }
+
     await switchScope('chat-lifecycle');
 }
 
