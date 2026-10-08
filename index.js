@@ -28,10 +28,15 @@ const OWNERSHIP_RECOVERY_GRACE_MS = 1_200;
 const STOP_REQUESTED_RETENTION_MS = 60 * 60 * 1000;
 
 const CHUNK_MAX_BYTES = 512 * 1024;
-const MAX_CHUNK_ASSEMBLY_BYTES = 12 * 1024 * 1024;
+// Headroom above the server's 12 MiB snapshot limit: the event envelope can
+// push a legal snapshot past the assembly ceiling.
+const MAX_CHUNK_ASSEMBLY_BYTES = 12 * 1024 * 1024 + 256 * 1024;
 const MAX_CHUNK_ASSEMBLIES = 8;
 const CHUNK_ASSEMBLY_TIMEOUT_MS = 30_000;
 const MAX_CHUNK_BUFFER_BYTES = 16 * 1024 * 1024;
+
+const DELTA_MAX_OPS = 500;
+const DELTA_MAX_BYTES = 256 * 1024;
 
 const MCS_META_KEY = 'multi_client_sync';
 const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -140,6 +145,8 @@ let generationTerminalPhase = null;
 let remoteSendButtonState = null;
 let storageHandler = null;
 let queueSequenceCounter = 0;
+let localMutationVersion = 0;
+let activeLocalPublishPromise = null;
 
 // Last-synced message fingerprints (id -> 64-bit hash). Hashes, not full
 // serialized messages — the map must stay tiny even for huge chats.
@@ -740,11 +747,18 @@ async function idbList(scopeKey) {
         try {
             const tx = db.transaction('ops', 'readonly');
             const req = tx.objectStore('ops').index('scopeKey').getAll(scopeKey);
-            req.onsuccess = () => finish(null, req.result.sort((a, b) => {
-                if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
-                if ((a.queueSequence || 0) !== (b.queueSequence || 0)) return (a.queueSequence || 0) - (b.queueSequence || 0);
-                return String(a.id).localeCompare(String(b.id));
-            }));
+            req.onsuccess = () => finish(null, req.result
+                .map(row => ({
+                    ...row,
+                    // Migration for rows created before opId became separate
+                    // from the stable queue-row key.
+                    opId: row.opId || row.id,
+                }))
+                .sort((a, b) => {
+                    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+                    if ((a.queueSequence || 0) !== (b.queueSequence || 0)) return (a.queueSequence || 0) - (b.queueSequence || 0);
+                    return String(a.id).localeCompare(String(b.id));
+                }));
             req.onerror = () => finish(req.error || new Error('IndexedDB read failed'));
             tx.onerror = () => finish(tx.error || new Error('IndexedDB transaction failed'));
             tx.onabort = () => finish(tx.error || new Error('IndexedDB transaction aborted'));
@@ -806,10 +820,29 @@ function fnv1a(str, seed) {
     return h >>> 0;
 }
 
-// 64-bit fingerprint (two independent 32-bit FNV-1a hashes). Compact: the
-// last-synced map must not hold a second copy of the chat.
+// Canonical string built in-place (no clone of the message), then hashed to
+// 16 chars — the last-synced map must never hold a second copy of the chat.
 function comparableHash(message) {
-    const s = stableStringify(comparableMessage(message));
+    const walk = (value, inExtra) => {
+        if (value === null || typeof value !== 'object') {
+            return JSON.stringify(value) ?? 'null';
+        }
+        if (Array.isArray(value)) {
+            return `[${value.map(item => walk(item, false)).join(',')}]`;
+        }
+        const keys = Object.keys(value)
+            .filter(key => !forbiddenKeys.has(key))
+            .filter(key => !(inExtra && key === MCS_META_KEY))
+            .sort();
+        const parts = [];
+        for (const key of keys) {
+            const val = value[key];
+            if (val === undefined) continue;
+            parts.push(`${JSON.stringify(key)}:${walk(val, key === 'extra' && value === message)}`);
+        }
+        return `{${parts.join(',')}}`;
+    };
+    const s = walk(message, false);
     return `${fnv1a(s, 0x811c9dc5).toString(16).padStart(8, '0')}${fnv1a(s, 0x9747b28c).toString(16).padStart(8, '0')}`;
 }
 
@@ -1074,7 +1107,7 @@ function connectSse(epoch) {
     if (!currentScope || !currentScopeGuard(epoch)) return;
 
     const localSseEpoch = sseEpoch;
-    const query = `?scope=${encodeURIComponent(encodeScope(currentScope))}&clientId=${encodeURIComponent(clientId)}&deviceId=${encodeURIComponent(deviceId)}&lastEventId=${encodeURIComponent(String(lastSseEventId || 0))}`;
+    const query = `?scope=${encodeURIComponent(encodeScope(currentScope))}&clientId=${encodeURIComponent(clientId)}&deviceId=${encodeURIComponent(deviceId)}&lastEventId=${encodeURIComponent(String(lastSseEventId || 0))}&delta=1`;
     const source = new EventSource(`${PLUGIN_BASE}/events${query}`, { withCredentials: true });
     eventSource = source;
 
@@ -1084,6 +1117,7 @@ function connectSse(epoch) {
         'replay_complete',
         'resync_required',
         'snapshot',
+        'snapshot_delta',
         'generation_claimed',
         'generation_started',
         'generation_stream',
@@ -1203,6 +1237,8 @@ async function dispatchLogicalEvent(type, data) {
                 return false;
             case 'snapshot':
                 return await handleSnapshotEvent(data);
+            case 'snapshot_delta':
+                return await handleSnapshotDeltaEvent(data);
             case 'generation_claimed':
                 handleGenerationEvent(data);
                 return true;
@@ -1354,9 +1390,9 @@ function currentScopeGuard(epoch) {
     return epoch === scopeEpoch && scopeKeyValue === makeScopeKey(currentScope);
 }
 
-// Compact server responses (generation heartbeat/started/stream/stop) carry
-// no snapshot. Merge them into the existing serverState instead of replacing
-// it, so the authoritative snapshot is never lost.
+// Compact server responses (generation heartbeat/started/stream/stop, delta
+// success) carry no snapshot. Merge them into the existing serverState
+// instead of replacing it, so the authoritative snapshot is never lost.
 function mergeCompactState(compact) {
     if (!compact) return;
     serverState = { ...(serverState || {}), ...compact };
@@ -2161,13 +2197,592 @@ async function ensureIdsPersisted(expectedScope = currentScope) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Delta fast path
+// ---------------------------------------------------------------------------
+
+function stripDeltaMetadata(metadata) {
+    const copy = clone(metadata || {});
+    delete copy[MCS_META_KEY];
+    return copy;
+}
+
+// One live-chat scan producing the minimal op set. fallback:true whenever the
+// change isn't safely expressible as a small delta.
+function computeDeltaOpsFromLiveChat() {
+    refreshLiveContext();
+    if (!ctx?.chat || !serverState?.snapshot) return { fallback: true, reason: 'no_state' };
+    if (!settings.syncMessages) return { fallback: true, reason: 'message_sync_disabled' };
+    if (localGeneration || generationActive(serverState?.generation)) return { fallback: true, reason: 'generation_active' };
+
+    ensureMessageIds(ctx.chat);
+
+    const baseMessages = serverState.snapshot.messages || [];
+    const baseById = new Map();
+    for (const message of baseMessages) {
+        const id = messageId(message);
+        if (id) baseById.set(id, message);
+    }
+
+    const localIds = new Set();
+    for (const message of ctx.chat) {
+        const id = messageId(message);
+        if (!id) return { fallback: true, reason: 'missing_message_id' };
+        localIds.add(id);
+    }
+
+    const deletedIds = new Set();
+    for (const id of baseById.keys()) {
+        if (!localIds.has(id)) deletedIds.add(id);
+    }
+
+    // Each surviving base message's previous surviving neighbour — so a
+    // deletion is never mistaken for a cascade of moves.
+    const basePrevious = new Map();
+    let previousBaseId = null;
+    for (const message of baseMessages) {
+        const id = messageId(message);
+        if (!id || deletedIds.has(id)) continue;
+        basePrevious.set(id, previousBaseId);
+        previousBaseId = id;
+    }
+
+    const bucket = chatSyncMetaBucket();
+    const tombstones = bucket ? readLedger(ctx.chatMetadata) : {};
+    const nowTs = Date.now();
+    const ops = [];
+    let previousLocalId = null;
+
+    for (const message of ctx.chat) {
+        const id = messageId(message);
+        const base = baseById.get(id);
+        const currentHash = comparableHash(message);
+        const previouslySynced = lastSyncedMessageMap.get(id);
+
+        const changed = !base || previouslySynced === undefined || previouslySynced !== currentHash;
+        if (changed) {
+            const meta = message.extra.multi_client_sync;
+            let modifiedAt = Number(meta.lastModified || 0);
+            if (!modifiedAt) {
+                modifiedAt = nowTs;
+                meta.lastModified = modifiedAt;
+            }
+            const upsert = { op: 'upsert', message: clone(message), modifiedAt };
+            // New messages need an explicit insertion anchor.
+            if (!base) upsert.afterMessageId = previousLocalId;
+            ops.push(upsert);
+        }
+
+        // Existing message whose actual predecessor changed = a real move.
+        if (base && basePrevious.get(id) !== previousLocalId) {
+            ops.push({ op: 'move', messageId: id, afterMessageId: previousLocalId });
+        }
+
+        previousLocalId = id;
+    }
+
+    // Deletes last: anchors used by surviving messages already exist when applied.
+    for (const id of deletedIds) {
+        let deletedAt = Number(tombstones[id] || 0);
+        if (!deletedAt) {
+            deletedAt = nowTs;
+            tombstones[id] = deletedAt;
+        }
+        ops.push({ op: 'delete', messageId: id, deletedAt });
+    }
+
+    if (bucket) bucket.tombstones = tombstones;
+
+    if (settings.syncMetadata && !deepEqual(
+        stripDeltaMetadata(ctx.chatMetadata || {}),
+        stripDeltaMetadata(serverState.snapshot.metadata || {}),
+    )) {
+        return { fallback: true, reason: 'metadata_changed' };
+    }
+
+    if (!ops.length) return { fallback: false, ops: [] };
+    if (ops.length > DELTA_MAX_OPS) return { fallback: true, reason: 'too_many_ops' };
+    if (utf8ByteLength({ ops }) > DELTA_MAX_BYTES) return { fallback: true, reason: 'delta_too_large' };
+
+    return { fallback: false, ops };
+}
+
+function writeDeltaTombstonesClient(metadata, tombstones) {
+    const out = clone(metadata || {});
+    if (!Object.keys(tombstones).length) {
+        if (out[MCS_META_KEY]?.tombstones) {
+            delete out[MCS_META_KEY].tombstones;
+            if (out[MCS_META_KEY] && Object.keys(out[MCS_META_KEY]).length === 0) delete out[MCS_META_KEY];
+        }
+        return out;
+    }
+    out[MCS_META_KEY] = { ...(out[MCS_META_KEY] || {}), tombstones };
+    return out;
+}
+
+// Client-side mirror of the server projector: identical op semantics,
+// including stale-tombstone rejection.
+function applyDeltaToSnapshotFast(baseSnapshot, ops) {
+    const messages = Array.isArray(baseSnapshot?.messages) ? baseSnapshot.messages.slice() : [];
+    let metadata = baseSnapshot?.metadata || {};
+    let metadataChanged = false;
+    const tombstones = readLedger(metadata);
+    const ensureMetadataCopy = () => {
+        if (metadataChanged) return;
+        metadata = clone(metadata);
+        metadataChanged = true;
+    };
+    const reindex = () => {
+        const map = new Map();
+        for (let i = 0; i < messages.length; i += 1) {
+            const id = messageId(messages[i]);
+            if (id) map.set(id, i);
+        }
+        return map;
+    };
+    let indexById = reindex();
+
+    for (const op of ops) {
+        if (op.op === 'delete') {
+            const id = String(op.messageId);
+            const index = indexById.get(id);
+            if (index !== undefined) {
+                messages.splice(index, 1);
+                indexById = reindex();
+            }
+            ensureMetadataCopy();
+            const deletedAt = Number(op.deletedAt || Date.now());
+            if (!Number.isFinite(deletedAt) || deletedAt <= 0) throw new Error('invalid_delete_timestamp');
+            if (!tombstones[id] || deletedAt > tombstones[id]) tombstones[id] = deletedAt;
+            continue;
+        }
+
+        if (op.op === 'upsert') {
+            const message = clone(op.message);
+            const id = messageId(message);
+            const modifiedAt = Number(op.modifiedAt || Date.now());
+            if (!id) throw new Error('message_ids_required');
+            if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) throw new Error('invalid_modified_timestamp');
+            if (tombstones[id] && modifiedAt <= tombstones[id]) throw new Error('delta_stale_message');
+
+            const existing = indexById.get(id);
+            if (existing !== undefined) {
+                messages[existing] = message;
+            } else {
+                const afterId = op.afterMessageId == null ? null : String(op.afterMessageId);
+                let insertAt = 0;
+                if (afterId) {
+                    const afterIndex = indexById.get(afterId);
+                    if (afterIndex === undefined) throw new Error('delta_anchor_missing');
+                    insertAt = afterIndex + 1;
+                }
+                messages.splice(insertAt, 0, message);
+                indexById = reindex();
+            }
+            if (tombstones[id]) {
+                ensureMetadataCopy();
+                delete tombstones[id];
+            }
+            continue;
+        }
+
+        if (op.op === 'move') {
+            const id = String(op.messageId);
+            const currentIndex = indexById.get(id);
+            if (currentIndex === undefined) throw new Error('delta_move_target_missing');
+            const afterId = op.afterMessageId == null ? null : String(op.afterMessageId);
+            if (afterId === id) throw new Error('delta_move_self');
+            const moved = messages[currentIndex];
+            messages.splice(currentIndex, 1);
+            indexById = reindex();
+            let insertAt = 0;
+            if (afterId) {
+                const afterIndex = indexById.get(afterId);
+                if (afterIndex === undefined) throw new Error('delta_move_anchor_missing');
+                insertAt = afterIndex + 1;
+            }
+            messages.splice(insertAt, 0, moved);
+            indexById = reindex();
+        }
+    }
+
+    if (metadataChanged) metadata = writeDeltaTombstonesClient(metadata, tombstones);
+    return { messages, metadata };
+}
+
+function recordRemoteTombstone(id, timestamp = Date.now()) {
+    if (!id) return;
+    const bucket = chatSyncMetaBucket();
+    if (!bucket) return;
+    const tombstones = readLedger(ctx.chatMetadata);
+    const ts = Number(timestamp);
+    if (!tombstones[id] || ts > tombstones[id]) tombstones[id] = ts;
+    bucket.tombstones = tombstones;
+}
+
+// Try a cheap delta publish first. Result {ok, fallback, abandoned, ambiguous}:
+// - ok: committed (or proven already committed)
+// - fallback: delta unsuitable or definitively conflicted — caller falls back
+//   to the full snapshot path with a NEW opId (different payload ⇒ new op)
+// - ambiguous: outcome unknown — a durable full-snapshot retry carrying the
+//   ORIGINAL delta opId has been queued; caller must not issue anything new
+// - abandoned: scope changed mid-flight
+async function publishLocalDelta({ scope = currentScope, opId, mutationVersion } = {}) {
+    if (!scope || !settings.enabled || !syncEnabled()) return { ok: false, fallback: true };
+    if (!nativeScopeStable(scope)) return { ok: false, fallback: true };
+    if (!serverState?.snapshot) return { ok: false, fallback: true };
+
+    const computed = computeDeltaOpsFromLiveChat();
+    if (computed.fallback) return { ok: false, fallback: true, reason: computed.reason };
+
+    const ops = computed.ops;
+    if (!ops.length) {
+        if (mutationVersion === localMutationVersion) {
+            clearLocalDirty(scope);
+            rebuildLastSyncedMap(serverState.snapshot.messages);
+        }
+        return { ok: true, fallback: false };
+    }
+
+    const scopeAtPublish = clone(scope);
+    const scopeKeyAtPublish = makeScopeKey(scopeAtPublish);
+    const baseRevision = Number(serverState.revision || 0);
+    const localOpId = opId || newId();
+
+    // Project the accepted ops locally so the compact response is enough.
+    const projected = applyDeltaToSnapshotFast(serverState.snapshot, ops);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+            const result = await api('/delta', 'POST', {
+                scope: scopeAtPublish,
+                clientId,
+                deviceId,
+                opId: localOpId,
+                baseRevision,
+                ops,
+            });
+
+            if (scopeKeyValue !== scopeKeyAtPublish || !currentScope || makeScopeKey(currentScope) !== scopeKeyAtPublish) {
+                return { ok: false, abandoned: true };
+            }
+
+            // Duplicate: the delta response is compact, so confirm against
+            // the authoritative state before deciding anything.
+            if (result.duplicate) {
+                const confirmation = await api('/state', 'POST', {
+                    scope: scopeAtPublish,
+                    clientId,
+                    deviceId,
+                }).catch(() => null);
+
+                const authoritative = confirmation?.state || null;
+                if (!authoritative) return { ok: false, fallback: false, ambiguous: true };
+
+                serverState = authoritative;
+                baseSnapshot = clone(authoritative.snapshot);
+
+                if (deepEqual(authoritative.snapshot, projected)) {
+                    if (mutationVersion === localMutationVersion) {
+                        clearLocalDirty(scopeAtPublish);
+                        rebuildLastSyncedMap(authoritative.snapshot.messages);
+                    }
+                    return { ok: true, fallback: false };
+                }
+
+                // Original delta committed and the server has since moved on.
+                // Any further publish is a NEW logical operation.
+                return { ok: false, fallback: true, conflict: true };
+            }
+
+            serverState = {
+                ...(serverState || {}),
+                ...(result.state || {}),
+                revision: Number(result.state?.revision ?? baseRevision + 1),
+                snapshot: projected,
+            };
+            baseSnapshot = projected;
+
+            if (Number(result.deltaEventId || 0) > 0) {
+                lastSseEventId = Math.max(lastSseEventId, Number(result.deltaEventId));
+            }
+
+            if (mutationVersion === localMutationVersion) {
+                clearLocalDirty(scopeAtPublish);
+                rebuildLastSyncedMap(projected.messages);
+            }
+            return { ok: true, fallback: false };
+        } catch (error) {
+            if (scopeKeyValue !== scopeKeyAtPublish) return { ok: false, abandoned: true };
+
+            if (error?.status === 409 && error?.payload?.state) {
+                serverState = error.payload.state;
+                baseSnapshot = clone(error.payload.state.snapshot);
+                // Definitive conflict: caller uses the full merge path, new opId.
+                return { ok: false, fallback: true, conflict: true };
+            }
+
+            if (error?.status === 413 || error?.payload?.error === 'delta_too_large') {
+                return { ok: false, fallback: true };
+            }
+
+            // Timeout/network = UNKNOWN outcome. Retry the SAME opId.
+            if (attempt < 2) {
+                await sleep(100 * (attempt + 1));
+                continue;
+            }
+        }
+    }
+
+    // Repeated ambiguous failures: confirm against authoritative state.
+    try {
+        const confirmation = await api('/state', 'POST', {
+            scope: scopeAtPublish,
+            clientId,
+            deviceId,
+        });
+        const authoritative = confirmation.state;
+        serverState = authoritative;
+        baseSnapshot = clone(authoritative.snapshot);
+
+        if (deepEqual(authoritative.snapshot, projected)) {
+            if (mutationVersion === localMutationVersion) {
+                clearLocalDirty(scopeAtPublish);
+                rebuildLastSyncedMap(authoritative.snapshot.messages);
+            }
+            return { ok: true, fallback: false };
+        }
+
+        // Ambiguous: durable retry carrying the ORIGINAL delta opId. The
+        // queue rotates the opId itself if it rebases the payload.
+        const fallbackSnapshot = syncSnapshot(durableSnapshot());
+        await enqueueSnapshot(
+            fallbackSnapshot,
+            Number(authoritative.revision || baseRevision),
+            clone(authoritative.snapshot),
+            scopeAtPublish,
+            'snapshot',
+            null,
+            localOpId,
+        );
+        scheduleQueueFlushRetry();
+        return { ok: false, fallback: false, ambiguous: true };
+    } catch {
+        // Still unknown. Durable retry with the original opId; never issue a
+        // second live operation that could double-commit.
+        const fallbackSnapshot = syncSnapshot(durableSnapshot());
+        await enqueueSnapshot(
+            fallbackSnapshot,
+            Number(serverState?.revision || baseRevision),
+            clone(serverState?.snapshot || { messages: [], metadata: {} }),
+            scopeAtPublish,
+            'snapshot',
+            null,
+            localOpId,
+        );
+        scheduleQueueFlushRetry();
+        return { ok: false, fallback: false, ambiguous: true };
+    }
+}
+
+async function handleSnapshotDeltaEvent(data) {
+    return new Promise(resolve => {
+        const run = stateApplyChain.then(async () => {
+            const revision = Number(data?.revision || 0);
+            const baseRevision = Number(data?.baseRevision ?? -1);
+            const currentRevision = Number(serverState?.revision || 0);
+
+            if (!revision) return false;
+
+            // Already consumed (own HTTP response or SSE echo arrived first).
+            if (revision <= currentRevision) return true;
+
+            // We must hold exactly the revision this delta chains from.
+            if (baseRevision !== currentRevision || revision !== currentRevision + 1) {
+                await resyncCurrentScope(scopeEpoch);
+                return true;
+            }
+
+            const ops = Array.isArray(data?.ops) ? data.ops : null;
+            if (!ops || ops.length === 0 || ops.length > DELTA_MAX_OPS) {
+                await resyncCurrentScope(scopeEpoch);
+                return true;
+            }
+
+            const scopeAtEvent = clone(currentScope);
+            if (!scopeAtEvent) return false;
+
+            // A remote mutation during an in-flight local publish must wait
+            // for THAT publish only — never the whole future chain.
+            if (data.sourceClientId !== clientId && activeLocalPublishPromise) {
+                await activeLocalPublishPromise;
+            }
+
+            if (!currentScopeGuard(scopeEpoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtEvent)) {
+                return false;
+            }
+
+            // Never merge a remote delta over locally dirty / generating state.
+            if (data.sourceClientId !== clientId && (
+                isLocalDirty(scopeAtEvent) ||
+                localGeneration ||
+                generationActive(serverState?.generation)
+            )) {
+                await resyncCurrentScope(scopeEpoch);
+                return true;
+            }
+
+            let projected;
+            try {
+                projected = applyDeltaToSnapshotFast(serverState.snapshot, ops);
+            } catch (error) {
+                warn('snapshot delta projection failed', error);
+                await resyncCurrentScope(scopeEpoch);
+                return true;
+            }
+
+            // Own echo: the local HTTP request already mutated ctx.chat.
+            // Only advance the authoritative projection.
+            if (data.sourceClientId === clientId) {
+                serverState = { ...(serverState || {}), revision, snapshot: projected };
+                baseSnapshot = projected;
+                return true;
+            }
+
+            refreshLiveContext();
+            if (!ctx?.chat || !nativeScopeStable(scopeAtEvent)) {
+                await resyncCurrentScope(scopeEpoch);
+                return true;
+            }
+
+            applyingRemoteDepth += 1;
+            let structuralChange = false;
+
+            try {
+                for (const op of ops) {
+                    if (op.op === 'delete') {
+                        const id = String(op.messageId);
+                        const index = ctx.chat.findIndex(message => messageId(message) === id);
+                        if (index >= 0) {
+                            ctx.chat.splice(index, 1);
+                            structuralChange = true;
+                        }
+                        recordRemoteTombstone(id, Number(op.deletedAt || Date.now()));
+                        continue;
+                    }
+
+                    if (op.op === 'upsert') {
+                        const message = clone(op.message);
+                        const id = messageId(message);
+                        if (!id) throw new Error('delta_message_id_missing');
+
+                        const index = ctx.chat.findIndex(item => messageId(item) === id);
+                        if (index >= 0) {
+                            ctx.chat[index] = message;
+                            try {
+                                const result = ctx.updateMessageBlock?.(index, clone(message), { rerenderMessage: true });
+                                const domBlock = document.querySelector(`[mesid="${index}"]`);
+                                if (result === false || !domBlock) structuralChange = true;
+                            } catch {
+                                structuralChange = true;
+                            }
+                        } else {
+                            let insertAt = ctx.chat.length;
+                            if (op.afterMessageId != null) {
+                                const afterIndex = ctx.chat.findIndex(item => messageId(item) === String(op.afterMessageId));
+                                if (afterIndex < 0) throw new Error('delta_anchor_missing');
+                                insertAt = afterIndex + 1;
+                            }
+                            ctx.chat.splice(insertAt, 0, message);
+                            structuralChange = true;
+                        }
+
+                        const modifiedAt = Number(op.modifiedAt || Date.now());
+                        const bucket = chatSyncMetaBucket();
+                        if (bucket) {
+                            const tomb = readLedger(ctx.chatMetadata);
+                            if (tomb[id] && modifiedAt > tomb[id]) {
+                                delete tomb[id];
+                                bucket.tombstones = tomb;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (op.op === 'move') {
+                        const id = String(op.messageId);
+                        const currentIndex = ctx.chat.findIndex(message => messageId(message) === id);
+                        if (currentIndex < 0) throw new Error('delta_move_target_missing');
+                        const moved = ctx.chat[currentIndex];
+                        ctx.chat.splice(currentIndex, 1);
+                        let insertAt = 0;
+                        if (op.afterMessageId != null) {
+                            const afterIndex = ctx.chat.findIndex(message => messageId(message) === String(op.afterMessageId));
+                            if (afterIndex < 0) throw new Error('delta_move_anchor_missing');
+                            insertAt = afterIndex + 1;
+                        }
+                        ctx.chat.splice(insertAt, 0, moved);
+                        structuralChange = true;
+                    }
+                }
+
+                if (structuralChange) {
+                    try {
+                        await awaitablePrintMessages();
+                    } catch (error) {
+                        log('delta printMessages failed', error);
+                        throw error;
+                    }
+                }
+
+                serverState = { ...(serverState || {}), revision, snapshot: projected };
+                baseSnapshot = projected;
+                rebuildLastSyncedMap(projected.messages);
+
+                // Persist the remotely-applied change without blocking SSE
+                // processing — but never silently accept a failed native save.
+                if (scopeAtEvent.kind !== 'group') {
+                    void safeNativeSave(scopeAtEvent)
+                        .then(saved => {
+                            if (!saved && currentScopeGuard(scopeEpoch)) {
+                                void resyncCurrentScope(scopeEpoch).catch(error => warn('remote delta persistence recovery failed', error));
+                            }
+                        })
+                        .catch(error => {
+                            warn('remote delta native save failed', error);
+                            if (currentScopeGuard(scopeEpoch)) {
+                                void resyncCurrentScope(scopeEpoch).catch(recoveryError => warn('remote delta persistence recovery failed', recoveryError));
+                            }
+                        });
+                }
+
+                updateGenerationUi();
+                return true;
+            } catch (error) {
+                warn('snapshot delta application failed; resyncing', error);
+                await resyncCurrentScope(scopeEpoch);
+                return true;
+            } finally {
+                applyingRemoteDepth -= 1;
+            }
+        });
+
+        stateApplyChain = run.then(() => undefined, error => warn('snapshot delta state chain failed', error));
+        run.then(value => resolve(value), () => resolve(false));
+    });
+}
+
 async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope, kind = 'snapshot', generationId = null, opId = null) {
     if (!syncEnabled() || !scope) return;
     const scopeKey = makeScopeKey(scope);
     if (!scopeKey) return;
 
+    // Row identity and idempotency identity are SEPARATE: the queue may
+    // rebase a row's payload (rotating its opId) while keeping the row key
+    // stable across retries.
     const row = {
-        id: opId || newId(),
+        id: newId(),
+        opId: opId || newId(),
         scopeKey,
         createdAt: Date.now(),
         queueSequence: ++queueSequenceCounter,
@@ -2178,7 +2793,9 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
         snapshot: clone(snapshot),
     };
 
-    const existingRows = await idbList(scopeKey);
+    const byteSize = utf8ByteLength(row);
+    let existingRows = await idbList(scopeKey);
+
     const duplicate = existingRows.find(existing =>
         existing.kind === kind &&
         existing.generationId === row.generationId &&
@@ -2186,25 +2803,35 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
     );
     if (duplicate) return;
 
-    const byteSize = utf8ByteLength(row);
-    const currentBytes = existingRows.reduce((sum, r) => sum + utf8ByteLength(r), 0);
-    if (currentBytes + byteSize > MAX_QUEUE_BYTES) {
-        warn('queue byte budget exceeded; dropping oldest queued snapshots');
-        const sorted = [...existingRows];
-        let budget = currentBytes;
-        while (sorted.length && budget + byteSize > MAX_QUEUE_BYTES) {
-            const oldest = sorted.shift();
-            await idbDelete(oldest.id);
-            budget -= utf8ByteLength(oldest);
+    let currentBytes = existingRows.reduce((sum, r) => sum + utf8ByteLength(r), 0);
+
+    // Over capacity: consolidate, never evict or reject. Pending rows are
+    // full snapshots (absolute desired state), so the newest subsumes the
+    // older ones — keep the earliest base, drop the rest.
+    if (currentBytes + byteSize > MAX_QUEUE_BYTES || existingRows.length >= MAX_QUEUE) {
+        const snapshotRows = existingRows
+            .filter(r => r.kind === 'snapshot' && !r.generationId)
+            .sort((a, b) => (a.queueSequence || 0) - (b.queueSequence || 0));
+        if (snapshotRows.length) {
+            const earliest = snapshotRows[0];
+            row.baseRevision = Math.min(row.baseRevision, Number(earliest.baseRevision || 0));
+            row.baseSnapshot = clone(earliest.baseSnapshot || row.baseSnapshot);
+            for (const old of snapshotRows) {
+                await idbDelete(old.id);
+                currentBytes -= utf8ByteLength(old);
+            }
+            existingRows = existingRows.filter(r => !snapshotRows.includes(r));
+        }
+        if (currentBytes + byteSize > MAX_QUEUE_BYTES || existingRows.length >= MAX_QUEUE) {
+            // Only generation-bound rows remain: retain the change in the
+            // live chat (localDirty stays set) rather than drop it.
+            warn('[MCS] queue capacity reached; retaining local change for later retry');
+            scheduleQueueFlushRetry();
+            return;
         }
     }
 
     await idbPut(row);
-
-    const rows = await idbList(scopeKey);
-    if (rows.length > MAX_QUEUE) {
-        for (const old of rows.slice(0, rows.length - MAX_QUEUE)) await idbDelete(old.id);
-    }
 }
 
 function scheduleQueueFlushRetry(delay = 2000) {
@@ -2229,7 +2856,7 @@ async function sendSnapshotDirect(snapshot, baseRev, opId, scope = currentScope)
     });
 }
 
-async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringGeneration = false, scope = currentScope, opId = null } = {}) {
+async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringGeneration = false, scope = currentScope, opId = null, expectedMutationVersion = null } = {}) {
     if (!scope || !settings.enabled || !syncEnabled()) return false;
     if (!nativeScopeStable(scope)) return false;
     if (localGeneration && !allowDuringGeneration) return false;
@@ -2255,8 +2882,10 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
         if (scopeKeyValue !== scopeKeyAtPublish || !currentScope || makeScopeKey(currentScope) !== scopeKeyAtPublish) return false;
         serverState = result.state;
         baseSnapshot = result.state.snapshot;
-        clearLocalDirty(scopeAtPublish);
-        rebuildLastSyncedMap(snapshot.messages);
+        if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
+            clearLocalDirty(scopeAtPublish);
+            rebuildLastSyncedMap(snapshot.messages);
+        }
         return true;
     } catch (error) {
         if (scopeKeyValue !== scopeKeyAtPublish) return false;
@@ -2282,7 +2911,10 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
                     clearDirty: false,
                 });
                 if (!applied) return false;
-                clearLocalDirty(scopeAtPublish);
+                if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
+                    clearLocalDirty(scopeAtPublish);
+                    rebuildLastSyncedMap(merged.messages);
+                }
                 return true;
             } catch (retryError) {
                 if (retryError?.status === 409 && retryError?.payload?.error === 'generation_active') return false;
@@ -2331,6 +2963,11 @@ async function flushQueueInternal() {
                 nextSnapshot = mergeSnapshots(nextBase, nextSnapshot, remote);
                 nextBase = remote;
                 nextRevision = remoteRevision;
+                // The payload/base changed: this is a NEW logical operation.
+                // Keep the row id stable, rotate the idempotency key —
+                // otherwise a server-side duplicate check could discard the
+                // rebased local change.
+                row.opId = newId();
                 row.snapshot = clone(nextSnapshot);
                 row.baseSnapshot = clone(nextBase);
                 row.baseRevision = nextRevision;
@@ -2347,7 +2984,7 @@ async function flushQueueInternal() {
             let sendError = null;
             for (let sendAttempt = 0; sendAttempt < 3; sendAttempt += 1) {
                 try {
-                    result = await sendSnapshotDirect(nextSnapshot, nextRevision, row.id, scopeAtFlush);
+                    result = await sendSnapshotDirect(nextSnapshot, nextRevision, row.opId, scopeAtFlush);
                     sendError = null;
                     break;
                 } catch (error) {
@@ -2384,6 +3021,7 @@ async function flushQueueInternal() {
                 }
 
                 const merged = mergeSnapshots(row.baseSnapshot, row.snapshot, remote.snapshot);
+                row.opId = newId();
                 row.snapshot = clone(merged);
                 row.baseSnapshot = remote.snapshot;
                 row.baseRevision = Number(remote.revision);
@@ -2530,9 +3168,7 @@ async function openScope(epoch) {
 
         const queued = await idbList(scopeKeyValue);
 
-        if (queued.length && !serverState.generation) {
-            await flushQueue();
-        } else {
+        if (!queued.length || serverState.generation) {
             const incoming = incomingSnapshot(serverState.snapshot);
             const localSnapshot = syncSnapshot(durableSnapshot());
             if (!deepEqual(localSnapshot, incoming) && !generationIsMine(serverState.generation)) {
@@ -2546,16 +3182,16 @@ async function openScope(epoch) {
             } else {
                 rebuildLastSyncedMap(serverState.snapshot.messages);
             }
+            if (!queued.length) clearLocalDirty(scopeAtJoin);
         }
 
-        if (!queued.length) clearLocalDirty(scopeAtJoin);
-
+        // Live connection first; queue reconciliation must never delay it.
         connectSse(epoch);
         startHeartbeats(epoch);
+        statusText(`Connected · rev ${serverState.revision}`);
+        updateGenerationUi();
 
         await flushQueue();
-        updateGenerationUi();
-        statusText(`Connected · rev ${serverState.revision}`);
     } catch (error) {
         if (joinAbortController === joinController) joinAbortController = null;
         if (error?.name === 'AbortError') return;
@@ -3000,14 +3636,14 @@ async function applyRemoteStreamNow(item) {
 
     const epochAtStart = scopeEpoch;
     const expectedKey = makeScopeKey(currentScope);
-    let previousMessages = null;
-    let mutated = false;
+    // Slim rollback state: only the touched message/index, never the whole chat.
+    let previousIndex = -1;
+    let previousMessage = null;
+    let insertedIndex = -1;
 
     try {
         refreshLiveContext();
         if (!currentScope || !nativeScopeStable(currentScope)) return false;
-
-        previousMessages = clone(ctx.chat);
 
         let index = ctx.chat.findIndex(message => messageId(message) === id);
 
@@ -3016,8 +3652,9 @@ async function applyRemoteStreamNow(item) {
                 const existingAtIndex = ctx.chat[item.messageIndex];
                 if (existingAtIndex && !existingAtIndex.is_user && !existingAtIndex.is_system) {
                     index = item.messageIndex;
+                    previousIndex = index;
+                    previousMessage = clone(ctx.chat[index]);
                     ctx.chat[index] = clone(item.message);
-                    mutated = true;
                 } else {
                     return false;
                 }
@@ -3025,11 +3662,12 @@ async function applyRemoteStreamNow(item) {
                 if (ctx.chat.length && ctx.chat[ctx.chat.length - 1]?.is_user) return false;
                 ctx.chat.push(clone(item.message));
                 index = ctx.chat.length - 1;
-                mutated = true;
+                insertedIndex = index;
             }
         } else {
+            previousIndex = index;
+            previousMessage = clone(ctx.chat[index]);
             ctx.chat[index] = clone(item.message);
-            mutated = true;
         }
 
         let updated = false;
@@ -3053,15 +3691,23 @@ async function applyRemoteStreamNow(item) {
         return true;
     } catch (error) {
         warn('applyRemoteStreamNow failed; rolling back preview', error);
-        if (mutated && previousMessages && ctx?.chat &&
-            scopeEpoch === epochAtStart && currentScope && makeScopeKey(currentScope) === expectedKey) {
+        const scopeIntact = ctx?.chat &&
+            scopeEpoch === epochAtStart &&
+            currentScope &&
+            makeScopeKey(currentScope) === expectedKey;
+
+        if (scopeIntact) {
             try {
-                ctx.chat.splice(0, ctx.chat.length, ...previousMessages);
-                try { ctx.printMessages?.(); } catch { /* best effort */ }
+                if (insertedIndex >= 0) {
+                    ctx.chat.splice(insertedIndex, 1);
+                } else if (previousIndex >= 0 && previousMessage) {
+                    ctx.chat[previousIndex] = previousMessage;
+                }
+                try { ctx.printMessages?.(); } catch { /* best effort restore */ }
             } catch (restoreError) {
                 warn('applyRemoteStreamNow rollback failed', restoreError);
             }
-        } else if (mutated) {
+        } else {
             warn('[MCS] skipped stream rollback because the native scope changed during apply');
         }
         return false;
@@ -3264,6 +3910,16 @@ function stopGenerationHeartbeat() {
     generationMismatchSince = 0;
 }
 
+function sseIsOpenOrConnecting() {
+    if (!eventSource) return false;
+    try {
+        return eventSource.readyState === EventSource.OPEN ||
+            eventSource.readyState === EventSource.CONNECTING;
+    } catch {
+        return false;
+    }
+}
+
 function startHeartbeats(epoch) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
@@ -3298,6 +3954,16 @@ function startHeartbeats(epoch) {
 
             if (newRevision < oldRevision) return;
 
+            // While SSE is open or reconnecting, SSE is the sole authority for
+            // revision, cursor, AND generation state. The heartbeat is only a
+            // membership/lease channel; adopting its view here races the event
+            // stream (e.g., stamping a revision before the matching SSE delta
+            // is processed, making that delta look stale).
+            if (sseIsOpenOrConnecting()) {
+                updateGenerationUi();
+                return;
+            }
+
             serverState = {
                 ...serverState,
                 revision: newRevision,
@@ -3306,6 +3972,7 @@ function startHeartbeats(epoch) {
 
             if (oldRevision !== newRevision || oldGenerationId !== newGenerationId) {
                 await resyncCurrentScope(epoch);
+                return;
             }
 
             updateGenerationUi();
@@ -4718,6 +5385,8 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
 
     const scopeAtEvent = clone(currentScope);
     const epochAtEvent = scopeEpoch;
+    const mutationVersion = ++localMutationVersion;
+    const deltaOpId = newId();
 
     if (!nativeScopeStable(scopeAtEvent)) {
         if (localGeneration) {
@@ -4728,22 +5397,38 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
     }
 
     stampLocalMutations();
-
     markLocalDirty(scopeAtEvent);
-    const snapshotAtEvent = syncSnapshot(durableSnapshot());
 
-    const run = publishChain.then(async () => {
+    let run;
+
+    run = publishChain.then(async () => {
         if (scopeEpoch !== epochAtEvent || scopeKeyValue !== makeScopeKey(scopeAtEvent)) return false;
         if (!nativeScopeStable(scopeAtEvent)) return false;
         if (localGeneration && makeScopeKey(localGenerationScope) === makeScopeKey(scopeAtEvent) && !allowDuringGeneration) return false;
         if (localGeneration && generationIsStopRequested(localGeneration.generationId)) return false;
         if (localGeneration && localGeneration.phase === 'streaming' && allowDuringGeneration) return false;
 
+        activeLocalPublishPromise = run;
         try {
-            return await publishLocalSnapshot(snapshotAtEvent, { allowDuringGeneration, scope: scopeAtEvent });
+            const deltaResult = await publishLocalDelta({ scope: scopeAtEvent, opId: deltaOpId, mutationVersion });
+            if (deltaResult.ok) return true;
+            if (deltaResult.abandoned || deltaResult.ambiguous) return false;
+
+            // Definitive fallback (conflict, metadata change, bulk edit): a
+            // DIFFERENT payload is a NEW logical operation — new opId. Capture
+            // the chat NOW, not at event-callback time.
+            const currentSnapshot = syncSnapshot(durableSnapshot());
+            return await publishLocalSnapshot(currentSnapshot, {
+                allowDuringGeneration,
+                scope: scopeAtEvent,
+                opId: newId(),
+                expectedMutationVersion: mutationVersion,
+            });
         } catch (error) {
             warn('publish after local event failed', error);
             return false;
+        } finally {
+            if (activeLocalPublishPromise === run) activeLocalPublishPromise = null;
         }
     });
 
