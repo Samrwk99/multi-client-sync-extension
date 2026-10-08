@@ -137,6 +137,29 @@ let generationTerminalTimer = null;
 let nativeSaveChain = Promise.resolve();
 let snapshotMutationChain = Promise.resolve();
 let lifecycleChain = Promise.resolve();
+
+let scopeTransitionChain =
+    Promise.resolve();
+
+function enqueueScopeTransition(task) {
+    const run = scopeTransitionChain.then(
+        () => task(),
+    );
+
+    scopeTransitionChain =
+        run.then(
+            () => undefined,
+            error => {
+                warn(
+                    '[MCS] scope transition failed',
+                    error,
+                );
+            },
+        );
+
+    return run;
+}
+
 const registeredEventHandlers = [];
 const registeredUiHandlers = [];
 let heartbeatTimer = null;
@@ -1271,7 +1294,202 @@ function enqueueSseLogicalEvent(item) {
     }).catch(error => warn('SSE process chain failed', error));
 }
 
-async function processSseLogicalEvent(item) {
+function processSseLogicalEvent(item) {
+    // Bridge the queued SSE item into the fast-lane event shape: logical
+    // items carry their type in logicalType and their payload in data.
+    const event = item?.kind === 'logical'
+        ? { ...item.data, type: item.logicalType }
+        : item;
+    const type = generationEventType(event);
+
+    if (FAST_GENERATION_EVENT_TYPES.has(type)) {
+        // Generation traffic is latency-sensitive and must never wait behind
+        // snapshot/delta/resync processing.
+        try {
+            dispatchGenerationFastLane(event);
+        } catch (error) {
+            warn(
+                '[MCS] generation fast-lane dispatch failed',
+                error,
+            );
+        }
+
+        // Preserve the reconnect cursor: fast-lane events still advance
+        // lastSseEventId.
+        if (item?.kind === 'logical' && Number(item.eventId) > 0) {
+            lastSseEventId = Math.max(lastSseEventId, Number(item.eventId));
+        }
+
+        return;
+    }
+
+    // Keep the existing authoritative/serialized SSE processing here.
+    return processAuthoritativeSseLogicalEvent(item);
+}
+
+function dispatchGenerationFastLane(event) {
+    const type = generationEventType(event);
+
+    switch (type) {
+        case 'generation_started':
+        case 'generation_start':
+            handleGenerationFastStartEvent(event);
+            return;
+
+        case 'generation_stream':
+            handleGenerationFastStreamEvent(event);
+            return;
+
+        case 'generation_stop_requested':
+            void handleRemoteStopEvent({
+                scope: event.scope || currentScope,
+                generationId: event.generationId,
+                generation: event.generation || null,
+            }).catch(error => {
+                warn(
+                    '[MCS] fast remote-stop event handling failed',
+                    error,
+                );
+            });
+            return;
+
+        case 'generation_stopped':
+        case 'generation_terminal':
+        case 'generation_completed':
+            handleGenerationFastTerminalEvent(event);
+            return;
+
+        default:
+            return;
+    }
+}
+
+function handleGenerationFastStartEvent(event) {
+    if (!isCurrentGenerationFastEvent(event)) return;
+
+    const generationId = String(
+        event.generationId ||
+        event.generation?.generationId ||
+        '',
+    );
+
+    if (!generationId) return;
+
+    const state = getFastGenerationState(generationId);
+    if (!state) return;
+
+    state.terminal = false;
+    state.terminalSeq = 0;
+
+    // Preserve the existing generation-start UI/state handling.
+    if (typeof handleGenerationEvent === 'function') {
+        handleGenerationEvent(event);
+    }
+
+    updateGenerationUi();
+}
+
+function handleGenerationFastStreamEvent(event) {
+    if (!isCurrentGenerationFastEvent(event, {
+        allowStart: false,
+        allowWithoutCurrentGeneration: true,
+    })) {
+        return;
+    }
+
+    const generationId = String(
+        event.generationId ||
+        event.generation?.generationId ||
+        '',
+    );
+
+    const state = getFastGenerationState(generationId);
+    if (!state || state.terminal) return;
+
+    const seq = generationEventSeq(event);
+
+    if (
+        seq > 0 &&
+        seq <= state.latestSeq
+    ) {
+        return;
+    }
+
+    state.latestSeq = Math.max(
+        state.latestSeq,
+        seq,
+    );
+
+    // A generation_stream frame is treated as the complete current
+    // streaming-message state. Therefore a skipped intermediate seq does
+    // not freeze the UI or force an immediate /state resync.
+    state.latestFrame = event;
+
+    scheduleFastGenerationRender(generationId);
+}
+
+function handleGenerationFastTerminalEvent(event) {
+    if (!isCurrentGenerationFastEvent(event, {
+        allowWithoutCurrentGeneration: true,
+    })) {
+        return;
+    }
+
+    const generationId = String(
+        event.generationId ||
+        event.generation?.generationId ||
+        '',
+    );
+
+    if (!generationId) return;
+
+    const state = getFastGenerationState(generationId);
+    if (!state) return;
+
+    const seq = generationEventSeq(event);
+
+    // Apply a final cumulative stream frame carried by the terminal event
+    // before marking the generation terminal.
+    if (
+        event.stream ||
+        event.finalFrame ||
+        event.message ||
+        event.content != null
+    ) {
+        if (
+            seq > 0 &&
+            seq > state.latestSeq
+        ) {
+            state.latestSeq = seq;
+            state.latestFrame =
+                event.stream ||
+                event.finalFrame ||
+                event;
+        }
+    }
+
+    state.terminal = true;
+    state.terminalSeq = seq || state.latestSeq;
+
+    // Terminal UI must respond immediately.
+    handleGenerationTerminalEvent(event);
+
+    // Wake any stop confirmation logic immediately when the SSE terminal
+    // event itself is sufficient proof.
+    if (
+        typeof resolveRemoteStopConfirmation === 'function'
+    ) {
+        resolveRemoteStopConfirmation(
+            generationId,
+            true,
+        );
+    }
+
+    // Authoritative reconciliation still happens through the normal state
+    // machinery; it must not block the visual terminal transition.
+}
+
+async function processAuthoritativeSseLogicalEvent(item) {
     // Stale item from a previous scope/connection: drop it.
     if (item.scopeKey !== scopeKeyValue || item.epoch !== scopeEpoch) return null;
 
@@ -1381,6 +1599,9 @@ function handleGenerationState(data) {
 
     remoteGenerationId = generation.generationId;
     lastRemoteStreamSeq = Number(generation.seq || 0);
+    // A tab joining mid-generation never saw a generation_started event to
+    // create the fast-lane state; create it here so live stream frames render.
+    getFastGenerationState(generation.generationId);
     if (generation.message) {
         pendingRemoteStream = {
             message: clone(generation.message),
@@ -4035,8 +4256,7 @@ function handleServerHello(data) {
         clearRemoteStreamState();
     } else if (generation?.generationId && !generationIsStopRequested(generation.generationId)) {
         if (remoteStopGenerationId && remoteStopGenerationId !== generation.generationId) {
-            remoteStopGenerationId = null;
-            remoteStopRequestedAt = 0;
+            clearRemoteStopTracking();
         }
     }
 
@@ -4400,69 +4620,14 @@ if (localGeneration) {
     }
 }
 
-function handleGenerationStreamEvent(data) {
-    const g = data?.generation;
-    if (!g || !g.generationId || !currentScope) return;
-    if (isGenerationTerminated(g.generationId)) return;
-    if (generationIsStopRequested(g.generationId)) return;
-
-    const current = serverState?.generation;
-    const currentTime = Number(current?.startedAt || current?.claimedAt || 0);
-    const incomingTime = Number(g?.startedAt || g?.claimedAt || 0);
-    if (current && current.generationId !== g.generationId && generationActive(current) && incomingTime && currentTime && incomingTime < currentTime) return;
-
-    const eventRevision = Number(data?.revision || 0);
-    if (eventRevision && eventRevision < Number(serverState?.revision || 0)) return;
-
-    const seq = Number(data?.seq ?? g.seq ?? 0);
-    const sameGeneration = current?.generationId === g.generationId;
-    if (sameGeneration && current && seq < Number(current.seq || 0)) return;
-
-    if (generationIsMine(g)) {
-        if (generationClaimedThisPage || generationClaimInFlightId === g.generationId) {
-            serverState = { ...(serverState || {}), revision: Math.max(Number(serverState?.revision || 0), eventRevision), generation: clone(g) };
-            if (generationClaimedThisPage && localGeneration?.generationId === g.generationId) localGeneration = clone(g);
-        }
-        return;
-    }
-
-    if (remoteGenerationId !== g.generationId) {
-        remoteGenerationId = g.generationId;
-        lastRemoteStreamSeq = -1;
-        suppressedRemoteStreamMessageIds.clear();
-    }
-
-    if (seq <= lastRemoteStreamSeq) return;
-
-    const hadGap = seq > 0 && lastRemoteStreamSeq >= 0 && seq > lastRemoteStreamSeq + 1;
-    if (hadGap) {
-        // A stream gap invalidates the preview ordering. Start authoritative
-        // reconciliation, but do not treat this event as proof that the
-        // native chat is fully caught up — applyRemoteStreamNow stays a
-        // preview path only.
-        void resyncCurrentScope(scopeEpoch).catch(error => warn('stream gap resync failed', error));
-    }
-
-    lastRemoteStreamSeq = seq;
-    serverState = {
-        ...(serverState || {}),
-        revision: Math.max(Number(serverState?.revision || 0), eventRevision),
-        generation: clone(g),
-    };
-
-    if (!data.message || !currentScope || !nativeScopeStable(currentScope)) {
-        updateGenerationUi();
-        return;
-    }
-
-    pendingRemoteStream = {
-        message: clone(data.message),
-        messageIndex: Number.isInteger(data.messageIndex) ? data.messageIndex : null,
-        generationId: g.generationId,
-        seq,
-    };
-    scheduleRemoteRender();
-    updateGenerationUi();
+function handleGenerationStreamEvent(event) {
+    /*
+     * This function should now be the compatibility entry point for all
+     * generation_stream deliveries. It must not await the authoritative
+     * state queue, /state, resync, queue flushing, or full-chat snapshot
+     * work.
+     */
+    handleGenerationFastStreamEvent(event);
 }
 
 async function applyRemoteStreamNow(item) {
@@ -4632,6 +4797,7 @@ async function handleGenerationTerminalEvent(data) {
     const local = !mine && dirty ? syncSnapshot(durableSnapshot()) : null;
 
     rememberTerminatedGeneration(generationId);
+    clearFastGenerationState(generationId);
 
     serverState = {
         ...(serverState || {}),
@@ -4700,15 +4866,20 @@ async function handleGenerationTerminalEvent(data) {
     clearRemoteStreamState();
     streamInFlightSeq = 0;
     remoteStopInFlight = null;
-    remoteStopGenerationId = null;
-    remoteStopRequestedAt = 0;
+    clearRemoteStopTracking();
 
     if (generationId === localGeneration?.generationId) {
         clearLocalGenerationState();
     }
 
     updateGenerationUi();
-    await flushQueue();
+
+    void flushQueue().catch(error => {
+        warn(
+            '[MCS] queue flush after generation terminal failed',
+            error,
+        );
+    });
 
     if (leaveAfterLocalGeneration && !localGeneration) {
         leaveAfterLocalGeneration = false;
@@ -5314,6 +5485,13 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
             startGenerationHeartbeat(
                 epochAtGeneration,
             );
+
+            broadcastWake('generation-started', {
+                scope: clone(localGenerationScope || currentScope),
+                generationId: localGeneration?.generationId,
+                generation: clone(localGeneration),
+                startedAt: Date.now(),
+            });
 
             return await ensureGenerationStarted();
         } catch (error) {
@@ -6182,6 +6360,7 @@ async function leaveCurrentScope({
     clearLocalGenerationState();
     clearRemoteStreamState();
     resetChunkAssemblies();
+    clearAllFastGenerationStates();
 
     lastSyncedMessageMap = new Map();
     lastSseEventId = 0;
@@ -6832,6 +7011,13 @@ try {
         updateGenerationUi();
         startGenerationHeartbeat(epochAtClaim);
 
+        broadcastWake('generation-started', {
+            scope: clone(localGenerationScope || currentScope),
+            generationId: localGeneration?.generationId,
+            generation: clone(localGeneration),
+            startedAt: Date.now(),
+        });
+
         const started = await ensureGenerationStarted();
         if (!started) {
             statusText('Reconnecting shared generation…');
@@ -7134,6 +7320,24 @@ if (!id) return;
     const seq = Math.max(previousSeq + 1, queuedSeq, inFlightNextSeq);
 
     pendingStream = { seq, message, messageIndex: index };
+
+    // Fast path: propagate the frame to same-browser tabs before the slower
+    // server persistence/network work.
+    broadcastWake('generation-stream', {
+        scopeKey: makeScopeKey(
+            localGenerationScope || currentScope,
+        ),
+        generationId:
+            localGeneration?.generationId || '',
+        seq,
+        messageId:
+            messageId(message) || null,
+        content:
+            message?.mes ?? null,
+        reasoning:
+            message?.extra?.reasoning ?? null,
+        stream: clone(message),
+    });
 
     if (generationServerReadyId === generationId) scheduleGenerationStream();
     else {
@@ -7800,50 +8004,240 @@ function wireEvents() {
     listen(types.GROUP_WRAPPER_FINISHED, onGroupWrapperFinished);
 }
 
+const REMOTE_GENERATION_ACTION_SELECTOR = [
+    '#mes_stop',
+    '.mes_stop',
+    '#send_but',
+    '#option_regenerate',
+    '#regenerate_last_message',
+    '#mes_impersonate',
+    '#option_impersonate',
+    '#swipe_left',
+    '#swipe_right',
+    '.swipe_left',
+    '.swipe_right',
+    '.group_member [data-action="speak"]',
+].join(', ');
+
 function remoteGenerationActionSelector() {
-    return [
-        '#mes_stop',
-        '.mes_stop',
-        '#send_but',
-        '#option_regenerate',
-        '#regenerate_last_message',
-        '#mes_impersonate',
-        '#option_impersonate',
-        '#swipe_left',
-        '#swipe_right',
-        '.swipe_left',
-        '.swipe_right',
-        '.group_member [data-action="speak"]',
-    ].join(', ');
+    return REMOTE_GENERATION_ACTION_SELECTOR;
 }
 
+const FAST_GENERATION_EVENT_TYPES = new Set([
+    'generation_started',
+    'generation_start',
+    'generation_stream',
+    'generation_stop_requested',
+    'generation_stopped',
+    'generation_terminal',
+    'generation_completed',
+]);
+
+// Transient, latency-sensitive generation state.
+// This deliberately stays separate from serverState so fast stream frames
+// cannot race the authoritative revision/state pipeline.
+const fastGenerationStates = new Map();
+
+function getFastGenerationState(generationId) {
+    const id = String(generationId || '');
+    if (!id) return null;
+
+    let state = fastGenerationStates.get(id);
+
+    if (!state) {
+        state = {
+            latestSeq: 0,
+            latestFrame: null,
+            terminal: false,
+            terminalSeq: 0,
+            renderScheduled: false,
+        };
+
+        fastGenerationStates.set(id, state);
+    }
+
+    return state;
+}
+
+function clearFastGenerationState(generationId) {
+    const id = String(generationId || '');
+    if (!id) return;
+
+    fastGenerationStates.delete(id);
+}
+
+function clearAllFastGenerationStates() {
+    fastGenerationStates.clear();
+}
+
+function generationEventType(event) {
+    return String(
+        event?.type ||
+        event?.event ||
+        event?.kind ||
+        '',
+    ).toLowerCase();
+}
+
+function generationEventSeq(event) {
+    const seq = Number(
+        event?.seq ??
+        event?.sequence ??
+        event?.streamSeq ??
+        0,
+    );
+
+    return Number.isFinite(seq) ? seq : 0;
+}
+
+function generationEventScopeKey(event) {
+    return String(
+        event?.scopeKey ||
+        (
+            event?.scope
+                ? makeScopeKey(event.scope)
+                : ''
+        ) ||
+        '',
+    );
+}
+
+function isCurrentGenerationFastEvent(event, {
+    allowStart = true,
+    allowWithoutCurrentGeneration = false,
+} = {}) {
+    if (!event || !currentScope) return false;
+
+    const eventScopeKey = generationEventScopeKey(event);
+
+    if (
+        eventScopeKey &&
+        eventScopeKey !== scopeKeyValue
+    ) {
+        return false;
+    }
+
+    const generationId = String(
+        event?.generationId ||
+        event?.generation?.generationId ||
+        '',
+    );
+
+    if (!generationId) return false;
+
+    if (
+        !allowStart &&
+        !fastGenerationStates.has(generationId)
+    ) {
+        return false;
+    }
+
+    if (
+        !allowWithoutCurrentGeneration &&
+        !localGeneration &&
+        serverState?.generation?.generationId &&
+        String(serverState.generation.generationId) !== generationId &&
+        generationEventType(event) !== 'generation_started' &&
+        generationEventType(event) !== 'generation_start'
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+function waitForNextPaint() {
+    return new Promise(resolve => {
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => resolve());
+        } else {
+            setTimeout(resolve, 0);
+        }
+    });
+}
+
+function scheduleFastGenerationRender(generationId) {
+    const state = getFastGenerationState(generationId);
+    if (!state || state.renderScheduled) return;
+
+    state.renderScheduled = true;
+
+    const render = () => {
+        state.renderScheduled = false;
+
+        const current = fastGenerationStates.get(
+            String(generationId || ''),
+        );
+
+        if (!current || !current.latestFrame) return;
+        if (current.terminal) return;
+
+        // Only the newest frame is rendered; the fast lane coalesces
+        // intermediate frames into the latest cumulative state.
+        void handleGenerationStreamFrameVisualUpdate(
+            current.latestFrame,
+        );
+    };
+
+    if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(render);
+    } else {
+        setTimeout(render, 0);
+    }
+}
+
+// Extracted stream-frame visual update: the existing DOM/message-rendering
+// portion of the stream path (applyRemoteStreamNow), kept separate so the
+// fast lane renders only the newest cumulative frame.
+function handleGenerationStreamFrameVisualUpdate(frame) {
+    if (!frame) return false;
+
+    const generationId = String(
+        frame.generationId ||
+        frame.generation?.generationId ||
+        '',
+    );
+
+    const message = frame.message || frame.stream || null;
+    if (!generationId || !message) return false;
+
+    return applyRemoteStreamNow({
+        message,
+        messageIndex: Number.isInteger(frame.messageIndex) ? frame.messageIndex : null,
+        generationId,
+        seq: generationEventSeq(frame),
+    });
+}
+
+const REMOTE_MUTATION_GUARD_SELECTOR = [
+    '#option_delete_mes',
+    '#option_delete_chat',
+    '#dialogue_del_mes_ok',
+    '.mes_edit',
+    '.mes_edit_done',
+    '.mes_edit_delete',
+    '.mes_edit_up',
+    '.mes_edit_down',
+    '.mes_edit_cancel',
+    '.mes_reasoning_edit',
+    '.mes_reasoning_edit_done',
+    '.mes_reasoning_delete',
+    '.mes_reasoning_edit_cancel',
+    '.mes_del',
+    '.mes_delete',
+    '.delete_message',
+    '.edit_message',
+    '.mes_hide',
+    '.mes_unhide',
+    '.mes_embed',
+    '.mes_create_bookmark',
+    '.mes_create_branch',
+    '[data-action="edit"]',
+    '[data-action="delete"]',
+].join(', ');
+
 function remoteMutationGuardSelector() {
-    return [
-        '#option_delete_mes',
-        '#option_delete_chat',
-        '#dialogue_del_mes_ok',
-        '.mes_edit',
-        '.mes_edit_done',
-        '.mes_edit_delete',
-        '.mes_edit_up',
-        '.mes_edit_down',
-        '.mes_edit_cancel',
-        '.mes_reasoning_edit',
-        '.mes_reasoning_edit_done',
-        '.mes_reasoning_delete',
-        '.mes_reasoning_edit_cancel',
-        '.mes_del',
-        '.mes_delete',
-        '.delete_message',
-        '.edit_message',
-        '.mes_hide',
-        '.mes_unhide',
-        '.mes_embed',
-        '.mes_create_bookmark',
-        '.mes_create_branch',
-        '[data-action="edit"]',
-        '[data-action="delete"]',
-    ].join(', ');
+    return REMOTE_MUTATION_GUARD_SELECTOR;
 }
 
 function unwireUiGuards() {
@@ -7968,6 +8362,37 @@ async function waitForRemoteStopConfirmation(scope, generationId, epoch) {
     let lastSeenRevision =
         Number(serverState?.revision || 0);
 
+    const alreadyKnownGeneration =
+        serverState?.generation || null;
+
+    if (
+        !alreadyKnownGeneration ||
+        alreadyKnownGeneration.generationId !==
+            generationId
+    ) {
+        rememberTerminatedGeneration(
+            generationId,
+        );
+
+        clearRemoteStopTracking();
+        updateGenerationUi();
+        return true;
+    }
+
+    if (
+        alreadyKnownGeneration.stopRequested
+    ) {
+        rememberStopRequestedGeneration(
+            generationId,
+        );
+
+        remoteStopGenerationId =
+            generationId;
+
+        updateGenerationUi();
+        return true;
+    }
+
     for (
         let attempt = 0;
         attempt < REMOTE_STOP_CONFIRM_ATTEMPTS;
@@ -8034,10 +8459,12 @@ async function waitForRemoteStopConfirmation(scope, generationId, epoch) {
                 );
 
             if (
-                incomingRevision >=
-                currentRevision
+                incomingRevision >= currentRevision
             ) {
                 serverState = incomingState;
+            } else {
+                await sleep(REMOTE_STOP_CONFIRM_MS);
+                continue;
             }
 
             const generation =
@@ -8124,6 +8551,11 @@ async function waitForRemoteStopConfirmation(scope, generationId, epoch) {
     }
 
     return false;
+}
+
+function clearRemoteStopTracking() {
+    remoteStopGenerationId = null;
+    remoteStopRequestedAt = 0;
 }
 
 async function requestRemoteStop() {
@@ -8263,10 +8695,70 @@ if (localGeneration) {
             }
 
             updateGenerationUi();
-            const confirmed = await waitForRemoteStopConfirmation(scopeAtRequest, generationId, epochAtRequest);
 
-            if (!confirmed && currentScopeGuard(epochAtRequest)) {
-                statusText('Stop request sent; waiting for the generating client…');
+            const returnedGeneration =
+                result?.state?.generation || null;
+
+            if (!returnedGeneration) {
+                clearRemoteStopTracking();
+                rememberTerminatedGeneration(generationId);
+                updateGenerationUi();
+                return true;
+            }
+
+            if (
+                returnedGeneration.generationId !==
+                generationId
+            ) {
+                clearRemoteStopTracking();
+                rememberTerminatedGeneration(generationId);
+                updateGenerationUi();
+                return true;
+            }
+
+            if (returnedGeneration.stopRequested) {
+                rememberStopRequestedGeneration(
+                    generationId,
+                );
+
+                remoteStopGenerationId =
+                    generationId;
+
+                updateGenerationUi();
+                return true;
+            }
+
+            const returnedPhase = String(
+                returnedGeneration.phase || '',
+            ).toLowerCase();
+
+            if (
+                terminalGenerationPhases.has(returnedPhase)
+            ) {
+                clearRemoteStopTracking();
+                rememberTerminatedGeneration(
+                    generationId,
+                );
+                updateGenerationUi();
+                return true;
+            }
+
+            // Only use the slower confirmation fallback if the Stop response genuinely
+            // did not tell us enough to know what happened.
+            const confirmed =
+                await waitForRemoteStopConfirmation(
+                    scopeAtRequest,
+                    generationId,
+                    epochAtRequest,
+                );
+
+            if (
+                !confirmed &&
+                currentScopeGuard(epochAtRequest)
+            ) {
+                statusText(
+                    'Stop request sent; waiting for the generating client…',
+                );
                 updateGenerationUi();
             }
 
@@ -8320,8 +8812,7 @@ if (
             }
 
             forgetStopRequestedGeneration(generationId);
-            remoteStopGenerationId = null;
-            remoteStopRequestedAt = 0;
+            clearRemoteStopTracking();
 
             if (currentScopeGuard(epochAtRequest)) {
                 statusText(`Stop request failed: ${error?.message || 'request failed'}`, true);
@@ -8360,12 +8851,19 @@ async function releaseGenerationClaim(phase = 'stopped') {
     // already-started stream request observe the abort before committing the
     // terminal snapshot, otherwise stream and terminal can cross in flight.
     if (streamInFlightPromise) {
+        /*
+         * The terminal snapshot is authoritative. Do not make UI/terminal
+         * completion depend on a potentially stalled stream transport.
+         *
+         * The stream transport has already been aborted above. Give it one
+         * microtask turn to observe the abort, but never block terminalization
+         * behind a multi-second timeout.
+         */
         try {
-            await Promise.race([
-                streamInFlightPromise,
-                sleep(2500),
-            ]);
-        } catch { /* ignore */ }
+            await Promise.resolve(streamInFlightPromise);
+        } catch {
+            /* terminal snapshot remains authoritative */
+        }
     }
 
     if (streamCaptureTimer) {
@@ -8373,7 +8871,7 @@ async function releaseGenerationClaim(phase = 'stopped') {
         streamCaptureTimer = null;
     }
 
-    await sleep(60);
+    await waitForNextPaint();
 
     if (!localGenerationMatches(generation.generationId, scopeAtGeneration)) {
         terminalizingGenerationId = null;
@@ -8405,6 +8903,10 @@ async function releaseGenerationClaim(phase = 'stopped') {
 
 if (result.success) {
     rememberTerminatedGeneration(
+        generation.generationId,
+    );
+
+    clearFastGenerationState(
         generation.generationId,
     );
 
@@ -8562,12 +9064,25 @@ if (
 
     try {
         if (streamInFlightPromise) {
-            try { await Promise.race([streamInFlightPromise, sleep(2500)]); } catch { /* ignore */ }
+            try {
+                await Promise.resolve(streamInFlightPromise);
+            } catch {
+                /* terminal snapshot remains authoritative */
+            }
         }
 
-        await sleep(60);
+        await waitForNextPaint();
 
-        if (!localGenerationMatches(g.generationId, scopeAtGeneration)) return false;
+        if (!localGenerationMatches(g.generationId, scopeAtGeneration)) {
+            if (
+                terminalizingGenerationId ===
+                g.generationId
+            ) {
+                terminalizingGenerationId = null;
+            }
+
+            return false;
+        }
 
         refreshLiveContext();
         const snapshot = nativeScopeStable(scopeAtGeneration)
@@ -8592,11 +9107,57 @@ if (
         }
 
         if (result.success) {
-            rememberTerminatedGeneration(g.generationId);
+            broadcastWake('generation-terminal', {
+                scopeKey: makeScopeKey(scopeAtGeneration),
+                generationId: g.generationId,
+                phase,
+                seq: Number(
+                    fastGenerationStates.get(
+                        g.generationId,
+                    )?.latestSeq || 0,
+                ),
+                state: result.state
+                    ? clone(result.state)
+                    : null,
+            });
+
+            rememberTerminatedGeneration(
+                g.generationId,
+            );
+
+            clearFastGenerationState(
+                g.generationId,
+            );
+
             if (stillSameLocal && mutationVersionAtStart === localMutationVersion) {
                 clearLocalDirty(scopeAtGeneration);
             } else if (stillSameLocal) {
                 markLocalDirty(scopeAtGeneration);
+
+                void enqueueSnapshot(
+                    syncSnapshot(
+                        durableSnapshot(),
+                    ),
+                    Number(
+                        serverState?.revision || 0,
+                    ),
+                    serverState?.snapshot ||
+                        localGenerationBaseSnapshot || {
+                            messages: [],
+                            metadata: {},
+                        },
+                    scopeAtGeneration,
+                    'snapshot',
+                    null,
+                    newId(),
+                ).then(
+                    () => scheduleQueueFlushRetry(),
+                ).catch(error => {
+                    warn(
+                        '[MCS] post-terminal mutation queue failed',
+                        error,
+                    );
+                });
             }
 
             if (stillSameLocal) clearLocalGenerationState();
@@ -8617,7 +9178,14 @@ if (
             }
 
             updateGenerationUi();
-            await flushQueue();
+
+            void flushQueue().catch(error => {
+                warn(
+                    '[MCS] queue flush after generation terminal failed',
+                    error,
+                );
+            });
+
             return true;
         }
 
@@ -8674,17 +9242,63 @@ try {
 }
 
 bc?.addEventListener('message', message => {
-            const data = message.data;
-            if (data?.scopeKey !== scopeKeyValue) return;
+    const data = message.data;
 
-            if (data?.kind === 'generation-stop-requested' && currentScope) {
-                handleRemoteStopEvent({
-                    scope: data.scope || currentScope,
-                    generationId: data.generationId,
-                    generation: data.generation || null,
-                }).catch(error => warn('BroadcastChannel remote stop handling failed', error));
-            }
+    if (!data || typeof data !== 'object') return;
+    if (data.scopeKey !== scopeKeyValue) return;
+
+    if (
+        data.kind === 'generation-stream' &&
+        currentScope
+    ) {
+        handleGenerationFastStreamEvent({
+            ...data,
+            __mcsFromBroadcastChannel: true,
         });
+
+        return;
+    }
+
+    if (
+        data.kind === 'generation-started' &&
+        currentScope
+    ) {
+        handleGenerationFastStartEvent({
+            ...data,
+            __mcsFromBroadcastChannel: true,
+        });
+
+        return;
+    }
+
+    if (
+        data.kind === 'generation-terminal' &&
+        currentScope
+    ) {
+        handleGenerationFastTerminalEvent({
+            ...data,
+            __mcsFromBroadcastChannel: true,
+        });
+
+        return;
+    }
+
+    if (
+        data.kind === 'generation-stop-requested' &&
+        currentScope
+    ) {
+        handleRemoteStopEvent({
+            scope: data.scope || currentScope,
+            generationId: data.generationId,
+            generation: data.generation || null,
+        }).catch(error => {
+            warn(
+                'BroadcastChannel remote stop handling failed',
+                error,
+            );
+        });
+    }
+});
 
 if (!storageHandler) {
     storageHandler = event => {
@@ -8744,7 +9358,7 @@ if (!storageHandler) {
                             });
                     }
                 } else {
-                    switchScope('storage:autoConnect')
+                    enqueueScopeTransition(() => switchScope('storage:autoConnect'))
                         .catch(error => {
                             warn(
                                 'storage-driven autoConnect reconnect failed',
@@ -8757,18 +9371,7 @@ if (!storageHandler) {
             }
 
             // Keep all other shared settings immediately reflected locally.
-            if (
-                previousSettings.coordinateGeneration !== settings.coordinateGeneration ||
-                previousSettings.remoteStop !== settings.remoteStop ||
-                previousSettings.syncMessages !== settings.syncMessages ||
-                previousSettings.syncMetadata !== settings.syncMetadata ||
-                previousSettings.notifications !== settings.notifications ||
-                previousSettings.debug !== settings.debug
-            ) {
-                updateGenerationUi();
-            } else {
-                updateGenerationUi();
-            }
+            updateGenerationUi();
         } catch {
             /* ignore invalid storage */
         }
@@ -8856,6 +9459,7 @@ function onDisableInternal() {
         setRemoteSendButtonMode(false);
         clearGenerationMarkers();
         manualGenerationRequestAt = 0;
+        clearAllFastGenerationStates();
 
         try { bc?.close?.(); } catch { /* ignore */ }
         bc = null;
@@ -8875,7 +9479,9 @@ function onDisable() {
 }
 
 async function onReconnect() {
-    return switchScope('manual-reconnect');
+    return enqueueScopeTransition(
+        () => switchScope('manual-reconnect'),
+    );
 }
 
 async function mountSettings() {
@@ -8996,7 +9602,7 @@ async function mountSettings() {
                     statusText('Disconnected');
                 }
             } else if (settings.enabled && settings.autoConnect) {
-                await switchScope(`setting:${key}`);
+                await enqueueScopeTransition(() => switchScope(`setting:${key}`));
             }
 
             updateGenerationUi();
