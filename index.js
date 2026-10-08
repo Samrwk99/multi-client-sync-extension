@@ -1794,7 +1794,7 @@ function setSendLock(reason = '') {
 function isRemoteGenerationActive() {
     const g = serverState?.generation;
 
-    if (!generationActive(g)) {
+    if (!g || !generationActive(g)) {
         return false;
     }
 
@@ -1806,8 +1806,7 @@ function isRemoteGenerationActive() {
         return false;
     }
 
-    // A generation that this client has just claimed is not remote, even
-    // before localGeneration has been fully installed.
+    // Our own claimed generation is never remote.
     if (
         generationClaimInFlightId &&
         generationId === String(
@@ -1817,14 +1816,10 @@ function isRemoteGenerationActive() {
         return false;
     }
 
-    // A server generation owned by this client is NEVER a remote generation.
-    // This is important during reconnect/recovery, where serverState can
-    // still contain our generation while localGeneration is temporarily null.
     if (generationIsMine(g)) {
         return false;
     }
 
-    // A locally tracked generation is also never remote.
     if (
         localGeneration &&
         generationId === String(
@@ -1834,9 +1829,28 @@ function isRemoteGenerationActive() {
         return false;
     }
 
-    // Do not block native Send controls based on a stale same-client lease
-    // that the server no longer considers authoritative.
     if (generationIsStaleOwned(g)) {
+        return false;
+    }
+
+    const phase = String(
+        g.phase || '',
+    ).toLowerCase();
+
+    // Only block native generation controls for an explicitly active
+    // generation. Do not let an incomplete/stale server object with an
+    // unknown phase suppress SillyTavern's normal Send path.
+    if (
+        phase !== 'started' &&
+        phase !== 'streaming'
+    ) {
+        return false;
+    }
+
+    // While this tab's authoritative SSE connection is unavailable, do not
+    // let a potentially stale cached generation object permanently block
+    // native sending. The reconnect/resync path will restore the state.
+    if (!sseIsOpen()) {
         return false;
     }
 
@@ -7858,15 +7872,12 @@ function wireUiGuards() {
 
 if (!isRemoteGenerationActive()) return;
 
-// Never let stale remote-generation state block native SillyTavern input
-// while this tab is still transitioning/reconnecting its shared scope.
-// The server/SSE state will be reconciled before generation coordination
-// takes effect again.
 if (
     !currentScope ||
-    !nativeScopeStable(currentScope) ||
-    !sseIsOpen()
+    !nativeScopeStable(currentScope)
 ) {
+    // Native ST is still transitioning. Do not interfere with its normal
+    // input handling.
     return;
 }
 
