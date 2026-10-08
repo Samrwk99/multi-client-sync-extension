@@ -8,7 +8,9 @@ const MAX_QUEUE_BYTES = 64 * 1024 * 1024;
 const HEARTBEAT_MS = 10_000;
 const GENERATION_HEARTBEAT_MS = 5_000;
 const STREAM_SEND_MS = 60;
-const REMOTE_RENDER_MS = 45;
+// Coalesced render on the next tick: pendingRemoteStream is overwritten by
+// newer stream events, so only the latest message renders. No fixed latency.
+const REMOTE_RENDER_MS = 16;
 const STORAGE_KEY = 'multi-client-sync-settings-v1';
 const CLIENT_KEY = 'multi-client-sync-client-id-v1';
 const DEVICE_KEY = 'multi-client-sync-device-id-v1';
@@ -18,7 +20,8 @@ const TERMINAL_API_TIMEOUT_MS = 15_000;
 const STOP_API_TIMEOUT_MS = 8_000;
 const TERMINAL_RETRY_MS = 1_000;
 const REMOTE_STOP_CONFIRM_MS = 350;
-const REMOTE_STOP_CONFIRM_ATTEMPTS = 12;
+// SSE now delivers terminal state promptly; the poll is only a fallback.
+const REMOTE_STOP_CONFIRM_ATTEMPTS = 6;
 const GENERATION_CONTINUATION_GRACE_MS = 350;
 const OWNERSHIP_CONFLICT_GRACE_MS = 3_500;
 const OWNERSHIP_RECOVERY_GRACE_MS = 1_200;
@@ -30,8 +33,6 @@ const MAX_CHUNK_ASSEMBLIES = 8;
 const CHUNK_ASSEMBLY_TIMEOUT_MS = 30_000;
 const MAX_CHUNK_BUFFER_BYTES = 16 * 1024 * 1024;
 
-// Tombstones travel inside chatMetadata under this reserved key so deletes
-// survive snapshot merges deterministically. Retention bounds the ledger.
 const MCS_META_KEY = 'multi_client_sync';
 const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -52,7 +53,6 @@ const quietGenerationTypes = new Set(['quiet', 'quiet_escape', 'background']);
 
 let settings = loadSettings();
 
-// clientId identifies this browser tab/session. It must NOT live in localStorage.
 let clientId = loadSessionId(CLIENT_KEY);
 let deviceId = loadStableId(DEVICE_KEY);
 let tabId = crypto.randomUUID();
@@ -103,14 +103,11 @@ let bc = null;
 let localGenerationScope = null;
 let localGenerationEpoch = 0;
 let localGenerationBaseSnapshot = null;
-let localGenerationLastSnapshot = null;
 let localStreamMessageId = null;
 let localStreamMessageIndex = null;
 let pendingRemoteStream = null;
 let remoteGenerationId = null;
 let lastRemoteStreamSeq = -1;
-// lastSseEventId is the LOGICAL event cursor: the highest logical event id
-// this client has fully accepted (normal event or complete chunked transfer).
 let lastSseEventId = 0;
 let generationHeartbeatFailures = 0;
 let generationHeartbeatInFlight = null;
@@ -144,13 +141,10 @@ let remoteSendButtonState = null;
 let storageHandler = null;
 let queueSequenceCounter = 0;
 
-// Last-synced message state (id -> comparable hash). Diffing current chat
-// against this detects local deletions and edits so tombstones and
-// lastModified timestamps get stamped before publishing.
+// Last-synced message fingerprints (id -> 64-bit hash). Hashes, not full
+// serialized messages — the map must stay tiny even for huge chats.
 let lastSyncedMessageMap = new Map();
 
-// SSE chunking state. Assemblies are keyed by scope + transferId so both
-// durable logical events and transient generation_state transfers are safe.
 const chunkAssemblies = new Map();
 let chunkAssemblyTotalBytes = 0;
 let sseProcessChain = Promise.resolve();
@@ -376,9 +370,6 @@ function ensureMessageIds(messages) {
 
         let id = message.extra.multi_client_sync.messageId;
         if (typeof id !== 'string' || !id || seen.has(id)) {
-            // A duplicate durable id is a local integrity failure: identity is
-            // unstable and merges may mis-associate messages. Regenerate to
-            // keep sync functional, but surface it loudly.
             if (typeof id === 'string' && id && seen.has(id)) {
                 warn('[MCS] duplicate message id detected; regenerating to preserve integrity:', id);
             }
@@ -530,9 +521,6 @@ function scopeFromContext() {
             character = ctx.characters.find(item => String(item?.name || '') === String(ctx.name2)) || null;
         }
 
-        // The avatar filename is SillyTavern's persistent unique character key
-        // (the card's on-disk identity). The array index is NOT stable. Name
-        // is the last-resort fallback.
         const ownerAvatar = character?.avatar ? String(character.avatar) : '';
         const ownerName = character?.name ? String(character.name) : '';
         ownerId = ownerAvatar || ownerName || '';
@@ -753,7 +741,6 @@ async function idbList(scopeKey) {
             const tx = db.transaction('ops', 'readonly');
             const req = tx.objectStore('ops').index('scopeKey').getAll(scopeKey);
             req.onsuccess = () => finish(null, req.result.sort((a, b) => {
-                // Deterministic ordering: createdAt, then local sequence, then id.
                 if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
                 if ((a.queueSequence || 0) !== (b.queueSequence || 0)) return (a.queueSequence || 0) - (b.queueSequence || 0);
                 return String(a.id).localeCompare(String(b.id));
@@ -799,12 +786,6 @@ async function idbClearScope(scopeKey) {
 
 // ---------------------------------------------------------------------------
 // Tombstones / local mutation stamping
-//
-// The tombstone ledger lives in chatMetadata under MCS_META_KEY and travels
-// with every snapshot. Before publishing a local change, the current chat is
-// diffed against the last-synced state: vanished ids become tombstones,
-// changed messages get a fresh lastModified. mergeSnapshots then resolves
-// delete-vs-edit races by timestamp instead of resurrecting silently.
 // ---------------------------------------------------------------------------
 
 function comparableMessage(message) {
@@ -816,8 +797,20 @@ function comparableMessage(message) {
     return copy;
 }
 
+function fnv1a(str, seed) {
+    let h = seed;
+    for (let i = 0; i < str.length; i += 1) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+}
+
+// 64-bit fingerprint (two independent 32-bit FNV-1a hashes). Compact: the
+// last-synced map must not hold a second copy of the chat.
 function comparableHash(message) {
-    return stableStringify(comparableMessage(message));
+    const s = stableStringify(comparableMessage(message));
+    return `${fnv1a(s, 0x811c9dc5).toString(16).padStart(8, '0')}${fnv1a(s, 0x9747b28c).toString(16).padStart(8, '0')}`;
 }
 
 function readLedger(metadata) {
@@ -856,8 +849,6 @@ function chatSyncMetaBucket() {
     return bucket;
 }
 
-// Stamp tombstones + lastModified for local mutations since the last sync.
-// Must run BEFORE the snapshot is built. No-op while applying remote data.
 function stampLocalMutations() {
     refreshLiveContext();
     if (!ctx?.chat || applyingRemoteDepth > 0) return;
@@ -878,7 +869,6 @@ function stampLocalMutations() {
     const tomb = readLedger(ctx.chatMetadata);
     let changed = false;
 
-    // Deletions: ids present at last sync, absent now.
     for (const id of lastSyncedMessageMap.keys()) {
         if (!currentHashes.has(id) && !tomb[id]) {
             tomb[id] = nowTs;
@@ -886,8 +876,6 @@ function stampLocalMutations() {
         }
     }
 
-    // Edits: same id, different comparable content. lastModified is excluded
-    // from the comparable hash, so stamping it cannot retrigger the diff.
     for (const [id, hash] of currentHashes) {
         const previous = lastSyncedMessageMap.get(id);
         if (previous !== undefined && previous !== hash) {
@@ -899,7 +887,6 @@ function stampLocalMutations() {
         }
     }
 
-    // Prune: expired entries and ids that are present again (resurrected).
     const cutoff = nowTs - TOMBSTONE_RETENTION_MS;
     for (const id of Object.keys(tomb)) {
         if (tomb[id] < cutoff || currentHashes.has(id)) {
@@ -913,10 +900,6 @@ function stampLocalMutations() {
 
 // ---------------------------------------------------------------------------
 // Chunk reassembly
-//
-// Chunks are transport fragments ONLY. No chunk ever mutates state. A logical
-// event is dispatched exactly once, after every chunk validates, the whole
-// byte count matches, and the whole-event SHA-256 verifies.
 // ---------------------------------------------------------------------------
 
 function resetChunkAssemblies() {
@@ -969,9 +952,8 @@ function base64ToArrayBuffer(base64) {
     return bytes.buffer;
 }
 
-// Returns the reconstructed logical event, null (incomplete/duplicate), or
-// the string 'resync' (unrecoverable corruption — caller must resync).
-// Every resync path cleans up the assembly and refunds its byte budget.
+// Any throw (bad base64, invalid UTF-8, hash API failure) converts to 'resync'
+// so a corrupt chunk can never silently strand the client.
 async function handleEventChunk(data) {
     const error = validateChunkEnvelope(data);
     if (error) {
@@ -980,101 +962,111 @@ async function handleEventChunk(data) {
     }
 
     const key = chunkAssemblyKey(scopeKeyValue, data.transferId);
-    let assembly = chunkAssemblies.get(key);
 
-    if (!assembly) {
-        pruneExpiredChunkAssemblies();
-        if (chunkAssemblies.size >= MAX_CHUNK_ASSEMBLIES || chunkAssemblyTotalBytes + data.totalBytes > MAX_CHUNK_BUFFER_BYTES) {
-            warn('chunk assembly budget exceeded');
-            return 'resync';
+    try {
+        let assembly = chunkAssemblies.get(key);
+
+        if (!assembly) {
+            pruneExpiredChunkAssemblies();
+            if (chunkAssemblies.size >= MAX_CHUNK_ASSEMBLIES || chunkAssemblyTotalBytes + data.totalBytes > MAX_CHUNK_BUFFER_BYTES) {
+                warn('chunk assembly budget exceeded');
+                return 'resync';
+            }
+            assembly = {
+                logicalEventId: data.logicalEventId,
+                logicalType: data.logicalType,
+                transferId: data.transferId,
+                chunkCount: data.chunkCount,
+                totalBytes: data.totalBytes,
+                eventSha256: data.eventSha256,
+                chunks: new Map(),
+                receivedBytes: 0,
+                createdAt: Date.now(),
+            };
+            chunkAssemblies.set(key, assembly);
+            chunkAssemblyTotalBytes += assembly.totalBytes;
         }
-        assembly = {
-            logicalEventId: data.logicalEventId,
-            logicalType: data.logicalType,
-            transferId: data.transferId,
-            chunkCount: data.chunkCount,
-            totalBytes: data.totalBytes,
-            eventSha256: data.eventSha256,
-            chunks: new Map(),
-            receivedBytes: 0,
-            createdAt: Date.now(),
-        };
-        chunkAssemblies.set(key, assembly);
-        chunkAssemblyTotalBytes += assembly.totalBytes;
-    }
 
-    const failResync = () => {
+        const failResync = () => {
+            chunkAssemblyTotalBytes -= assembly.totalBytes;
+            chunkAssemblies.delete(key);
+            return 'resync';
+        };
+
+        if (
+            assembly.chunkCount !== data.chunkCount ||
+            assembly.totalBytes !== data.totalBytes ||
+            assembly.eventSha256 !== data.eventSha256 ||
+            assembly.transferId !== data.transferId
+        ) {
+            warn('chunk assembly conflict', data.transferId);
+            return failResync();
+        }
+
+        if (assembly.chunks.has(data.chunkIndex)) return null;
+
+        const chunkBytes = base64ToArrayBuffer(data.payload);
+        if (chunkBytes.byteLength !== data.chunkBytes) {
+            warn('chunk byte length mismatch');
+            return failResync();
+        }
+        const chunkHash = await sha256Hex(chunkBytes);
+        if (chunkHash !== data.chunkSha256) {
+            warn('chunk hash mismatch');
+            return failResync();
+        }
+
+        assembly.chunks.set(data.chunkIndex, chunkBytes);
+        assembly.receivedBytes += chunkBytes.byteLength;
+
+        if (assembly.chunks.size < assembly.chunkCount) return null;
+
+        const ordered = [];
+        let totalLen = 0;
+        for (let i = 0; i < assembly.chunkCount; i += 1) {
+            const buf = assembly.chunks.get(i);
+            if (!buf) { warn('missing chunk after completion', i); return failResync(); }
+            ordered.push(buf);
+            totalLen += buf.byteLength;
+        }
+        if (totalLen !== assembly.totalBytes) { warn('reconstructed byte count mismatch'); return failResync(); }
+
+        const reconstructed = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const buf of ordered) {
+            reconstructed.set(new Uint8Array(buf), offset);
+            offset += buf.byteLength;
+        }
+
+        const eventHash = await sha256Hex(reconstructed.buffer);
+        if (eventHash !== assembly.eventSha256) { warn('whole-event hash mismatch'); return failResync(); }
+
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(reconstructed);
+        let logicalEvent;
+        try { logicalEvent = JSON.parse(text); } catch (e) { warn('chunked event JSON parse failed', e); return failResync(); }
+        if (logicalEvent.type !== assembly.logicalType) { warn('chunked event type mismatch'); return failResync(); }
+
         chunkAssemblyTotalBytes -= assembly.totalBytes;
         chunkAssemblies.delete(key);
+
+        return logicalEvent;
+    } catch (e) {
+        warn('chunk processing threw; forcing resync', e);
+        const assembly = chunkAssemblies.get(key);
+        if (assembly) {
+            chunkAssemblyTotalBytes -= assembly.totalBytes;
+            chunkAssemblies.delete(key);
+        }
         return 'resync';
-    };
-
-    if (
-        assembly.chunkCount !== data.chunkCount ||
-        assembly.totalBytes !== data.totalBytes ||
-        assembly.eventSha256 !== data.eventSha256 ||
-        assembly.transferId !== data.transferId
-    ) {
-        warn('chunk assembly conflict', data.transferId);
-        return failResync();
     }
-
-    if (assembly.chunks.has(data.chunkIndex)) return null; // duplicate chunk, ignore
-
-    const chunkBytes = base64ToArrayBuffer(data.payload);
-    if (chunkBytes.byteLength !== data.chunkBytes) {
-        warn('chunk byte length mismatch');
-        return failResync();
-    }
-    const chunkHash = await sha256Hex(chunkBytes);
-    if (chunkHash !== data.chunkSha256) {
-        warn('chunk hash mismatch');
-        return failResync();
-    }
-
-    assembly.chunks.set(data.chunkIndex, chunkBytes);
-    assembly.receivedBytes += chunkBytes.byteLength;
-
-    if (assembly.chunks.size < assembly.chunkCount) return null; // incomplete
-
-    // Complete: reconstruct, verify, dispatch exactly once.
-    const ordered = [];
-    let totalLen = 0;
-    for (let i = 0; i < assembly.chunkCount; i += 1) {
-        const buf = assembly.chunks.get(i);
-        if (!buf) { warn('missing chunk after completion', i); return failResync(); }
-        ordered.push(buf);
-        totalLen += buf.byteLength;
-    }
-    if (totalLen !== assembly.totalBytes) { warn('reconstructed byte count mismatch'); return failResync(); }
-
-    const reconstructed = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const buf of ordered) {
-        reconstructed.set(new Uint8Array(buf), offset);
-        offset += buf.byteLength;
-    }
-
-    const eventHash = await sha256Hex(reconstructed.buffer);
-    if (eventHash !== assembly.eventSha256) { warn('whole-event hash mismatch'); return failResync(); }
-
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(reconstructed);
-    let logicalEvent;
-    try { logicalEvent = JSON.parse(text); } catch (e) { warn('chunked event JSON parse failed', e); return failResync(); }
-    if (logicalEvent.type !== assembly.logicalType) { warn('chunked event type mismatch'); return failResync(); }
-
-    chunkAssemblyTotalBytes -= assembly.totalBytes;
-    chunkAssemblies.delete(key);
-
-    return logicalEvent;
 }
 
 // ---------------------------------------------------------------------------
 // SSE processing
 //
-// receive → parse → validate → process logical event → advance cursor.
-// The cursor NEVER advances before the logical event is fully accepted.
-// Chunked events share one id; the later-chunk dedupe check is bypassed.
+// Every queued item carries the epoch + scope key it was received under and
+// is dropped if the scope changed before processing — an old chat's event can
+// never mutate the new chat.
 // ---------------------------------------------------------------------------
 
 function connectSse(epoch) {
@@ -1086,22 +1078,22 @@ function connectSse(epoch) {
     const source = new EventSource(`${PLUGIN_BASE}/events${query}`, { withCredentials: true });
     eventSource = source;
 
-    const listeners = {
-        hello: 'hello',
-        generation_state: 'generation_state',
-        replay_complete: 'replay_complete',
-        resync_required: 'resync_required',
-        snapshot: 'snapshot',
-        generation_claimed: 'generation_claimed',
-        generation_started: 'generation_started',
-        generation_stream: 'generation_stream',
-        generation_stop_requested: 'generation_stop_requested',
-        generation_terminal: 'generation_terminal',
-        generation_recovered: 'generation_recovered',
-        event_chunk: 'event_chunk',
-    };
+    const listeners = [
+        'hello',
+        'generation_state',
+        'replay_complete',
+        'resync_required',
+        'snapshot',
+        'generation_claimed',
+        'generation_started',
+        'generation_stream',
+        'generation_stop_requested',
+        'generation_terminal',
+        'generation_recovered',
+        'event_chunk',
+    ];
 
-    for (const type of Object.keys(listeners)) {
+    for (const type of listeners) {
         source.addEventListener(type, event => handleSseFrame(event, type, localSseEpoch, epoch));
     }
 
@@ -1121,15 +1113,13 @@ function handleSseFrame(rawEvent, type, localSseEpoch, epoch) {
         return;
     }
 
-    // Chunks share one logical id — the stale-id drop must NOT run here.
     if (type === 'event_chunk') {
-        enqueueSseLogicalEvent({ kind: 'chunk', eventId, data });
+        enqueueSseLogicalEvent({ kind: 'chunk', eventId, data, epoch, scopeKey: scopeKeyValue });
         return;
     }
 
-    // Transient current-state transfer: never touches the cursor.
     if (type === 'generation_state') {
-        enqueueSseLogicalEvent({ kind: 'generation_state', data });
+        enqueueSseLogicalEvent({ kind: 'generation_state', data, epoch, scopeKey: scopeKeyValue });
         return;
     }
 
@@ -1138,9 +1128,9 @@ function handleSseFrame(rawEvent, type, localSseEpoch, epoch) {
         return;
     }
 
-    if (eventId > 0 && eventId <= lastSseEventId) return; // already accepted
+    if (eventId > 0 && eventId <= lastSseEventId) return;
 
-    enqueueSseLogicalEvent({ kind: 'logical', logicalType: type, eventId, data });
+    enqueueSseLogicalEvent({ kind: 'logical', logicalType: type, eventId, data, epoch, scopeKey: scopeKeyValue });
 }
 
 function enqueueSseLogicalEvent(item) {
@@ -1161,14 +1151,15 @@ function enqueueSseLogicalEvent(item) {
 }
 
 async function processSseLogicalEvent(item) {
+    // Stale item from a previous scope/connection: drop it.
+    if (item.scopeKey !== scopeKeyValue || item.epoch !== scopeEpoch) return null;
+
     if (item.kind === 'chunk') {
         const logicalEvent = await handleEventChunk(item.data);
         if (logicalEvent === 'resync') return 'resync';
         if (!logicalEvent) return null;
 
         if (logicalEvent.type === 'generation_state') {
-            // Reconstructed transient transfer: same handling as the direct
-            // frame path, and never advances the cursor.
             handleGenerationState(logicalEvent);
             return null;
         }
@@ -1178,6 +1169,8 @@ async function processSseLogicalEvent(item) {
             logicalType: logicalEvent.type,
             eventId: item.eventId,
             data: logicalEvent,
+            epoch: item.epoch,
+            scopeKey: item.scopeKey,
         });
     }
 
@@ -1200,8 +1193,6 @@ async function processSseLogicalEvent(item) {
     return null;
 }
 
-// Every branch returns an explicit boolean. false = event not safely
-// consumed → caller resyncs instead of silently skipping.
 async function dispatchLogicalEvent(type, data) {
     try {
         switch (type) {
@@ -1246,9 +1237,6 @@ async function performAuthoritativeResync() {
     }
 }
 
-// Current remote generation state (metadata + live message) arriving via SSE.
-// This is the only path that materializes the live remote message; routine
-// /state and /join responses carry metadata only.
 function handleGenerationState(data) {
     const generation = data?.generation || null;
     if (!generation || !currentScope) return;
@@ -1286,9 +1274,11 @@ function handleGenerationState(data) {
 // API
 // ---------------------------------------------------------------------------
 
+// The body is serialized exactly once. The char length is a sufficient
+// proxy for the large-request timeout heuristic.
 async function api(path, method = 'GET', body = undefined, query = '', options = {}) {
-    const bodyBytes = body === undefined ? 0 : utf8ByteLength(body);
-    const isLarge = bodyBytes > 512 * 1024;
+    const bodyText = body === undefined ? undefined : JSON.stringify(body);
+    const isLarge = bodyText !== undefined && bodyText.length > 512 * 1024;
     const timeoutMs = Number(
         options.timeoutMs ??
         (path.startsWith('/generation/terminal') ? TERMINAL_API_TIMEOUT_MS :
@@ -1325,7 +1315,7 @@ async function api(path, method = 'GET', body = undefined, query = '', options =
             {
                 method,
                 headers,
-                body: body === undefined ? undefined : JSON.stringify(body),
+                body: bodyText,
                 credentials: 'same-origin',
                 cache: 'no-cache',
                 signal: controller.signal,
@@ -1346,8 +1336,6 @@ async function api(path, method = 'GET', body = undefined, query = '', options =
         return payload;
     } catch (error) {
         if (timedOut) {
-            // A timeout means OUTCOME UNKNOWN, not rejection. Callers must
-            // treat this as ambiguous and retry with the SAME opId.
             const timeoutError = new Error(`Request timed out: ${method} ${path}`);
             timeoutError.name = 'TimeoutError';
             timeoutError.cause = error;
@@ -1364,6 +1352,14 @@ async function api(path, method = 'GET', body = undefined, query = '', options =
 
 function currentScopeGuard(epoch) {
     return epoch === scopeEpoch && scopeKeyValue === makeScopeKey(currentScope);
+}
+
+// Compact server responses (generation heartbeat/started/stream/stop) carry
+// no snapshot. Merge them into the existing serverState instead of replacing
+// it, so the authoritative snapshot is never lost.
+function mergeCompactState(compact) {
+    if (!compact) return;
+    serverState = { ...(serverState || {}), ...compact };
 }
 
 function statusText(text, notify = false) {
@@ -1499,9 +1495,12 @@ function installRemoteUiObserver() {
     });
 
     remoteUiObservedParent = parent;
+    // subtree: true — SillyTavern mutates the attributes of the BUTTON nodes,
+    // which are children of the observed parent. Without subtree, those
+    // mutations are invisible and the observer cannot fight ST's show/hide.
     remoteUiObserver.observe(parent, {
         childList: true,
-        subtree: false,
+        subtree: true,
         attributes: true,
         attributeFilter: ['style', 'class', 'hidden', 'aria-hidden'],
     });
@@ -1584,7 +1583,6 @@ function setRemoteSendButtonMode(active) {
         };
     }
 
-    // Remote generation uses SillyTavern's actual native Stop control.
     nativeHideElement(send);
     nativeShowElement(stop);
 
@@ -1638,11 +1636,11 @@ function setSendLock(reason = '') {
             el.classList.add('disabled');
             if ('disabled' in el) el.disabled = true;
         } else if (selector === '#send_but' && remote && settings.remoteStop) {
-            delete el.dataset.mcsLocked;
-            delete el.dataset.mcsPrevDisabled;
-            delete el.dataset.mcsPrevTitle;
-            el.classList.remove('disabled');
-            if ('disabled' in el) el.disabled = false;
+            // Remote generation with remote Stop: the send button's visibility
+            // is owned EXCLUSIVELY by setRemoteSendButtonMode(). Force-enabling
+            // it here fights the hide and produces both buttons visible at
+            // once. Do not touch it.
+            continue;
         } else if (el.dataset.mcsLocked === '1') {
             delete el.dataset.mcsLocked;
             const wasDisabled = el.dataset.mcsPrevDisabled === '1';
@@ -1697,7 +1695,6 @@ function clearLocalGenerationState() {
     localGeneration = null;
     localGenerationScope = null;
     localGenerationBaseSnapshot = null;
-    localGenerationLastSnapshot = null;
     generationClaimedThisPage = false;
     generationServerReadyId = null;
     generationStartPromise = null;
@@ -1887,15 +1884,6 @@ function orderMergedMessages(baseMessages, localMessages, remoteMessages, chosen
     return orderedIds.map(id => clone(byId.get(id))).filter(Boolean);
 }
 
-// Merge policy (deterministic), with tombstones resolved by timestamp:
-//  - tombstone vs surviving edit: the later timestamp wins
-//  - tombstone vs tombstone: deleted
-//  - edit vs edit (both changed from base): later lastModified wins
-//  - one-sided change: the changed side wins
-//  - both unchanged from base / both equal: remote wins
-// Tombstone ledgers are read from snapshot metadata (MCS_META_KEY), keyed by
-// raw durable messageId — the same key the per-id loop extracts from
-// `id:<messageId>` identities, so lookups always match.
 function mergeSnapshots(base, local, remote) {
     const b = normalizeSnapshot(base);
     const l = normalizeSnapshot(local);
@@ -1912,7 +1900,6 @@ function mergeSnapshots(base, local, remote) {
     const remoteTomb = readLedger(r.metadata);
     const baseTomb = readLedger(b.metadata);
 
-    // Merged ledger: union of all three sides, newest deletion timestamp wins.
     const mergedTomb = {};
     for (const source of [baseTomb, localTomb, remoteTomb]) {
         for (const [id, ts] of Object.entries(source)) {
@@ -1929,8 +1916,6 @@ function mergeSnapshots(base, local, remote) {
         const lv = lm.get(id);
         const rv = rm.get(id);
 
-        // Tombstone lookups use the raw durable messageId extracted from the
-        // identity string, matching the ledger keys exactly.
         const mid = id.startsWith('id:') ? id.slice(3) : null;
         const lt = mid ? (localTomb[mid] || null) : null;
         const rt = mid ? (remoteTomb[mid] || null) : null;
@@ -1938,11 +1923,11 @@ function mergeSnapshots(base, local, remote) {
         let value = null;
 
         if (lt && rt) {
-            value = null; // both sides deleted
+            value = null;
         } else if (lt && rv) {
-            value = messageLastModified(rv) > lt ? rv : null; // remote edit newer than local delete?
+            value = messageLastModified(rv) > lt ? rv : null;
         } else if (rt && lv) {
-            value = messageLastModified(lv) > rt ? lv : null; // local edit newer than remote delete?
+            value = messageLastModified(lv) > rt ? lv : null;
         } else if (!lv && !rv) {
             value = null;
         } else if (!lv && bv) {
@@ -1978,16 +1963,11 @@ function mergeSnapshots(base, local, remote) {
         }
     }
 
-    // Ledger post-processing: drop entries for messages that survived the
-    // merge, and expire old entries.
     const cutoff = Date.now() - TOMBSTONE_RETENTION_MS;
     for (const id of Object.keys(mergedTomb)) {
         if (chosenDurableIds.has(id) || mergedTomb[id] < cutoff) delete mergedTomb[id];
     }
 
-    // Metadata: merge normally with the MCS key stripped, then re-inject the
-    // resolved ledger so tombstone state is never clobbered by generic
-    // metadata merge rules.
     const stripMeta = meta => {
         const copy = clone(meta || {});
         delete copy[MCS_META_KEY];
@@ -2007,8 +1987,6 @@ function mergeSnapshots(base, local, remote) {
     };
 }
 
-// false must always mean "not durably saved". No caller may clear localDirty
-// after a false return.
 async function safeNativeSave(expectedScope = currentScope) {
     const run = nativeSaveChain.then(async () => {
         refreshLiveContext();
@@ -2041,7 +2019,6 @@ async function safeNativeSave(expectedScope = currentScope) {
             if (String(character?.chat || '').trim() !== chatId) return false;
         }
 
-        // Group chats are already persisted authoritatively by MCS.
         if (expectedScope.kind === 'group') return false;
 
         await sleep(50);
@@ -2060,8 +2037,10 @@ async function safeNativeSave(expectedScope = currentScope) {
     return run;
 }
 
-// Snapshot application is rollback-safe: ctx.chat/chatMetadata are snapshotted
-// before mutation, and any render or save failure restores the previous state.
+// Rollback-safe: the previous chat/metadata are captured before mutation, and
+// the restore in finally runs ONLY if the native scope is still the one that
+// was mutated. If the user switched chats mid-apply, ctx.chat now points at a
+// different chat and restoring here would corrupt it.
 async function applySnapshotNow(
     snapshot,
     {
@@ -2147,15 +2126,19 @@ async function applySnapshotNow(
     } finally {
         applyingRemoteDepth -= 1;
         if (!applied && previousMessages && ctx) {
-            try {
-                ctx.chat.splice(0, ctx.chat.length, ...previousMessages);
-                if (ctx.chatMetadata && typeof ctx.chatMetadata === 'object') {
-                    for (const key of Object.keys(ctx.chatMetadata)) delete ctx.chatMetadata[key];
-                    Object.assign(ctx.chatMetadata, previousMetadata);
+            if (scopeEpoch === epochAtStart && currentScope && makeScopeKey(currentScope) === expectedKey) {
+                try {
+                    ctx.chat.splice(0, ctx.chat.length, ...previousMessages);
+                    if (ctx.chatMetadata && typeof ctx.chatMetadata === 'object') {
+                        for (const key of Object.keys(ctx.chatMetadata)) delete ctx.chatMetadata[key];
+                        Object.assign(ctx.chatMetadata, previousMetadata);
+                    }
+                    try { ctx.printMessages?.(); } catch { /* best effort restore */ }
+                } catch (restoreError) {
+                    warn('applySnapshotNow rollback failed', restoreError);
                 }
-                try { ctx.printMessages?.(); } catch { /* best effort restore */ }
-            } catch (restoreError) {
-                warn('applySnapshotNow rollback failed', restoreError);
+            } else {
+                warn('[MCS] skipped snapshot rollback because the native scope changed during apply');
             }
         }
     }
@@ -2178,9 +2161,6 @@ async function ensureIdsPersisted(expectedScope = currentScope) {
     return true;
 }
 
-// The row id IS the opId. When queueing an operation whose HTTP outcome is
-// uncertain, pass the SAME opId so the retry is recognized as a duplicate by
-// the server instead of creating a second logical mutation.
 async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope, kind = 'snapshot', generationId = null, opId = null) {
     if (!syncEnabled() || !scope) return;
     const scopeKey = makeScopeKey(scope);
@@ -2264,19 +2244,19 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
 
     const scopeAtPublish = clone(scope);
     const scopeKeyAtPublish = makeScopeKey(scopeAtPublish);
-    const base = clone(baseSnapshot || { messages: [], metadata: {} });
+    // Immutable baseline reference: snapshots are never mutated in place, so
+    // cloning the baseline is pure memory waste on a large chat.
+    const base = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
     const revision = Number(serverState?.revision || 0);
-    // One opId per logical snapshot; retries after ambiguous outcomes reuse it.
     const localOpId = opId || newId();
 
     try {
         const result = await sendSnapshotDirect(snapshot, revision, localOpId, scopeAtPublish);
         if (scopeKeyValue !== scopeKeyAtPublish || !currentScope || makeScopeKey(currentScope) !== scopeKeyAtPublish) return false;
         serverState = result.state;
-        baseSnapshot = clone(result.state.snapshot);
+        baseSnapshot = result.state.snapshot;
         clearLocalDirty(scopeAtPublish);
         rebuildLastSyncedMap(snapshot.messages);
-        broadcastWake('state');
         return true;
     } catch (error) {
         if (scopeKeyValue !== scopeKeyAtPublish) return false;
@@ -2287,14 +2267,14 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
 
             const merged = mergeSnapshots(base, snapshot, remoteState.snapshot);
             serverState = remoteState;
-            baseSnapshot = clone(remoteState.snapshot);
+            baseSnapshot = remoteState.snapshot;
 
             const retryBase = Number(remoteState.revision);
             try {
                 const result = await sendSnapshotDirect(merged, retryBase, localOpId, scopeAtPublish);
                 if (scopeKeyValue !== scopeKeyAtPublish) return false;
                 serverState = result.state;
-                baseSnapshot = clone(result.state.snapshot);
+                baseSnapshot = result.state.snapshot;
                 const applied = await applySnapshot(merged, {
                     save: true,
                     render: true,
@@ -2303,7 +2283,6 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
                 });
                 if (!applied) return false;
                 clearLocalDirty(scopeAtPublish);
-                broadcastWake('state');
                 return true;
             } catch (retryError) {
                 if (retryError?.status === 409 && retryError?.payload?.error === 'generation_active') return false;
@@ -2322,7 +2301,6 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
         }
 
         if (localGeneration && allowDuringGeneration) return false;
-        // Ambiguous or failed: queue with the SAME opId for idempotent retry.
         await enqueueSnapshot(snapshot, revision, base, scopeAtPublish, 'snapshot', null, localOpId);
         scheduleQueueFlushRetry();
         return false;
@@ -2346,12 +2324,12 @@ async function flushQueueInternal() {
             let nextSnapshot = clone(row.snapshot);
             let nextBase = clone(row.baseSnapshot || { messages: [], metadata: {} });
             let nextRevision = Number(row.baseRevision || 0);
-            const remote = serverState?.snapshot ? clone(serverState.snapshot) : null;
+            const remote = serverState?.snapshot || null;
             const remoteRevision = Number(serverState?.revision || nextRevision);
 
             if (remote && remoteRevision !== nextRevision) {
                 nextSnapshot = mergeSnapshots(nextBase, nextSnapshot, remote);
-                nextBase = clone(remote);
+                nextBase = remote;
                 nextRevision = remoteRevision;
                 row.snapshot = clone(nextSnapshot);
                 row.baseSnapshot = clone(nextBase);
@@ -2359,8 +2337,6 @@ async function flushQueueInternal() {
                 await idbPut(row);
             }
 
-            // Already-satisfied operation: a previous response was lost but
-            // the server committed it. Do not create another revision.
             if (deepEqual(nextSnapshot, serverState?.snapshot)) {
                 await idbDelete(row.id);
                 rebuildLastSyncedMap(nextSnapshot.messages);
@@ -2371,7 +2347,6 @@ async function flushQueueInternal() {
             let sendError = null;
             for (let sendAttempt = 0; sendAttempt < 3; sendAttempt += 1) {
                 try {
-                    // row.id is the stable opId across all retries.
                     result = await sendSnapshotDirect(nextSnapshot, nextRevision, row.id, scopeAtFlush);
                     sendError = null;
                     break;
@@ -2386,10 +2361,8 @@ async function flushQueueInternal() {
             if (!result || scopeKeyValue !== scopeKeyAtFlush) return;
 
             serverState = result.state;
-            baseSnapshot = clone(result.state.snapshot);
+            baseSnapshot = result.state.snapshot;
 
-            // Apply BEFORE deleting the row: a failed local application keeps
-            // the row, and the server's opId idempotency makes the retry safe.
             const applied = await applySnapshot(incomingSnapshot(result.state.snapshot), {
                 save: true,
                 render: true,
@@ -2406,16 +2379,16 @@ async function flushQueueInternal() {
                 const remote = error.payload.state;
                 if (remote.generation || error.payload.error === 'generation_active') {
                     serverState = remote;
-                    baseSnapshot = clone(remote.snapshot);
+                    baseSnapshot = remote.snapshot;
                     return;
                 }
 
                 const merged = mergeSnapshots(row.baseSnapshot, row.snapshot, remote.snapshot);
                 row.snapshot = clone(merged);
-                row.baseSnapshot = clone(remote.snapshot);
+                row.baseSnapshot = remote.snapshot;
                 row.baseRevision = Number(remote.revision);
                 serverState = remote;
-                baseSnapshot = clone(remote.snapshot);
+                baseSnapshot = remote.snapshot;
                 await idbPut(row);
                 continue;
             }
@@ -2451,6 +2424,9 @@ function broadcastWake(kind, extra = {}) {
     } catch { /* ignore */ }
 }
 
+// Two-phase join: join WITHOUT the snapshot first. Only when the server has
+// no state at all does it request a seed — an established chat never pays the
+// giant upload.
 async function openScope(epoch) {
     if (!settings.enabled || !settings.autoConnect || !currentScope) return;
 
@@ -2467,8 +2443,6 @@ async function openScope(epoch) {
         return;
     }
 
-    const localSnapshot = syncSnapshot(durableSnapshot());
-
     if (joinAbortController) {
         try { joinAbortController.abort(); } catch { /* ignore */ }
     }
@@ -2477,12 +2451,20 @@ async function openScope(epoch) {
     joinAbortController = joinController;
 
     try {
-        const result = await api('/join', 'POST', {
+        let result = await api('/join', 'POST', {
             scope: scopeAtJoin,
             clientId,
             deviceId,
-            snapshot: localSnapshot,
         }, '', { signal: joinController.signal, timeoutMs: API_TIMEOUT_MS });
+
+        if (result?.seedRequired) {
+            result = await api('/join', 'POST', {
+                scope: scopeAtJoin,
+                clientId,
+                deviceId,
+                snapshot: syncSnapshot(durableSnapshot()),
+            }, '', { signal: joinController.signal, timeoutMs: API_TIMEOUT_MS * 3 });
+        }
 
         if (!currentScopeGuard(epoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtJoin)) {
             try { await api('/leave', 'POST', { scope: scopeAtJoin, clientId, deviceId }); } catch { /* best effort */ }
@@ -2498,18 +2480,13 @@ async function openScope(epoch) {
         }
 
         serverState = result.state;
-        baseSnapshot = clone(result.state.snapshot);
-        // The join response carries the authoritative SSE cursor. This
-        // prevents replaying stale history after a full authoritative join.
+        baseSnapshot = result.state.snapshot;
         lastSseEventId = Number(result.state?.lastEventId || 0);
         resetChunkAssemblies();
         remoteGenerationId = null;
         lastRemoteStreamSeq = -1;
         generationMismatchSince = 0;
 
-        // A page reload cannot continue ST's in-flight request. Same-client
-        // ownership left by a previous page instance is stale and must not be
-        // resurrected.
         const staleOwnedGenerationId =
             serverState?.generation && generationIsStaleOwned(serverState.generation)
                 ? serverState.generation.generationId
@@ -2528,14 +2505,14 @@ async function openScope(epoch) {
                 });
                 if (currentScopeGuard(epoch)) {
                     serverState = cleared.state;
-                    baseSnapshot = clone(cleared.state.snapshot);
+                    baseSnapshot = cleared.state.snapshot;
                     lastSseEventId = Number(cleared.state?.lastEventId || lastSseEventId);
                     rememberTerminatedGeneration(staleOwnedGenerationId);
                 }
             } catch (staleError) {
                 if (staleError?.status === 409 && staleError?.payload?.state) {
                     serverState = staleError.payload.state;
-                    baseSnapshot = clone(staleError.payload.state.snapshot);
+                    baseSnapshot = staleError.payload.state.snapshot;
                 } else {
                     warn('stale generation cleanup failed', staleError);
                 }
@@ -2551,28 +2528,28 @@ async function openScope(epoch) {
             return;
         }
 
-        const incoming = incomingSnapshot(serverState.snapshot);
         const queued = await idbList(scopeKeyValue);
 
-        // Existing server state remains authoritative on first join.
         if (queued.length && !serverState.generation) {
             await flushQueue();
-        } else if (!deepEqual(localSnapshot, incoming) && !generationIsMine(serverState.generation)) {
-            const applied = await applySnapshot(incoming, {
-                save: true,
-                render: true,
-                expectedScope: scopeAtJoin,
-                allowDuringGeneration: true,
-            });
-            if (!applied) return;
         } else {
-            rebuildLastSyncedMap(serverState.snapshot.messages);
+            const incoming = incomingSnapshot(serverState.snapshot);
+            const localSnapshot = syncSnapshot(durableSnapshot());
+            if (!deepEqual(localSnapshot, incoming) && !generationIsMine(serverState.generation)) {
+                const applied = await applySnapshot(incoming, {
+                    save: true,
+                    render: true,
+                    expectedScope: scopeAtJoin,
+                    allowDuringGeneration: true,
+                });
+                if (!applied) return;
+            } else {
+                rebuildLastSyncedMap(serverState.snapshot.messages);
+            }
         }
 
         if (!queued.length) clearLocalDirty(scopeAtJoin);
 
-        // SSE hello + generation_state deliver the live remote message; the
-        // join response deliberately carries generation metadata only.
         connectSse(epoch);
         startHeartbeats(epoch);
 
@@ -2595,9 +2572,6 @@ async function openScope(epoch) {
 
 function disconnectSse() {
     ++sseEpoch;
-    // Chunks from the old connection never apply to the new one. The process
-    // chain is NOT reset: its in-flight tail re-checks scope/epoch guards, so
-    // letting it drain is safer than racing a fresh chain against it.
     resetChunkAssemblies();
     if (eventSource) {
         try { eventSource.close(); } catch { /* ignore */ }
@@ -2613,8 +2587,6 @@ function stopHeartbeats() {
     nativeMembershipHeartbeatInFlight = null;
 }
 
-// hello carries generation METADATA only; the live message arrives via the
-// generation_state transfer immediately after.
 function handleServerHello(data) {
     // hello is always the first event of a fresh SSE connection. Any assembly
     // still in the map belongs to a dead connection and can never complete —
@@ -2696,7 +2668,6 @@ function handleServerHello(data) {
     } else if (generation) {
         remoteGenerationId = generation.generationId;
         lastRemoteStreamSeq = Number(generation.seq ?? 0);
-        // No live message here: generation_state supplies it.
     } else {
         clearRemoteStreamState();
     }
@@ -2710,16 +2681,11 @@ function isGenerationTerminated(generationId) {
     return terminatedGenerationIds.has(id) || String(lastTerminatedGenerationId || '') === id;
 }
 
-// Returns true when the event is safely consumed, false when the SSE layer
-// should resync. Stale-but-consistent events count as consumed. Transient
-// native-scope instability counts as consumed too: the scope switch in
-// flight will resync authoritatively, and treating it as failure would cause
-// a reconnect storm against an event that cannot be applied right now.
 async function handleSnapshotEvent(data) {
     return new Promise(resolve => {
         const run = stateApplyChain.then(async () => {
             const revision = Number(data?.revision || 0);
-            if (!revision || revision <= Number(serverState?.revision || 0)) return true; // stale, safely consumed
+            if (!revision || revision <= Number(serverState?.revision || 0)) return true;
             if (!currentScope || !nativeScopeStable(currentScope)) {
                 log('[MCS] snapshot arrived during transient scope instability; deferring to scope switch');
                 return true;
@@ -2727,13 +2693,13 @@ async function handleSnapshotEvent(data) {
 
             const scopeAtEvent = clone(currentScope);
             const remote = incomingSnapshot(data.snapshot);
-            const knownBase = clone(baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} });
+            const knownBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
             const local = syncSnapshot(durableSnapshot());
             const dirty = isLocalDirty(scopeAtEvent);
             const incomingGenerationId = String(data?.generationId || '');
 
             serverState = { ...(serverState || {}), revision, snapshot: clone(data.snapshot) };
-            baseSnapshot = clone(data.snapshot);
+            baseSnapshot = data.snapshot;
 
             if (serverState?.generation || incomingGenerationId) {
                 updateGenerationUi();
@@ -2770,13 +2736,13 @@ async function handleSnapshotEvent(data) {
                     const result = await sendSnapshotDirect(appliedSnapshot, revision, newId(), scopeAtEvent);
                     if (scopeKeyValue === makeScopeKey(scopeAtEvent)) {
                         serverState = result.state;
-                        baseSnapshot = clone(result.state.snapshot);
+                        baseSnapshot = result.state.snapshot;
                         clearLocalDirty(scopeAtEvent);
                     }
                 } catch (publishError) {
                     if (publishError?.status === 409 && publishError?.payload?.state) {
                         serverState = publishError.payload.state;
-                        baseSnapshot = clone(publishError.payload.state.snapshot);
+                        baseSnapshot = publishError.payload.state.snapshot;
                     } else {
                         await enqueueSnapshot(appliedSnapshot, revision, knownBase, scopeAtEvent);
                         scheduleQueueFlushRetry();
@@ -2786,7 +2752,6 @@ async function handleSnapshotEvent(data) {
                 clearLocalDirty(scopeAtEvent);
             }
 
-            broadcastWake('state');
             updateGenerationUi();
             return true;
         });
@@ -2839,8 +2804,7 @@ function handleGenerationEvent(data) {
                     localGeneration = clone(generation);
                     localGenerationScope = localGenerationScope || clone(currentScope);
                     localGenerationEpoch = scopeEpoch;
-                    localGenerationBaseSnapshot = localGenerationBaseSnapshot || clone(baseSnapshot || serverState.snapshot || { messages: [], metadata: {} });
-                    localGenerationLastSnapshot = localGenerationLastSnapshot || clone(serverState.snapshot || baseSnapshot || { messages: [], metadata: {} });
+                    localGenerationBaseSnapshot = localGenerationBaseSnapshot || baseSnapshot || serverState.snapshot;
                 }
             }
 
@@ -2864,8 +2828,6 @@ function handleGenerationEvent(data) {
         }
 
         lastRemoteStreamSeq = Math.max(lastRemoteStreamSeq, seq);
-        // Claimed/started events carry no live message; generation_state and
-        // stream events deliver content.
     }
 
     updateGenerationUi();
@@ -2891,7 +2853,7 @@ async function handleGenerationRecovered(data) {
         const localId = localGeneration?.generationId || null;
 
         serverState = authoritative;
-        baseSnapshot = clone(authoritative?.snapshot || baseSnapshot || { messages: [], metadata: {} });
+        baseSnapshot = authoritative?.snapshot || baseSnapshot || { messages: [], metadata: {} };
         lastSseEventId = Number(authoritative?.lastEventId || lastSseEventId);
 
         if (generation) {
@@ -2912,8 +2874,6 @@ async function handleGenerationRecovered(data) {
             }
 
             clearRemoteStreamState();
-            // Live remote message is reacquired via generation_state on the
-            // next SSE reconnect/resync cycle.
             updateGenerationUi();
             return true;
         }
@@ -3025,9 +2985,6 @@ function handleGenerationStreamEvent(data) {
     updateGenerationUi();
 }
 
-// Remote stream preview. The chat array is snapshotted before mutation and
-// restored if the DOM update fails, so a bad render never poisons the final
-// sync state — the terminal snapshot remains authoritative.
 async function applyRemoteStreamNow(item) {
     if (!item || !ctx?.chat || !currentScope || !nativeScopeStable(currentScope)) return false;
 
@@ -3041,6 +2998,8 @@ async function applyRemoteStreamNow(item) {
 
     applyingRemoteDepth += 1;
 
+    const epochAtStart = scopeEpoch;
+    const expectedKey = makeScopeKey(currentScope);
     let previousMessages = null;
     let mutated = false;
 
@@ -3063,8 +3022,6 @@ async function applyRemoteStreamNow(item) {
                     return false;
                 }
             } else {
-                // Do not resurrect an arbitrary deleted assistant message; the
-                // terminal snapshot is authoritative for structural changes.
                 if (ctx.chat.length && ctx.chat[ctx.chat.length - 1]?.is_user) return false;
                 ctx.chat.push(clone(item.message));
                 index = ctx.chat.length - 1;
@@ -3096,13 +3053,16 @@ async function applyRemoteStreamNow(item) {
         return true;
     } catch (error) {
         warn('applyRemoteStreamNow failed; rolling back preview', error);
-        if (mutated && previousMessages && ctx?.chat) {
+        if (mutated && previousMessages && ctx?.chat &&
+            scopeEpoch === epochAtStart && currentScope && makeScopeKey(currentScope) === expectedKey) {
             try {
                 ctx.chat.splice(0, ctx.chat.length, ...previousMessages);
                 try { ctx.printMessages?.(); } catch { /* best effort */ }
             } catch (restoreError) {
                 warn('applyRemoteStreamNow rollback failed', restoreError);
             }
+        } else if (mutated) {
+            warn('[MCS] skipped stream rollback because the native scope changed during apply');
         }
         return false;
     } finally {
@@ -3150,13 +3110,10 @@ async function handleGenerationTerminalEvent(data) {
 
     const activeId = localGeneration?.generationId || serverState?.generation?.generationId || null;
     if (activeId && activeId !== generationId) {
-        // A terminal for an older generation can never mutate a newer one.
         rememberTerminatedGeneration(generationId);
         return true;
     }
 
-    // Duplicate detection happens BEFORE we mark this generation terminated,
-    // otherwise the marker we set would suppress our own processing.
     if (revision && currentRevision && revision < currentRevision) return true;
     if (isGenerationTerminated(generationId) && !localGenerationMatches(generationId)) return true;
 
@@ -3165,7 +3122,7 @@ async function handleGenerationTerminalEvent(data) {
     const mine = hadLocalGeneration && !!terminalGeneration && generationIsMine(terminalGeneration);
 
     const terminalSnapshot = incomingSnapshot(data.snapshot || serverState?.snapshot || { messages: [], metadata: {} });
-    const knownBase = clone(baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} });
+    const knownBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
     const dirty = !mine && isLocalDirty(scopeAtEvent);
     const local = !mine && dirty ? syncSnapshot(durableSnapshot()) : null;
 
@@ -3177,7 +3134,7 @@ async function handleGenerationTerminalEvent(data) {
         snapshot: clone(data.snapshot || serverState?.snapshot || { messages: [], metadata: {} }),
         generation: null,
     };
-    baseSnapshot = clone(serverState.snapshot);
+    baseSnapshot = serverState.snapshot;
 
     if (mine) {
         clearLocalGenerationState();
@@ -3186,7 +3143,6 @@ async function handleGenerationTerminalEvent(data) {
         let finalSnapshot = terminalSnapshot;
         if (dirty) finalSnapshot = mergeSnapshots(knownBase, local, terminalSnapshot);
 
-        // Never apply an old terminal snapshot over a new local generation.
         const applied = await applySnapshot(finalSnapshot, {
             save: true,
             render: true,
@@ -3201,11 +3157,11 @@ async function handleGenerationTerminalEvent(data) {
                 try {
                     const committed = await sendSnapshotDirect(finalSnapshot, Number(serverState?.revision || 0), newId(), scopeAtEvent);
                     serverState = committed.state;
-                    baseSnapshot = clone(committed.state.snapshot);
+                    baseSnapshot = committed.state.snapshot;
                 } catch (error) {
                     if (error?.status === 409 && error?.payload?.state) {
                         serverState = error.payload.state;
-                        baseSnapshot = clone(error.payload.state.snapshot);
+                        baseSnapshot = error.payload.state.snapshot;
                     } else {
                         await enqueueSnapshot(finalSnapshot, Number(serverState?.revision || 0), baseSnapshot, scopeAtEvent);
                         scheduleQueueFlushRetry();
@@ -3340,8 +3296,6 @@ function startHeartbeats(epoch) {
             const newRevision = Number(result.revision || 0);
             const newGenerationId = result.generation?.generationId || null;
 
-            // Server revision is monotonic within a scope; never let a stale
-            // heartbeat erase a newer generation response.
             if (newRevision < oldRevision) return;
 
             serverState = {
@@ -3414,15 +3368,11 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
                 return false;
             }
 
-            // Merge against the current authoritative snapshot before
-            // reclaiming. A revision advance is normal during streaming.
             const authoritativeSnapshot = normalizeSnapshot(state?.snapshot || { messages: [], metadata: {} });
             const localSnapshot = syncSnapshot(durableSnapshot());
-            const recoveryBase = clone(localGenerationBaseSnapshot || baseSnapshot || { messages: [], metadata: {} });
+            const recoveryBase = localGenerationBaseSnapshot || baseSnapshot || { messages: [], metadata: {} };
             const desired = mergeSnapshots(recoveryBase, localSnapshot, authoritativeSnapshot);
 
-            // One claim opId for this entire recovery operation; retries of
-            // this claim are idempotent on the server.
             const claimOpId = newId();
             const claimed = await api('/generation/claim', 'POST', {
                 scope: scopeAtGeneration,
@@ -3441,9 +3391,9 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
             if (!nextGeneration || nextGeneration.generationId !== generationId || !generationIsMine(nextGeneration)) return false;
 
             serverState = claimed.state;
-            baseSnapshot = clone(claimed.state.snapshot);
+            baseSnapshot = claimed.state.snapshot;
             localGeneration = clone(nextGeneration);
-            localGenerationBaseSnapshot = clone(claimed.state.snapshot);
+            localGenerationBaseSnapshot = claimed.state.snapshot;
             localGenerationBaseRevision = Number(claimed.state.revision || 0);
             generationServerReadyId = null;
             generationMismatchSince = 0;
@@ -3455,7 +3405,7 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
             if (error?.status === 409 && error?.payload?.state) {
                 const state = error.payload.state;
                 serverState = state;
-                baseSnapshot = clone(state.snapshot);
+                baseSnapshot = state.snapshot;
                 const competing = state.generation;
                 if (competing && competing.generationId !== generationId && generationActive(competing)) {
                     generationMismatchSince = generationMismatchSince || Date.now();
@@ -3501,11 +3451,10 @@ function startGenerationHeartbeat(epoch) {
 
                 if (!localGeneration || localGeneration.generationId !== generationId || !currentScopeGuard(epoch)) return;
 
-                const state = result.state || null;
-                const stateGeneration = state?.generation || null;
-                serverState = state;
+                // Compact response: merge, never replace, so the snapshot survives.
+                mergeCompactState(result.state);
 
-                if (result.stopRequested || stateGeneration?.stopRequested) {
+                if (result.stopRequested || result.state?.generation?.stopRequested) {
                     rememberStopRequestedGeneration(generationId);
                     generationTerminalPhase = 'stopped';
                     remoteStopGenerationId = generationId;
@@ -3522,6 +3471,7 @@ function startGenerationHeartbeat(epoch) {
                     return;
                 }
 
+                const stateGeneration = result.state?.generation || null;
                 if (stateGeneration && stateGeneration.generationId === generationId && generationIsMine(stateGeneration)) {
                     localGeneration = { ...localGeneration, ...clone(stateGeneration) };
                     generationServerReadyId = ['started', 'streaming'].includes(stateGeneration.phase) ? generationId : generationServerReadyId;
@@ -3619,7 +3569,6 @@ function startGenerationHeartbeat(epoch) {
                     return;
                 }
 
-                // Never kill the native LLM on transport errors alone.
                 if (localGeneration?.generationId === generationId && !generationServerReadyId) {
                     scheduleGenerationStartRetry(generationId, 1000);
                 }
@@ -3656,19 +3605,16 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
         const remote = incomingSnapshot(state.snapshot);
         const dirty = isLocalDirty(scopeAtRequest);
         const local = syncSnapshot(durableSnapshot());
-        const knownBase = clone(baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} });
+        const knownBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
 
         serverState = state;
-        baseSnapshot = clone(state.snapshot);
-        // Adopt the authoritative SSE cursor from the state response.
+        baseSnapshot = state.snapshot;
         lastSseEventId = Number(state?.lastEventId || lastSseEventId);
 
         if (localGeneration) {
             const localId = localGeneration.generationId;
 
             if (serverGeneration && serverGeneration.generationId === localId && generationIsMine(serverGeneration)) {
-                // /state carries no live message; the SSE generation_state
-                // transfer reacquires it on reconnect.
                 localGeneration = { ...localGeneration, ...clone(serverGeneration) };
                 localGenerationScope = clone(scopeAtRequest);
                 localGenerationEpoch = epoch;
@@ -3713,12 +3659,12 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                         opId: newId(),
                     });
                     serverState = cleared.state;
-                    baseSnapshot = clone(cleared.state.snapshot);
+                    baseSnapshot = cleared.state.snapshot;
                     lastSseEventId = Number(cleared.state?.lastEventId || lastSseEventId);
                 } catch (error) {
                     if (error?.status === 409 && error?.payload?.state) {
                         serverState = error.payload.state;
-                        baseSnapshot = clone(error.payload.state.snapshot);
+                        baseSnapshot = error.payload.state.snapshot;
                     }
                 }
             }
@@ -3726,10 +3672,6 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
 
         const effectiveGeneration = serverState.generation || null;
         if (effectiveGeneration?.stopRequested) rememberStopRequestedGeneration(effectiveGeneration.generationId);
-
-        // The live remote message is NOT in /state; if this resync replaced a
-        // remote generation we know, the next generation_state transfer (SSE
-        // reconnect) reacquires it. Render nothing stale here.
 
         if (!effectiveGeneration && !localGeneration) {
             if (dirty) {
@@ -3748,13 +3690,13 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                     try {
                         const publishResult = await sendSnapshotDirect(merged, Number(serverState.revision), newId(), scopeAtRequest);
                         serverState = publishResult.state;
-                        baseSnapshot = clone(publishResult.state.snapshot);
+                        baseSnapshot = publishResult.state.snapshot;
                         clearLocalDirty(scopeAtRequest);
                         rebuildLastSyncedMap(merged.messages);
                     } catch (publishError) {
                         if (publishError?.status === 409 && publishError?.payload?.state) {
                             serverState = publishError.payload.state;
-                            baseSnapshot = clone(publishError.payload.state.snapshot);
+                            baseSnapshot = publishError.payload.state.snapshot;
                         } else {
                             await enqueueSnapshot(merged, Number(serverState.revision), serverState.snapshot, scopeAtRequest);
                             scheduleQueueFlushRetry();
@@ -3789,8 +3731,6 @@ function resyncCurrentScope(epoch = scopeEpoch) {
     return run;
 }
 
-// One stable opId per logical termination; every retry attempt reuses it so a
-// lost response can never produce two terminal revisions.
 async function terminateGenerationOnServer(generation, scope, phase, snapshot, opId = null) {
     let lastError = null;
     const terminalOpId = opId || newId();
@@ -3936,9 +3876,6 @@ function switchScopeInternal(reason = 'scope-change') {
         clearGenerationTerminalTimer();
         await leaveCurrentScope();
 
-        // Chains are NOT reset: their in-flight tails re-check scope/epoch
-        // guards (applySnapshotNow refuses unstable scopes), so draining is
-        // safer than racing a fresh chain against an old one.
         currentScope = nextScope;
         scopeKeyValue = nextKey;
         localDirty = false;
@@ -4020,7 +3957,8 @@ async function ensureGenerationStarted() {
                 const current = result.state?.generation || null;
                 if (!current || current.generationId !== generationId || !generationIsMine(current)) return false;
 
-                serverState = result.state;
+                // Compact response: merge, never replace.
+                mergeCompactState(result.state);
                 localGeneration = { ...localGeneration, ...clone(current) };
                 generationServerReadyId = generationId;
                 generationHeartbeatFailures = 0;
@@ -4031,7 +3969,7 @@ async function ensureGenerationStarted() {
                 if (error?.status === 409 && error?.payload?.state) {
                     const state = error.payload.state;
                     serverState = state;
-                    baseSnapshot = clone(state.snapshot);
+                    baseSnapshot = state.snapshot;
                     const current = state.generation;
 
                     if (current?.generationId === generationId && generationIsMine(current)) {
@@ -4076,7 +4014,6 @@ async function ensureGenerationStarted() {
 async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
     refreshLiveContext();
 
-    // Quiet/background generations are outside the shared foreground lease.
     if (shouldBypassMcsGeneration(type)) return;
 
     if (!settings.enabled || !settings.coordinateGeneration || applyingRemoteDepth > 0) return;
@@ -4160,7 +4097,7 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
                     opId: newId(),
                 });
                 serverState = cleared.state;
-                baseSnapshot = clone(cleared.state.snapshot);
+                baseSnapshot = cleared.state.snapshot;
                 rememberTerminatedGeneration(existing.generationId);
                 existing = serverState?.generation || null;
             } catch (error) {
@@ -4180,12 +4117,10 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
 
     const generationId = newId();
     generationClaimInFlightId = generationId;
-    // One claim opId for the whole logical claim; every retry attempt reuses
-    // it so a timed-out accepted claim resolves to the existing state.
     const claimOpId = newId();
 
     let desired = null;
-    let claimBase = clone(baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} });
+    let claimBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
     let revision = Number(serverState?.revision || 0);
     let claimResult = null;
 
@@ -4227,7 +4162,7 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
                         }
 
                         serverState = payload.state;
-                        baseSnapshot = clone(payload.state.snapshot);
+                        baseSnapshot = payload.state.snapshot;
                         abort(false);
                         if (settings.notifications) statusText('Another client is already generating this shared chat.', true);
                         updateGenerationUi();
@@ -4236,9 +4171,9 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
 
                     const merged = mergeSnapshots(claimBase, desired, payload.state.snapshot);
                     serverState = payload.state;
-                    baseSnapshot = clone(payload.state.snapshot);
+                    baseSnapshot = payload.state.snapshot;
                     desired = merged;
-                    claimBase = clone(payload.state.snapshot);
+                    claimBase = payload.state.snapshot;
                     revision = Number(payload.state.revision);
                     continue;
                 }
@@ -4274,17 +4209,16 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
         }
 
         serverState = claimResult.state;
-        baseSnapshot = clone(claimResult.state.snapshot);
+        baseSnapshot = claimResult.state.snapshot;
         localGeneration = clone(claimed);
         localGenerationScope = clone(scopeAtClaim);
         localGenerationEpoch = epochAtClaim;
-        localGenerationBaseSnapshot = clone(baseSnapshot);
+        localGenerationBaseSnapshot = baseSnapshot;
         localGenerationBaseRevision = Number(claimResult.state.revision || 0);
         localGenerationSettings = {
             syncMessages: !!settings.syncMessages,
             syncMetadata: !!settings.syncMetadata,
         };
-        localGenerationLastSnapshot = clone(desired);
         localStreamMessageId = null;
         localStreamMessageIndex = null;
         generationClaimedThisPage = true;
@@ -4295,7 +4229,6 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
         updateGenerationUi();
         startGenerationHeartbeat(epochAtClaim);
 
-        // Keep the lease alive and let ST continue if the handshake hiccups.
         const started = await ensureGenerationStarted();
         if (!started) {
             statusText('Reconnecting shared generation…');
@@ -4389,8 +4322,9 @@ function scheduleGenerationStream(delayOverride = null) {
 
                 if (!localGenerationMatches(generationId, scopeAtStream) || generationIsStopRequested(generationId)) return;
 
+                // Compact response: merge, never replace.
+                mergeCompactState(result.state);
                 const returned = result.state?.generation || null;
-                serverState = result.state;
                 if (returned?.generationId === generationId && generationIsMine(returned)) {
                     localGeneration = { ...localGeneration, ...clone(returned) };
                     generationServerReadyId = generationId;
@@ -4414,8 +4348,6 @@ function scheduleGenerationStream(delayOverride = null) {
                     if (expected > 0 && localGenerationMatches(generationId, scopeAtStream)) {
                         const pending = pendingStream;
                         if (Number(payload.seq) < expected) {
-                            // Server already has this seq: it was accepted and
-                            // the response was lost. Do not resend it.
                             localGeneration.seq = Math.max(Number(localGeneration.seq || 0), expected - 1);
                             if (pending) pendingStream = { ...pending, seq: Math.max(expected, Number(pending.seq || 0)) };
                         } else {
@@ -4453,8 +4385,6 @@ function scheduleGenerationStream(delayOverride = null) {
                     await openScope(epochAtStream);
                     if (!generationIsStopRequested(generationId)) scheduleGenerationStream(STREAM_SEND_MS);
                 } else {
-                    // Timeout = outcome unknown. The server's same-seq
-                    // idempotency check makes resending this seq safe.
                     if (localGenerationMatches(generationId, scopeAtStream)) {
                         if (!pendingStream || Number(pendingStream.seq || 0) < Number(payload.seq || 0)) pendingStream = payload;
                         if (!streamRetryTimer && terminalizingGenerationId !== generationId) {
@@ -4486,6 +4416,9 @@ function scheduleGenerationStream(delayOverride = null) {
     }, delay);
 }
 
+// Hot path: runs on every stream token. Only the streaming MESSAGE is
+// captured — never a full-chat snapshot. The full snapshot is built at
+// terminalization, where it is actually needed.
 function captureLocalStream() {
     if (terminalizingGenerationId || !localGeneration || !localGenerationScope || !ctx?.chat?.length) return;
     const generationId = localGeneration.generationId;
@@ -4520,7 +4453,6 @@ function captureLocalStream() {
     const id = messageId(message);
     if (!id) return;
 
-    localGenerationLastSnapshot = syncSnapshot(durableSnapshot());
     localStreamMessageId = id;
     localStreamMessageIndex = index;
 
@@ -4566,6 +4498,12 @@ async function handleRemoteStopEvent(data) {
     );
     if (!generationId) return false;
     if (isGenerationTerminated(generationId)) return true;
+
+    // Idempotent: if this exact generation is already stopping (SSE event +
+    // BroadcastChannel can both arrive), do not run the stop path twice.
+    if (generationIsStopRequested(generationId) && (generationTerminalPhase === 'stopped' || terminalizingGenerationId === generationId)) {
+        return true;
+    }
 
     if (serverState?.generation?.generationId === generationId) {
         serverState = {
@@ -4789,9 +4727,6 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
         return switchScope('local-event-context-mismatch');
     }
 
-    // Stamp tombstones/lastModified for local deletions and edits BEFORE the
-    // snapshot is built, so the published snapshot carries the evidence the
-    // merge policy needs.
     stampLocalMutations();
 
     markLocalDirty(scopeAtEvent);
@@ -4805,7 +4740,6 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
         if (localGeneration && localGeneration.phase === 'streaming' && allowDuringGeneration) return false;
 
         try {
-            if (localGeneration) localGenerationLastSnapshot = clone(snapshotAtEvent);
             return await publishLocalSnapshot(snapshotAtEvent, { allowDuringGeneration, scope: scopeAtEvent });
         } catch (error) {
             warn('publish after local event failed', error);
@@ -4818,7 +4752,7 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
 }
 
 async function handleChatLifecycleEvent() {
-    await sleep(150);
+    await sleep(50);
     refreshLiveContext();
     if (nativeRestoreInProgress) return;
     if (localGeneration) {
@@ -5171,8 +5105,6 @@ async function requestRemoteStop() {
     setRemoteSendButtonMode(true);
     statusText('Stop requested…');
 
-    // One opId for the entire stop request, honored by the server for
-    // duplicate detection across any retry/confirmation path.
     const stopOpId = newId();
 
     broadcastWake('generation-stop-requested', {
@@ -5205,7 +5137,8 @@ async function requestRemoteStop() {
             }
 
             if (currentScopeGuard(epochAtRequest) && result?.state) {
-                serverState = result.state;
+                // Compact response: merge, never replace.
+                mergeCompactState(result.state);
             }
 
             updateGenerationUi();
@@ -5282,13 +5215,13 @@ async function releaseGenerationClaim(phase = 'stopped') {
     try {
         const snapshot = nativeScopeStable(scopeAtGeneration)
             ? syncSnapshot(durableSnapshot())
-            : clone(localGenerationLastSnapshot || serverState?.snapshot || localGenerationBaseSnapshot || { messages: [], metadata: {} });
+            : clone(serverState?.snapshot || localGenerationBaseSnapshot || { messages: [], metadata: {} });
 
         const result = await terminateGenerationOnServer(generation, scopeAtGeneration, phase, snapshot);
 
         if (result.state) {
             serverState = result.state;
-            baseSnapshot = clone(result.state.snapshot);
+            baseSnapshot = result.state.snapshot;
         }
 
         if (result.success) {
@@ -5326,8 +5259,6 @@ async function sendGenerationTerminal(phase = 'completed') {
     terminalizingGenerationId = g.generationId;
     clearGenerationStreamWork(g.generationId);
 
-    // One terminal opId for this entire logical termination, including the
-    // scheduled retries below.
     const terminalOpId = newId();
 
     try {
@@ -5341,7 +5272,7 @@ async function sendGenerationTerminal(phase = 'completed') {
 
         const snapshot = nativeScopeStable(scopeAtGeneration)
             ? syncSnapshot(durableSnapshot())
-            : clone(localGenerationLastSnapshot || serverState?.snapshot || localGenerationBaseSnapshot || { messages: [], metadata: {} });
+            : clone(serverState?.snapshot || localGenerationBaseSnapshot || { messages: [], metadata: {} });
 
         const result = await terminateGenerationOnServer(g, scopeAtGeneration, phase, snapshot, terminalOpId);
         const stillSameLocal = localGenerationMatches(g.generationId, scopeAtGeneration);
@@ -5349,7 +5280,7 @@ async function sendGenerationTerminal(phase = 'completed') {
         if (result.state) {
             if (currentScopeGuard(epochAtGeneration) || makeScopeKey(currentScope) === makeScopeKey(scopeAtGeneration)) {
                 serverState = result.state;
-                baseSnapshot = clone(result.state.snapshot);
+                baseSnapshot = result.state.snapshot;
             }
         }
 
@@ -5379,8 +5310,6 @@ async function sendGenerationTerminal(phase = 'completed') {
             return true;
         }
 
-        // Do not drop localGeneration on a failed terminal POST; the lease
-        // state enables a safe retry and prevents a phantom server lease.
         terminalizingGenerationId = null;
         generationTerminalPhase = phase;
         scheduleTerminalRetry(g.generationId, phase, TERMINAL_RETRY_MS);
@@ -5410,11 +5339,6 @@ async function onActivate() {
         bc?.addEventListener('message', message => {
             const data = message.data;
             if (data?.scopeKey !== scopeKeyValue) return;
-
-            if (data?.kind === 'state' && currentScope) {
-                resyncCurrentScope().catch(error => warn('BroadcastChannel state resync failed', error));
-                return;
-            }
 
             if (data?.kind === 'generation-stop-requested' && currentScope) {
                 handleRemoteStopEvent({
@@ -5449,8 +5373,7 @@ async function onActivate() {
         await negotiateClientId();
         await mountSettings();
 
-        // Let SillyTavern own startup chat restoration.
-        await sleep(250);
+        await sleep(100);
         refreshLiveContext();
     } finally {
         activationInProgress = false;
@@ -5460,9 +5383,9 @@ async function onActivate() {
     wireUiGuards();
     globalThis.multiClientSyncGenerateInterceptor = coordinatedGenerateInterceptor;
 
-    safeSetTimer(() => {
-        switchScope('post-activate').catch(error => warn('post-activate scope check failed', error));
-    }, 900);
+    // No artificial startup delay: if ST hasn't loaded a chat yet,
+    // scopeFromContext returns null and the 500ms retry loop handles it.
+    void switchScope('post-activate').catch(error => warn('post-activate scope check failed', error));
 
     updateGenerationUi();
 }
