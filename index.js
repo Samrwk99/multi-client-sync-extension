@@ -4326,11 +4326,10 @@ function stopGenerationHeartbeat() {
     generationMismatchSince = 0;
 }
 
-function sseIsOpenOrConnecting() {
+function sseIsOpen() {
     if (!eventSource) return false;
     try {
-        return eventSource.readyState === EventSource.OPEN ||
-            eventSource.readyState === EventSource.CONNECTING;
+        return eventSource.readyState === EventSource.OPEN;
     } catch {
         return false;
     }
@@ -4376,7 +4375,10 @@ function startHeartbeats(epoch) {
             // membership/lease channel; adopting its view here races the event
             // stream (e.g., stamping a revision before the matching SSE delta
             // is processed, making that delta look stale).
-            if (sseIsOpenOrConnecting()) {
+            // OPEN means SSE is currently authoritative. CONNECTING does not:
+            // during a reconnect, heartbeat state is useful for detecting missed
+            // revisions/generation changes and triggering an authoritative resync.
+            if (sseIsOpen()) {
                 updateGenerationUi();
                 return;
             }
@@ -4954,10 +4956,48 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
         }
     }
 
-    if (localGeneration && localGenerationScope && !preserveNativeGeneration) {
-        try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
-        try { await sendGenerationTerminal('stopped'); } catch (error) { warn('generation cleanup failed while leaving scope', error); }
+if (localGeneration && localGenerationScope && !preserveNativeGeneration) {
+    try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
+
+    let terminalized = false;
+
+    try {
+        terminalized = await sendGenerationTerminal('stopped');
+    } catch (error) {
+        warn('generation cleanup failed while leaving scope', error);
     }
+
+    // The terminal call can still fail because the network is disappearing
+    // during a chat switch/disable. Preserve the final native snapshot in the
+    // durable queue before the scope is torn down so the generation's last
+    // state is not silently lost.
+    if (!terminalized && nativeScopeStable(leavingScope)) {
+        try {
+            refreshLiveContext();
+
+            const finalSnapshot = syncSnapshot(durableSnapshot());
+
+            markLocalDirty(leavingScope);
+
+            await enqueueSnapshot(
+                finalSnapshot,
+                Number(serverState?.revision || 0),
+                serverState?.snapshot || { messages: [], metadata: {} },
+                leavingScope,
+                'snapshot',
+                null,
+                newId(),
+            );
+
+            scheduleQueueFlushRetry();
+        } catch (error) {
+            warn(
+                '[MCS] failed to durably queue final generation snapshot while leaving scope',
+                error,
+            );
+        }
+    }
+}
 
     try {
         await api('/leave', 'POST', {
@@ -5133,10 +5173,24 @@ async function ensureGenerationStarted() {
                     generationId,
                 });
 
-                if (!localGenerationMatches(generationId, scopeAtGeneration)) return false;
+                if (
+                    !localGenerationMatches(generationId, scopeAtGeneration) ||
+                    terminalizingGenerationId === generationId ||
+                    generationIsStopRequested(generationId)
+                ) {
+                    return false;
+                }
 
-                const current = result.state?.generation || null;
-                if (!current || current.generationId !== generationId || !generationIsMine(current)) return false;
+const current = result.state?.generation || null;
+if (
+    !current ||
+    current.generationId !== generationId ||
+    !generationIsMine(current) ||
+    terminalizingGenerationId === generationId ||
+    generationIsStopRequested(generationId)
+) {
+    return false;
+}
 
                 // Compact response: merge, never replace.
                 mergeCompactState(result.state);
@@ -5145,9 +5199,19 @@ async function ensureGenerationStarted() {
                 generationHeartbeatFailures = 0;
                 updateGenerationUi();
                 return true;
-            } catch (error) {
-                lastError = error;
-                if (error?.status === 409 && error?.payload?.state) {
+} catch (error) {
+    lastError = error;
+
+    // A terminalization/stop can begin while /generation/started is still
+    // in flight. Do not let the late response resurrect local readiness.
+    if (
+        terminalizingGenerationId === generationId ||
+        generationIsStopRequested(generationId)
+    ) {
+        return false;
+    }
+
+    if (error?.status === 409 && error?.payload?.state) {
                     const state = error.payload.state;
                     serverState = state;
                     baseSnapshot = state.snapshot;
@@ -5652,22 +5716,56 @@ function captureLocalStream() {
         }
     }
 
-    if (index < 0) return;
-    ensureMessageIds(messages);
+if (index < 0) return;
 
-    const target = messages[index];
-    if (!target || typeof target !== 'object') return;
+const target = messages[index];
+if (!target || typeof target !== 'object') return;
 
-    // Streaming content is a local mutation: stamp lastModified so a
-    // concurrent remote edit conflict resolves by timestamp. Defensive
-    // initialization — invalid native data must never crash this path.
-    target.extra ??= {};
-    target.extra.multi_client_sync ??= {};
-    target.extra.multi_client_sync.lastModified = Date.now();
+// IDs are normally guaranteed by ensureIdsPersisted() before generation.
+// Do not scan the entire chat on every stream token. Only repair the
+// streaming message when its ID is actually missing.
+if (
+    !target.extra ||
+    typeof target.extra !== 'object' ||
+    Array.isArray(target.extra)
+) {
+    target.extra = {};
+}
 
-    const message = clone(target);
-    const id = messageId(message);
-    if (!id) return;
+if (
+    !target.extra[MCS_META_KEY] ||
+    typeof target.extra[MCS_META_KEY] !== 'object' ||
+    Array.isArray(target.extra[MCS_META_KEY])
+) {
+    target.extra[MCS_META_KEY] = {};
+}
+
+const syncMeta = target.extra[MCS_META_KEY];
+
+let id = messageId(target);
+
+if (!id) {
+    const usedIds = new Set();
+
+    for (const message of messages) {
+        const existingId = messageId(message);
+        if (existingId) usedIds.add(existingId);
+    }
+
+    do {
+        id = newId();
+    } while (usedIds.has(id));
+
+    syncMeta.messageId = id;
+}
+
+// Streaming content is a local mutation: stamp lastModified so a
+// concurrent remote edit conflict resolves by timestamp.
+syncMeta.lastModified = Date.now();
+
+const message = clone(target);
+id = messageId(message);
+if (!id) return;
 
     localStreamMessageId = id;
     localStreamMessageIndex = index;
@@ -5759,12 +5857,18 @@ async function handleRemoteStopEvent(data) {
 
     if (!localGenerationMatches(generationId, currentScope)) return true;
 
-    generationTerminalPhase = 'stopped';
-    clearGenerationTerminalTimer();
-    clearTerminalRetryTimer();
-    clearGenerationStreamWork(generationId);
-    pendingStream = null;
-    renderBanner('Stopping generation…');
+generationTerminalPhase = 'stopped';
+clearGenerationTerminalTimer();
+clearTerminalRetryTimer();
+
+// Stop any in-flight stream POST as well as queued stream work. Otherwise a
+// final token can still arrive at the server after the stop request.
+try { streamAbortController?.abort(); } catch { /* ignore */ }
+streamAbortController = null;
+
+clearGenerationStreamWork(generationId);
+pendingStream = null;
+renderBanner('Stopping generation…');
     setRemoteSendButtonMode(true);
     updateGenerationUi();
 
@@ -6035,37 +6139,86 @@ function unwireEvents() {
 function wireEvents() {
     unwireEvents();
     refreshLiveContext();
+
     const types = ctx?.eventTypes || {};
     const es = ctx?.eventSource;
 
-    // Multiple ST event constants can resolve to the same event string —
-    // dedupe by type so no handler is ever registered twice.
-    const registeredTypes = new Set();
+    // Multiple ST event constants can resolve to the same event string.
+    // Keep one native listener per event string, but preserve all distinct
+    // logical handlers registered for that event.
+    const registrations = new Map();
 
     const listen = (eventType, fn) => {
-        if (!eventType || !es?.on) return;
-        if (registeredTypes.has(eventType)) return;
+        if (!eventType || !es?.on || typeof fn !== 'function') return;
 
-        registeredTypes.add(eventType);
-        es.on(eventType, fn);
-        registeredEventHandlers.push([eventType, fn]);
+        const existing = registrations.get(eventType);
+
+        if (existing) {
+            if (!existing.handlers.includes(fn)) {
+                existing.handlers.push(fn);
+            }
+            return;
+        }
+
+        const handlers = [fn];
+
+        const wrapper = (...args) => {
+            for (const handler of handlers) {
+                try {
+                    const result = handler(...args);
+
+                    if (result && typeof result.then === 'function') {
+                        Promise.resolve(result).catch(error => {
+                            warn(
+                                `[MCS] async event handler failed: ${String(eventType)}`,
+                                error,
+                            );
+                        });
+                    }
+                } catch (error) {
+                    warn(
+                        `[MCS] event handler failed: ${String(eventType)}`,
+                        error,
+                    );
+                }
+            }
+        };
+
+        registrations.set(eventType, { handlers, wrapper });
+
+        es.on(eventType, wrapper);
+        registeredEventHandlers.push([eventType, wrapper]);
     };
 
     listen(types.APP_INITIALIZED, () => switchScope('APP_INITIALIZED'));
     listen(types.APP_READY, () => switchScope('APP_READY'));
+
     listen(types.CHAT_CHANGED, handleChatLifecycleEvent);
     listen(types.CHAT_LOADED, handleChatLifecycleEvent);
     listen(types.CHAT_CREATED, handleChatLifecycleEvent);
     listen(types.CHAT_RENAMED, handleChatLifecycleEvent);
+
     listen(types.CHAT_DELETED, async data => {
-        const old = typeof data === 'string' ? data.replace(/\.jsonl$/, '') : '';
-        if (old && currentScope?.chatId === old && scopeKeyValue) await idbClearScope(scopeKeyValue).catch(() => {});
+        const old = typeof data === 'string'
+            ? data.replace(/\.jsonl$/, '')
+            : '';
+
+        if (old && currentScope?.chatId === old && scopeKeyValue) {
+            await idbClearScope(scopeKeyValue).catch(() => {});
+        }
+
         await handleChatLifecycleEvent();
     });
+
     listen(types.GROUP_CHAT_CREATED, handleChatLifecycleEvent);
     listen(types.GROUP_CHAT_DELETED, handleChatLifecycleEvent);
 
-    listen(types.MESSAGE_SENT, event => publishAfterLocalEvent(event, { allowDuringGeneration: true }));
+    listen(types.MESSAGE_SENT, event => {
+        return publishAfterLocalEvent(event, {
+            allowDuringGeneration: true,
+        });
+    });
+
     listen(types.MESSAGE_RECEIVED, publishAfterLocalEvent);
     listen(types.MESSAGE_EDITED, publishAfterLocalEvent);
     listen(types.MESSAGE_UPDATED, scheduleDeferredLocalPublish);
@@ -6087,6 +6240,7 @@ function wireEvents() {
     listen(types.TOOL_CALLS_RENDERED, onToolEvent);
     listen(types.GENERATION_ENDED, onGenerationEnded);
     listen(types.GENERATION_STOPPED, onGenerationStopped);
+
     listen(types.GROUP_MEMBER_DRAFTED, onStreamToken);
     listen(types.GROUP_WRAPPER_STARTED, onGroupWrapperStarted);
     listen(types.GROUP_WRAPPER_FINISHED, onGroupWrapperFinished);
@@ -6316,15 +6470,54 @@ async function requestRemoteStop() {
         return false;
     }
 
-    if (localGeneration) {
-        const generationId = localGeneration.generationId;
-        rememberStopRequestedGeneration(generationId);
-        generationTerminalPhase = 'stopped';
-        clearGenerationStreamWork(generationId);
-        renderBanner('Stopping generation…');
-        try { ctx?.stopGeneration?.(); } catch (error) { warn('local stopGeneration failed', error); }
-        return true;
+if (localGeneration) {
+    const generationId = localGeneration.generationId;
+
+    rememberStopRequestedGeneration(generationId);
+    generationTerminalPhase = 'stopped';
+    clearGenerationTerminalTimer();
+    clearTerminalRetryTimer();
+    clearGenerationStreamWork(generationId);
+
+    try { streamAbortController?.abort(); } catch { /* ignore */ }
+    streamAbortController = null;
+
+    renderBanner('Stopping generation…');
+    updateGenerationUi();
+
+    try {
+        const stopped = ctx?.stopGeneration?.();
+
+        // Native ST normally emits GENERATION_STOPPED. Keep a fallback so a
+        // missing/late event cannot strand the server-side generation.
+        if (stopped === false) {
+            void sendGenerationTerminal('stopped').catch(error => {
+                warn('local stopGeneration fallback terminal failed', error);
+            });
+        } else {
+            safeSetTimer(() => {
+                if (localGeneration?.generationId !== generationId) return;
+                if (!generationIsStopRequested(generationId)) return;
+                if (generationTerminalPhase !== 'stopped') return;
+                if (terminalizingGenerationId === generationId) return;
+
+                void sendGenerationTerminal('stopped').catch(error => {
+                    warn('local stop fallback terminal failed', error);
+                });
+            }, 250);
+        }
+    } catch (error) {
+        warn('local stopGeneration failed', error);
+
+        if (localGeneration?.generationId === generationId) {
+            void sendGenerationTerminal('stopped').catch(terminalError => {
+                warn('local stopGeneration exception terminal failed', terminalError);
+            });
+        }
     }
+
+    return true;
+}
 
     let g = serverState?.generation;
     if (!g || !currentScope) {
@@ -6486,20 +6679,47 @@ async function releaseGenerationClaim(phase = 'stopped') {
     try { streamAbortController?.abort(); } catch { /* ignore */ }
     streamAbortController = null;
 
-    // Terminalization is the authoritative final capture point: flush any
-    // deferred stream capture so the final token reaches the snapshot.
+    // Terminalization is the authoritative final capture point. Let an
+    // already-started stream request observe the abort before committing the
+    // terminal snapshot, otherwise stream and terminal can cross in flight.
+    if (streamInFlightPromise) {
+        try {
+            await Promise.race([
+                streamInFlightPromise,
+                sleep(2500),
+            ]);
+        } catch { /* ignore */ }
+    }
+
     if (streamCaptureTimer) {
         clearTimeout(streamCaptureTimer);
         streamCaptureTimer = null;
     }
+
+    await sleep(60);
+
+    if (!localGenerationMatches(generation.generationId, scopeAtGeneration)) {
+        terminalizingGenerationId = null;
+        return false;
+    }
+
     refreshLiveContext();
 
     try {
         const snapshot = nativeScopeStable(scopeAtGeneration)
             ? syncSnapshot(durableSnapshot())
-            : clone(serverState?.snapshot || localGenerationBaseSnapshot || { messages: [], metadata: {} });
+            : clone(
+                serverState?.snapshot ||
+                localGenerationBaseSnapshot ||
+                { messages: [], metadata: {} },
+            );
 
-        const result = await terminateGenerationOnServer(generation, scopeAtGeneration, phase, snapshot);
+        const result = await terminateGenerationOnServer(
+            generation,
+            scopeAtGeneration,
+            phase,
+            snapshot,
+        );
 
         if (result.state && currentScopeGuard(epochAtGeneration)) {
             serverState = result.state;
@@ -6508,24 +6728,61 @@ async function releaseGenerationClaim(phase = 'stopped') {
 
         if (result.success) {
             rememberTerminatedGeneration(generation.generationId);
+
             if (mutationVersionAtStart === localMutationVersion) {
                 clearLocalDirty(scopeAtGeneration);
             }
+
             clearLocalGenerationState();
             updateGenerationUi();
+
+            // A failed/ambiguous publish may have left durable work behind.
+            // Flush it now that the generation has definitely released.
+            void flushQueue().catch(error => {
+                warn('[MCS] queue flush after generation release failed', error);
+            });
+
             return true;
         }
 
         terminalizingGenerationId = null;
         generationTerminalPhase = phase;
+
         if (localGenerationMatches(generation.generationId, scopeAtGeneration)) {
             startGenerationHeartbeat(epochAtGeneration);
         }
-        scheduleTerminalRetry(generation.generationId, phase, TERMINAL_RETRY_MS);
+
+        scheduleTerminalRetry(
+            generation.generationId,
+            phase,
+            TERMINAL_RETRY_MS,
+        );
+
         updateGenerationUi();
         return false;
+    } catch (error) {
+        terminalizingGenerationId = null;
+        generationTerminalPhase = phase;
+
+        if (localGenerationMatches(generation.generationId, scopeAtGeneration)) {
+            startGenerationHeartbeat(epochAtGeneration);
+        }
+
+        scheduleTerminalRetry(
+            generation.generationId,
+            phase,
+            TERMINAL_RETRY_MS,
+        );
+
+        warn('generation release/terminal failed', error);
+        return false;
     } finally {
-        if (!localGeneration && terminalizingGenerationId === generation.generationId) terminalizingGenerationId = null;
+        if (
+            !localGeneration &&
+            terminalizingGenerationId === generation.generationId
+        ) {
+            terminalizingGenerationId = null;
+        }
     }
 }
 
@@ -6669,26 +6926,96 @@ async function onActivate() {
             }
         });
 
-        if (!storageHandler) {
-            storageHandler = event => {
-                if (event.key !== STORAGE_KEY || !event.newValue) return;
-                try {
-                    const incoming = JSON.parse(event.newValue);
-                    if (!incoming || typeof incoming !== 'object') return;
-                    const previousEnabled = !!settings.enabled;
-                    settings = normalizeSettings(incoming);
-                    updateSettingsControls();
+if (!storageHandler) {
+    storageHandler = event => {
+        if (event.key !== STORAGE_KEY || !event.newValue) return;
 
-                    if (previousEnabled !== !!settings.enabled) {
-                        if (settings.enabled) onEnable().catch(error => warn('storage-driven enable failed', error));
-                        else onDisable().catch(error => warn('storage-driven disable failed', error));
-                    } else if (settings.enabled && settings.autoConnect) {
-                        updateGenerationUi();
+        try {
+            const incoming = JSON.parse(event.newValue);
+            if (!incoming || typeof incoming !== 'object') return;
+
+            const previousSettings = { ...settings };
+            const previousEnabled = !!settings.enabled;
+            const previousAutoConnect = !!settings.autoConnect;
+
+            settings = normalizeSettings(incoming);
+            updateSettingsControls();
+
+            if (previousEnabled !== !!settings.enabled) {
+                if (settings.enabled) {
+                    onEnable().catch(error => {
+                        warn('storage-driven enable failed', error);
+                    });
+                } else {
+                    onDisable().catch(error => {
+                        warn('storage-driven disable failed', error);
+                    });
+                }
+                return;
+            }
+
+            // Settings are shared through localStorage, so autoConnect must
+            // also be enforced in tabs that did not originate the change.
+            if (
+                settings.enabled &&
+                previousAutoConnect !== !!settings.autoConnect
+            ) {
+                if (!settings.autoConnect) {
+                    if (localGeneration) {
+                        leaveAfterLocalGeneration = true;
+                        statusText(
+                            'Auto-connect disabled; the current generation will finish normally.',
+                        );
+                    } else {
+                        ++scopeEpoch;
+
+                        void leaveCurrentScope()
+                            .then(() => {
+                                currentScope = null;
+                                scopeKeyValue = '';
+                                statusText('Disconnected');
+                                updateGenerationUi();
+                            })
+                            .catch(error => {
+                                warn(
+                                    'storage-driven autoConnect disconnect failed',
+                                    error,
+                                );
+                            });
                     }
-                } catch { /* ignore invalid storage */ }
-            };
-            window.addEventListener('storage', storageHandler);
+                } else {
+                    switchScope('storage:autoConnect')
+                        .catch(error => {
+                            warn(
+                                'storage-driven autoConnect reconnect failed',
+                                error,
+                            );
+                        });
+                }
+
+                return;
+            }
+
+            // Keep all other shared settings immediately reflected locally.
+            if (
+                previousSettings.coordinateGeneration !== settings.coordinateGeneration ||
+                previousSettings.remoteStop !== settings.remoteStop ||
+                previousSettings.syncMessages !== settings.syncMessages ||
+                previousSettings.syncMetadata !== settings.syncMetadata ||
+                previousSettings.notifications !== settings.notifications ||
+                previousSettings.debug !== settings.debug
+            ) {
+                updateGenerationUi();
+            } else {
+                updateGenerationUi();
+            }
+        } catch {
+            /* ignore invalid storage */
         }
+    };
+
+    window.addEventListener('storage', storageHandler);
+}
 
         await negotiateClientId();
         await mountSettings();
