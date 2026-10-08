@@ -125,7 +125,11 @@ let remoteUiRefreshTimer = null;
 let sseEpoch = 0;
 let scopeSwitchChain = Promise.resolve();
 let stateApplyChain = Promise.resolve();
+// Retain the legacy variable in case another lifecycle path still references
+// it, but do not use it to serialize unrelated chats.
 let publishChain = Promise.resolve();
+
+const publishChains = new Map();
 let nativeRestoreInProgress = false;
 let activationInProgress = false;
 let joinAbortController = null;
@@ -187,6 +191,7 @@ let storageHandler = null;
 let queueSequenceCounter = 0;
 let localMutationVersion = 0;
 let activeLocalPublishPromise = null;
+let activeLocalPublishScopeKey = '';
 
 // Last-synced message fingerprints (id -> 64-bit hash). Hashes, not full
 // serialized messages — the map must stay tiny even for huge chats.
@@ -2700,7 +2705,9 @@ async function handleSnapshotDeltaEvent(data) {
         const run = stateApplyChain.then(async () => {
             const revision = Number(data?.revision || 0);
             const baseRevision = Number(data?.baseRevision ?? -1);
-            const currentRevision = Number(serverState?.revision || 0);
+            const currentRevision = Number(
+                serverState?.revision || 0,
+            );
 
             if (!revision) return false;
 
@@ -2708,13 +2715,23 @@ async function handleSnapshotDeltaEvent(data) {
             if (revision <= currentRevision) return true;
 
             // We must hold exactly the revision this delta chains from.
-            if (baseRevision !== currentRevision || revision !== currentRevision + 1) {
+            if (
+                baseRevision !== currentRevision ||
+                revision !== currentRevision + 1
+            ) {
                 await resyncCurrentScope(scopeEpoch);
                 return true;
             }
 
-            const ops = Array.isArray(data?.ops) ? data.ops : null;
-            if (!ops || ops.length === 0 || ops.length > DELTA_MAX_OPS) {
+            const ops = Array.isArray(data?.ops)
+                ? data.ops
+                : null;
+
+            if (
+                !ops ||
+                ops.length === 0 ||
+                ops.length > DELTA_MAX_OPS
+            ) {
                 await resyncCurrentScope(scopeEpoch);
                 return true;
             }
@@ -2722,116 +2739,326 @@ async function handleSnapshotDeltaEvent(data) {
             const scopeAtEvent = clone(currentScope);
             if (!scopeAtEvent) return false;
 
+            const eventScopeKey = makeScopeKey(
+                scopeAtEvent,
+            );
+
+            const eventPublishScopeKey =
+                `${eventScopeKey}:${scopeEpoch}`;
+
             // A remote mutation during an in-flight local publish must wait
-            // for THAT publish only — never the whole future chain.
-            if (data.sourceClientId !== clientId && activeLocalPublishPromise) {
-                await activeLocalPublishPromise;
+            // only for THAT publish if it belongs to this exact scope+epoch.
+            // Never wait on a publish belonging to another chat or an older
+            // lifecycle epoch.
+            if (
+                data.sourceClientId !== clientId &&
+                activeLocalPublishPromise &&
+                activeLocalPublishScopeKey ===
+                    eventPublishScopeKey
+            ) {
+                try {
+                    await activeLocalPublishPromise;
+                } catch {
+                    // The local publish path performs its own authoritative
+                    // reconciliation. Do not let its failure break SSE.
+                }
             }
 
-            if (!currentScopeGuard(scopeEpoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtEvent)) {
+            if (
+                !currentScopeGuard(scopeEpoch) ||
+                makeScopeKey(currentScope) !== eventScopeKey
+            ) {
                 return false;
             }
 
             // Never merge a remote delta over locally dirty / generating state.
-            if (data.sourceClientId !== clientId && (
-                isLocalDirty(scopeAtEvent) ||
-                localGeneration ||
-                generationActive(serverState?.generation)
-            )) {
+            if (
+                data.sourceClientId !== clientId &&
+                (
+                    isLocalDirty(scopeAtEvent) ||
+                    localGeneration ||
+                    generationActive(
+                        serverState?.generation,
+                    )
+                )
+            ) {
                 await resyncCurrentScope(scopeEpoch);
                 return true;
             }
 
             let projected;
+
             try {
-                projected = applyDeltaToSnapshotFast(serverState.snapshot, ops);
+                projected = applyDeltaToSnapshotFast(
+                    serverState.snapshot,
+                    ops,
+                );
             } catch (error) {
-                warn('snapshot delta projection failed', error);
-                await resyncCurrentScope(scopeEpoch);
+                warn(
+                    'snapshot delta projection failed',
+                    error,
+                );
+
+                await resyncCurrentScope(
+                    scopeEpoch,
+                );
+
                 return true;
             }
 
             // Own echo: the local HTTP request already mutated ctx.chat.
             // Only advance the authoritative projection.
             if (data.sourceClientId === clientId) {
-                serverState = { ...(serverState || {}), revision, snapshot: projected };
+                serverState = {
+                    ...(serverState || {}),
+                    revision,
+                    snapshot: projected,
+                };
+
                 baseSnapshot = projected;
                 return true;
             }
 
             refreshLiveContext();
-            if (!ctx?.chat || !nativeScopeStable(scopeAtEvent)) {
-                await resyncCurrentScope(scopeEpoch);
+
+            if (
+                !ctx?.chat ||
+                !nativeScopeStable(
+                    scopeAtEvent,
+                )
+            ) {
+                await resyncCurrentScope(
+                    scopeEpoch,
+                );
+
                 return true;
             }
 
             applyingRemoteDepth += 1;
+
             let structuralChange = false;
 
             try {
                 for (const op of ops) {
                     if (op.op === 'delete') {
-                        const id = String(op.messageId);
-                        const index = ctx.chat.findIndex(message => messageId(message) === id);
+                        const id = String(
+                            op.messageId,
+                        );
+
+                        const index =
+                            ctx.chat.findIndex(
+                                message =>
+                                    messageId(message) ===
+                                    id,
+                            );
+
                         if (index >= 0) {
-                            ctx.chat.splice(index, 1);
+                            ctx.chat.splice(
+                                index,
+                                1,
+                            );
+
                             structuralChange = true;
                         }
-                        recordRemoteTombstone(id, Number(op.deletedAt || Date.now()));
+
+                        recordRemoteTombstone(
+                            id,
+                            Number(
+                                op.deletedAt ||
+                                Date.now(),
+                            ),
+                        );
+
                         continue;
                     }
 
                     if (op.op === 'upsert') {
-                        const message = clone(op.message);
-                        const id = messageId(message);
-                        if (!id) throw new Error('delta_message_id_missing');
+                        const message = clone(
+                            op.message,
+                        );
 
-                        const index = ctx.chat.findIndex(item => messageId(item) === id);
+                        const id =
+                            messageId(message);
+
+                        if (!id) {
+                            throw new Error(
+                                'delta_message_id_missing',
+                            );
+                        }
+
+                        const index =
+                            ctx.chat.findIndex(
+                                item =>
+                                    messageId(item) ===
+                                    id,
+                            );
+
                         if (index >= 0) {
-                            ctx.chat[index] = message;
+                            ctx.chat[index] =
+                                message;
+
                             try {
-                                const result = ctx.updateMessageBlock?.(index, clone(message), { rerenderMessage: true });
-                                const domBlock = document.querySelector(`[mesid="${index}"]`);
-                                if (result === false || !domBlock) structuralChange = true;
+                                const result =
+                                    ctx.updateMessageBlock?.(
+                                        index,
+                                        clone(message),
+                                        {
+                                            rerenderMessage:
+                                                true,
+                                        },
+                                    );
+
+                                const domBlock =
+                                    document.querySelector(
+                                        `[mesid="${index}"]`,
+                                    );
+
+                                if (
+                                    result === false ||
+                                    !domBlock
+                                ) {
+                                    structuralChange =
+                                        true;
+                                }
                             } catch {
                                 structuralChange = true;
                             }
                         } else {
-                            let insertAt = ctx.chat.length;
-                            if (op.afterMessageId != null) {
-                                const afterIndex = ctx.chat.findIndex(item => messageId(item) === String(op.afterMessageId));
-                                if (afterIndex < 0) throw new Error('delta_anchor_missing');
-                                insertAt = afterIndex + 1;
+                            let insertAt =
+                                ctx.chat.length;
+
+                            if (
+                                op.afterMessageId != null
+                            ) {
+                                const afterIndex =
+                                    ctx.chat.findIndex(
+                                        item =>
+                                            messageId(item) ===
+                                            String(
+                                                op.afterMessageId,
+                                            ),
+                                    );
+
+                                if (
+                                    afterIndex < 0
+                                ) {
+                                    throw new Error(
+                                        'delta_anchor_missing',
+                                    );
+                                }
+
+                                insertAt =
+                                    afterIndex + 1;
                             }
-                            ctx.chat.splice(insertAt, 0, message);
+
+                            ctx.chat.splice(
+                                insertAt,
+                                0,
+                                message,
+                            );
+
                             structuralChange = true;
                         }
 
-                        const modifiedAt = Number(op.modifiedAt || Date.now());
-                        const bucket = chatSyncMetaBucket();
+                        const modifiedAt =
+                            Number(
+                                op.modifiedAt ||
+                                Date.now(),
+                            );
+
+                        const bucket =
+                            chatSyncMetaBucket();
+
                         if (bucket) {
-                            const tomb = readLedger(ctx.chatMetadata);
-                            if (Object.hasOwn(tomb, id) && modifiedAt > tomb[id]) {
+                            const tomb =
+                                readLedger(
+                                    ctx.chatMetadata,
+                                );
+
+                            if (
+                                Object.hasOwn(
+                                    tomb,
+                                    id,
+                                ) &&
+                                modifiedAt >
+                                    tomb[id]
+                            ) {
                                 delete tomb[id];
-                                bucket.tombstones = JSON.parse(JSON.stringify(tomb));
+
+                                bucket.tombstones =
+                                    JSON.parse(
+                                        JSON.stringify(
+                                            tomb,
+                                        ),
+                                    );
                             }
                         }
+
                         continue;
                     }
 
                     if (op.op === 'move') {
-                        const id = String(op.messageId);
-                        const currentIndex = ctx.chat.findIndex(message => messageId(message) === id);
-                        if (currentIndex < 0) throw new Error('delta_move_target_missing');
-                        const moved = ctx.chat[currentIndex];
-                        ctx.chat.splice(currentIndex, 1);
-                        let insertAt = 0;
-                        if (op.afterMessageId != null) {
-                            const afterIndex = ctx.chat.findIndex(item => messageId(item) === String(op.afterMessageId));
-                            if (afterIndex < 0) throw new Error('delta_move_anchor_missing');
-                            insertAt = afterIndex + 1;
+                        const id = String(
+                            op.messageId,
+                        );
+
+                        const currentIndex =
+                            ctx.chat.findIndex(
+                                message =>
+                                    messageId(message) ===
+                                    id,
+                            );
+
+                        if (
+                            currentIndex < 0
+                        ) {
+                            throw new Error(
+                                'delta_move_target_missing',
+                            );
                         }
-                        ctx.chat.splice(insertAt, 0, moved);
+
+                        const moved =
+                            ctx.chat[
+                                currentIndex
+                            ];
+
+                        ctx.chat.splice(
+                            currentIndex,
+                            1,
+                        );
+
+                        let insertAt = 0;
+
+                        if (
+                            op.afterMessageId != null
+                        ) {
+                            const afterIndex =
+                                ctx.chat.findIndex(
+                                    item =>
+                                        messageId(item) ===
+                                        String(
+                                            op.afterMessageId,
+                                        ),
+                                );
+
+                            if (
+                                afterIndex < 0
+                            ) {
+                                throw new Error(
+                                    'delta_move_anchor_missing',
+                                );
+                            }
+
+                            insertAt =
+                                afterIndex + 1;
+                        }
+
+                        ctx.chat.splice(
+                            insertAt,
+                            0,
+                            moved,
+                        );
+
                         structuralChange = true;
                     }
                 }
@@ -2840,28 +3067,72 @@ async function handleSnapshotDeltaEvent(data) {
                     try {
                         await awaitablePrintMessages();
                     } catch (error) {
-                        log('delta printMessages failed', error);
+                        log(
+                            'delta printMessages failed',
+                            error,
+                        );
+
                         throw error;
                     }
                 }
 
-                serverState = { ...(serverState || {}), revision, snapshot: projected };
+                serverState = {
+                    ...(serverState || {}),
+                    revision,
+                    snapshot: projected,
+                };
+
                 baseSnapshot = projected;
-                rebuildLastSyncedMap(projected.messages);
+
+                rebuildLastSyncedMap(
+                    projected.messages,
+                );
 
                 // Persist the remotely-applied change without blocking SSE
                 // processing — but never silently accept a failed native save.
-                if (scopeAtEvent.kind !== 'group') {
-                    void safeNativeSave(scopeAtEvent)
+                if (
+                    scopeAtEvent.kind !== 'group'
+                ) {
+                    void safeNativeSave(
+                        scopeAtEvent,
+                    )
                         .then(saved => {
-                            if (!saved && currentScopeGuard(scopeEpoch)) {
-                                void resyncCurrentScope(scopeEpoch).catch(error => warn('remote delta persistence recovery failed', error));
+                            if (
+                                !saved &&
+                                currentScopeGuard(
+                                    scopeEpoch,
+                                )
+                            ) {
+                                void resyncCurrentScope(
+                                    scopeEpoch,
+                                ).catch(error =>
+                                    warn(
+                                        'remote delta persistence recovery failed',
+                                        error,
+                                    ),
+                                );
                             }
                         })
                         .catch(error => {
-                            warn('remote delta native save failed', error);
-                            if (currentScopeGuard(scopeEpoch)) {
-                                void resyncCurrentScope(scopeEpoch).catch(recoveryError => warn('remote delta persistence recovery failed', recoveryError));
+                            warn(
+                                'remote delta native save failed',
+                                error,
+                            );
+
+                            if (
+                                currentScopeGuard(
+                                    scopeEpoch,
+                                )
+                            ) {
+                                void resyncCurrentScope(
+                                    scopeEpoch,
+                                ).catch(
+                                    recoveryError =>
+                                        warn(
+                                            'remote delta persistence recovery failed',
+                                            recoveryError,
+                                        ),
+                                );
                             }
                         });
                 }
@@ -2869,16 +3140,34 @@ async function handleSnapshotDeltaEvent(data) {
                 updateGenerationUi();
                 return true;
             } catch (error) {
-                warn('snapshot delta application failed; resyncing', error);
-                await resyncCurrentScope(scopeEpoch);
+                warn(
+                    'snapshot delta application failed; resyncing',
+                    error,
+                );
+
+                await resyncCurrentScope(
+                    scopeEpoch,
+                );
+
                 return true;
             } finally {
                 applyingRemoteDepth -= 1;
             }
         });
 
-        stateApplyChain = run.then(() => undefined, error => warn('snapshot delta state chain failed', error));
-        run.then(value => resolve(value), () => resolve(false));
+        stateApplyChain = run.then(
+            () => undefined,
+            error =>
+                warn(
+                    'snapshot delta state chain failed',
+                    error,
+                ),
+        );
+
+        run.then(
+            value => resolve(value),
+            () => resolve(false),
+        );
     });
 }
 
@@ -3895,31 +4184,101 @@ async function handleGenerationRecovered(data) {
             return true;
         }
 
-        if (localGeneration) {
-            const localGenerationId = localGeneration.generationId;
-            generationMismatchSince = generationMismatchSince || Date.now();
+if (localGeneration) {
+    const localGenerationId =
+        localGeneration.generationId;
 
-            if (generationIsStopRequested(localGenerationId) || generationTerminalPhase === 'stopped') {
-                generationTerminalPhase = 'stopped';
-                clearGenerationStreamWork(localGenerationId);
-                scheduleTerminalRetry(localGenerationId, 'stopped', 250);
-                updateGenerationUi();
-                return true;
-            }
+    generationMismatchSince =
+        generationMismatchSince || Date.now();
 
-            void reacquireGenerationOwnership('generation_recovered').then(recovered => {
-                if (recovered) {
-                    generationMismatchSince = 0;
-                    updateGenerationUi();
-                }
-            });
+    const terminalPhase = String(
+        generationTerminalPhase || '',
+    ).toLowerCase();
 
-            generationHeartbeatFailures = 0;
-            renderBanner('Reconnecting shared generation…');
-            scheduleGenerationStartRetry(localGenerationId, 500);
-            updateGenerationUi();
-            return true;
+    const alreadyTerminal =
+        terminalizingGenerationId ===
+            localGenerationId ||
+        generationIsStopRequested(
+            localGenerationId,
+        ) ||
+        terminalGenerationPhases.has(
+            terminalPhase,
+        );
+
+    if (alreadyTerminal) {
+        generationTerminalPhase =
+            generationIsStopRequested(
+                localGenerationId,
+            )
+                ? 'stopped'
+                : (
+                    terminalGenerationPhases.has(
+                        terminalPhase,
+                    )
+                        ? terminalPhase
+                        : 'stopped'
+                );
+
+        clearGenerationStreamWork(
+            localGenerationId,
+        );
+
+        clearGenerationTerminalTimer();
+
+        // Do not try to reacquire or start a generation that is already
+        // terminalizing/terminal. Its terminal path owns cleanup.
+        if (
+            terminalizingGenerationId !==
+                localGenerationId
+        ) {
+            void sendGenerationTerminal(
+                generationTerminalPhase,
+            ).catch(error => warn(
+                '[MCS] terminal confirmation after generation recovery failed',
+                error,
+            ));
         }
+
+        updateGenerationUi();
+        return true;
+    }
+
+    // The server generation disappeared, but this tab still has a live
+    // native generation. Attempt authoritative ownership recovery rather
+    // than blindly scheduling /generation/started against a generation
+    // that the server no longer knows about.
+    generationHeartbeatFailures = 0;
+
+    renderBanner(
+        'Reconnecting shared generation…',
+    );
+
+    void reacquireGenerationOwnership(
+        'generation_recovered',
+    ).then(recovered => {
+        if (
+            recovered &&
+            localGeneration?.generationId ===
+                localGenerationId &&
+            terminalizingGenerationId !==
+                localGenerationId &&
+            !generationIsStopRequested(
+                localGenerationId,
+            )
+        ) {
+            generationMismatchSince = 0;
+            updateGenerationUi();
+        }
+    }).catch(error => {
+        warn(
+            '[MCS] generation recovery reacquisition failed',
+            error,
+        );
+    });
+
+    updateGenerationUi();
+    return true;
+}
 
         generationServerReadyId = null;
         clearGenerationTerminalTimer();
@@ -4408,15 +4767,36 @@ function startHeartbeats(epoch) {
 }
 
 async function reacquireGenerationOwnership(reason = 'recovery') {
-    if (!localGeneration || !localGenerationScope || generationRecoveryInFlight || terminalizingGenerationId) return false;
+    if (
+        !localGeneration ||
+        !localGenerationScope ||
+        generationRecoveryInFlight ||
+        terminalizingGenerationId
+    ) {
+        return false;
+    }
 
     const generation = clone(localGeneration);
     const scopeAtGeneration = clone(localGenerationScope);
-    const epochAtGeneration = localGenerationEpoch || scopeEpoch;
+    const epochAtGeneration =
+        localGenerationEpoch || scopeEpoch;
     const generationId = generation.generationId;
 
-    if (!currentScopeGuard(epochAtGeneration) || !nativeScopeStable(scopeAtGeneration)) return false;
-    if (generationIsStopRequested(generationId) || generationTerminalPhase === 'stopped') return false;
+    if (
+        !currentScopeGuard(epochAtGeneration) ||
+        !nativeScopeStable(scopeAtGeneration)
+    ) {
+        return false;
+    }
+
+    if (
+        generationIsStopRequested(generationId) ||
+        terminalGenerationPhases.has(
+            String(generationTerminalPhase || '').toLowerCase(),
+        )
+    ) {
+        return false;
+    }
 
     const run = (async () => {
         try {
@@ -4427,88 +4807,469 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
                 connectionId: membershipConnectionId,
             });
 
-            if (!localGenerationMatches(generationId, scopeAtGeneration) || !currentScopeGuard(epochAtGeneration)) return false;
-
-            const state = stateResult.state;
-            const current = state?.generation || null;
-
-            if (current && current.generationId === generationId && generationIsMine(current)) {
-                serverState = state;
-                localGeneration = { ...localGeneration, ...clone(current) };
-                generationMismatchSince = 0;
-                if (current.stopRequested) {
-                    rememberStopRequestedGeneration(generationId);
-                    return false;
-                }
-                if (['started', 'streaming'].includes(current.phase)) {
-                    generationServerReadyId = generationId;
-                    return true;
-                }
-                generationServerReadyId = null;
-                scheduleGenerationStartRetry(generationId, 250);
-                return await ensureGenerationStarted();
-            }
-
-            if (current && generationActive(current) && current.generationId !== generationId) {
-                generationMismatchSince = generationMismatchSince || Date.now();
-                log('[MCS] competing generation observed during recovery; preserving local generation until confirmed', { reason, generationId, competing: current.generationId });
+            if (
+                !localGenerationMatches(
+                    generationId,
+                    scopeAtGeneration,
+                ) ||
+                !currentScopeGuard(epochAtGeneration) ||
+                terminalizingGenerationId === generationId
+            ) {
                 return false;
             }
 
-            const authoritativeSnapshot = normalizeSnapshot(state?.snapshot || { messages: [], metadata: {} });
-            const localSnapshot = syncSnapshot(durableSnapshot());
-            const recoveryBase = localGenerationBaseSnapshot || baseSnapshot || { messages: [], metadata: {} };
-            const desired = mergeSnapshots(recoveryBase, localSnapshot, authoritativeSnapshot);
+            const state = stateResult?.state || null;
+            const current = state?.generation || null;
 
-            const claimOpId = newId();
-            const claimed = await api('/generation/claim', 'POST', {
-                scope: scopeAtGeneration,
-                clientId,
-                deviceId,
-                connectionId: membershipConnectionId,
-                opId: claimOpId,
-                generationId,
-                generationType: String(generation.generationType || 'normal'),
-                baseRevision: Number(state.revision || 0),
-                snapshot: desired,
-            });
-
-            if (!localGenerationMatches(generationId, scopeAtGeneration) || !currentScopeGuard(epochAtGeneration)) return false;
-
-            const nextGeneration = claimed.state?.generation;
-            if (!nextGeneration || nextGeneration.generationId !== generationId || !generationIsMine(nextGeneration)) return false;
-
-            serverState = claimed.state;
-            baseSnapshot = claimed.state.snapshot;
-            localGeneration = clone(nextGeneration);
-            localGenerationBaseSnapshot = claimed.state.snapshot;
-            localGenerationBaseRevision = Number(claimed.state.revision || 0);
-            generationServerReadyId = null;
-            generationMismatchSince = 0;
-            updateGenerationUi();
-
-            startGenerationHeartbeat(epochAtGeneration);
-            return await ensureGenerationStarted();
-        } catch (error) {
-            if (error?.status === 409 && error?.payload?.state) {
-                const state = error.payload.state;
+            if (
+                current &&
+                current.generationId === generationId &&
+                generationIsMine(current)
+            ) {
                 serverState = state;
                 baseSnapshot = state.snapshot;
-                const competing = state.generation;
-                if (competing && competing.generationId !== generationId && generationActive(competing)) {
-                    generationMismatchSince = generationMismatchSince || Date.now();
+
+                localGeneration = {
+                    ...localGeneration,
+                    ...clone(current),
+                };
+
+                localGenerationScope = clone(scopeAtGeneration);
+                localGenerationEpoch = epochAtGeneration;
+
+                generationMismatchSince = 0;
+
+                if (current.stopRequested) {
+                    rememberStopRequestedGeneration(generationId);
+                    generationTerminalPhase = 'stopped';
+                    clearGenerationStreamWork(generationId);
+                    return false;
+                }
+
+                const phase = String(
+                    current.phase || '',
+                ).toLowerCase();
+
+                if (terminalGenerationPhases.has(phase)) {
+                    generationTerminalPhase = phase;
+                    clearGenerationStreamWork(generationId);
+                    return false;
+                }
+
+                if (
+                    phase === 'started' ||
+                    phase === 'streaming'
+                ) {
+                    generationServerReadyId = generationId;
+                    startGenerationHeartbeat(epochAtGeneration);
+                    updateGenerationUi();
+                    return true;
+                }
+
+                generationServerReadyId = null;
+                startGenerationHeartbeat(epochAtGeneration);
+
+                scheduleGenerationStartRetry(
+                    generationId,
+                    250,
+                );
+
+                return await ensureGenerationStarted();
+            }
+
+            if (
+                current &&
+                generationActive(current) &&
+                current.generationId !== generationId
+            ) {
+                generationMismatchSince =
+                    generationMismatchSince || Date.now();
+
+                log(
+                    '[MCS] competing generation observed during recovery',
+                    {
+                        reason,
+                        generationId,
+                        competing: current.generationId,
+                    },
+                );
+
+                return false;
+            }
+
+            if (
+                current &&
+                current.generationId === generationId &&
+                !generationIsMine(current)
+            ) {
+                generationMismatchSince =
+                    generationMismatchSince || Date.now();
+                return false;
+            }
+
+            const authoritativeSnapshot = normalizeSnapshot(
+                state?.snapshot || {
+                    messages: [],
+                    metadata: {},
+                },
+            );
+
+            const localSnapshot = syncSnapshot(
+                durableSnapshot(),
+            );
+
+            const recoveryBase =
+                localGenerationBaseSnapshot ||
+                baseSnapshot ||
+                serverState?.snapshot || {
+                    messages: [],
+                    metadata: {},
+                };
+
+            let desired = mergeSnapshots(
+                recoveryBase,
+                localSnapshot,
+                authoritativeSnapshot,
+            );
+
+            let claimBase = authoritativeSnapshot;
+            let revision = Number(
+                state?.revision || 0,
+            );
+
+            let claimResult = null;
+            let claimOpId = newId();
+
+            for (
+                let attempt = 0;
+                attempt < 4;
+                attempt += 1
+            ) {
+                if (
+                    !localGenerationMatches(
+                        generationId,
+                        scopeAtGeneration,
+                    ) ||
+                    !currentScopeGuard(epochAtGeneration) ||
+                    !nativeScopeStable(scopeAtGeneration) ||
+                    terminalizingGenerationId === generationId ||
+                    generationIsStopRequested(generationId)
+                ) {
+                    return false;
+                }
+
+                try {
+                    claimResult = await api(
+                        '/generation/claim',
+                        'POST',
+                        {
+                            scope: scopeAtGeneration,
+                            clientId,
+                            deviceId,
+                            connectionId: membershipConnectionId,
+                            opId: claimOpId,
+                            generationId,
+                            generationType: String(
+                                generation.generationType ||
+                                'normal',
+                            ),
+                            baseRevision: revision,
+                            snapshot: desired,
+                        },
+                    );
+
+                    break;
+                } catch (error) {
+                    if (
+                        error?.status === 409 &&
+                        error?.payload?.state
+                    ) {
+                        const conflictState =
+                            error.payload.state;
+
+                        const conflictGeneration =
+                            conflictState.generation ||
+                            null;
+
+                        if (
+                            conflictGeneration &&
+                            conflictGeneration.generationId !==
+                                generationId &&
+                            generationActive(
+                                conflictGeneration,
+                            )
+                        ) {
+                            serverState = conflictState;
+                            baseSnapshot =
+                                conflictState.snapshot;
+
+                            generationMismatchSince =
+                                generationMismatchSince ||
+                                Date.now();
+
+                            return false;
+                        }
+
+                        const remoteSnapshot =
+                            conflictState.snapshot || {
+                                messages: [],
+                                metadata: {},
+                            };
+
+                        desired = mergeSnapshots(
+                            claimBase,
+                            desired,
+                            remoteSnapshot,
+                        );
+
+                        claimBase = remoteSnapshot;
+                        revision = Number(
+                            conflictState.revision || 0,
+                        );
+
+                        serverState = conflictState;
+                        baseSnapshot = remoteSnapshot;
+
+                        // New payload => new logical operation ID.
+                        claimOpId = newId();
+
+                        continue;
+                    }
+
+                    // The request may have committed even though the
+                    // response was lost. Prove it before retrying.
+                    const confirmedResult = await api(
+                        '/state',
+                        'POST',
+                        {
+                            scope: scopeAtGeneration,
+                            clientId,
+                            deviceId,
+                            connectionId: membershipConnectionId,
+                        },
+                    ).catch(() => null);
+
+                    const confirmedState =
+                        confirmedResult?.state || null;
+
+                    const confirmedGeneration =
+                        confirmedState?.generation || null;
+
+                    if (
+                        confirmedState &&
+                        confirmedGeneration?.generationId ===
+                            generationId &&
+                        generationIsMine(
+                            confirmedGeneration,
+                        )
+                    ) {
+                        claimResult = {
+                            state: confirmedState,
+                        };
+                        break;
+                    }
+
+                    if (
+                        confirmedGeneration &&
+                        confirmedGeneration.generationId !==
+                            generationId &&
+                        generationActive(
+                            confirmedGeneration,
+                        ) &&
+                        !generationIsMine(
+                            confirmedGeneration,
+                        )
+                    ) {
+                        serverState = confirmedState;
+                        baseSnapshot =
+                            confirmedState.snapshot;
+
+                        generationMismatchSince =
+                            generationMismatchSince ||
+                            Date.now();
+
+                        return false;
+                    }
+
+                    // Exact same payload => same opId.
+                    if (attempt < 3) {
+                        await sleep(
+                            Math.min(
+                                250 * 2 ** attempt,
+                                1000,
+                            ),
+                        );
+                        continue;
+                    }
+
+                    throw error;
                 }
             }
-            log('[MCS] generation ownership recovery failed; keeping native generation alive', reason, error);
+
+            if (!claimResult?.state) {
+                return false;
+            }
+
+            if (
+                !currentScopeGuard(epochAtGeneration) ||
+                !nativeScopeStable(scopeAtGeneration)
+            ) {
+                return false;
+            }
+
+            const claimed =
+                claimResult.state.generation;
+
+            if (
+                !claimed ||
+                claimed.generationId !== generationId ||
+                !generationIsMine(claimed)
+            ) {
+                return false;
+            }
+
+            serverState = claimResult.state;
+            baseSnapshot =
+                claimResult.state.snapshot;
+
+            localGeneration = clone(claimed);
+            localGenerationScope =
+                clone(scopeAtGeneration);
+            localGenerationEpoch =
+                epochAtGeneration;
+
+            localGenerationBaseSnapshot =
+                clone(
+                    claimResult.state.snapshot || {
+                        messages: [],
+                        metadata: {},
+                    },
+                );
+
+            localGenerationBaseRevision =
+                Number(
+                    claimResult.state.revision || 0,
+                );
+
+            localGenerationSettings = {
+                syncMessages:
+                    !!settings.syncMessages,
+                syncMetadata:
+                    !!settings.syncMetadata,
+            };
+
+            localStreamMessageId = null;
+            localStreamMessageIndex = null;
+            generationClaimedThisPage = true;
+            generationTerminalPhase = null;
+            generationMismatchSince = 0;
+            leaveAfterLocalGeneration = false;
+
+            // The claim has now committed. Bring native ST to the exact
+            // snapshot the server accepted. Do this AFTER the claim, never
+            // before it, so a failed recovery claim cannot silently rewrite
+            // native chat state.
+            if (
+                !deepEqual(
+                    syncSnapshot(durableSnapshot()),
+                    normalizeSnapshot(
+                        claimResult.state.snapshot || {
+                            messages: [],
+                            metadata: {},
+                        },
+                    ),
+                )
+            ) {
+                const applied = await applySnapshot(
+                    desired,
+                    {
+                        save: true,
+                        render: true,
+                        expectedScope:
+                            scopeAtGeneration,
+                        clearDirty: false,
+                    },
+                );
+
+                if (
+                    !applied ||
+                    !currentScopeGuard(
+                        epochAtGeneration,
+                    ) ||
+                    !nativeScopeStable(
+                        scopeAtGeneration,
+                    )
+                ) {
+                    return false;
+                }
+            }
+
+            markLocalDirty(scopeAtGeneration);
+
+            rebuildLastSyncedMap(
+                syncSnapshot(
+                    durableSnapshot(),
+                ).messages,
+            );
+
+            updateGenerationUi();
+            startGenerationHeartbeat(
+                epochAtGeneration,
+            );
+
+            return await ensureGenerationStarted();
+        } catch (error) {
+            if (
+                error?.status === 409 &&
+                error?.payload?.state
+            ) {
+                const state =
+                    error.payload.state;
+
+                if (
+                    currentScopeGuard(
+                        epochAtGeneration,
+                    )
+                ) {
+                    serverState = state;
+                    baseSnapshot = state.snapshot;
+                }
+
+                const competing =
+                    state?.generation;
+
+                if (
+                    competing &&
+                    competing.generationId !==
+                        generationId &&
+                    generationActive(
+                        competing,
+                    )
+                ) {
+                    generationMismatchSince =
+                        generationMismatchSince ||
+                        Date.now();
+                }
+            }
+
+            log(
+                '[MCS] generation ownership recovery failed; keeping native generation alive',
+                reason,
+                error,
+            );
+
             return false;
         }
     })();
 
     generationRecoveryInFlight = run;
+
     try {
         return await run;
     } finally {
-        if (generationRecoveryInFlight === run) generationRecoveryInFlight = null;
+        if (generationRecoveryInFlight === run) {
+            generationRecoveryInFlight = null;
+        }
     }
 }
 
@@ -4538,10 +5299,24 @@ function startGenerationHeartbeat(epoch) {
                     generationId,
                 });
 
-                if (!localGeneration || localGeneration.generationId !== generationId || !currentScopeGuard(epoch)) return;
+if (
+    !localGeneration ||
+    localGeneration.generationId !== generationId ||
+    !currentScopeGuard(epoch) ||
+    terminalizingGenerationId === generationId
+) {
+    return;
+}
 
-                // Compact response: merge, never replace, so the snapshot survives.
-                mergeCompactState(result.state);
+// A heartbeat response can have been generated before terminalization
+// committed. Never let that stale response resurrect readiness or streaming.
+if (generationIsStopRequested(generationId)) {
+    rememberStopRequestedGeneration(generationId);
+    return;
+}
+
+// Compact response: merge, never replace.
+mergeCompactState(result.state);
 
                 if (result.stopRequested || result.state?.generation?.stopRequested) {
                     rememberStopRequestedGeneration(generationId);
@@ -4561,14 +5336,61 @@ function startGenerationHeartbeat(epoch) {
                 }
 
                 const stateGeneration = result.state?.generation || null;
-                if (stateGeneration && stateGeneration.generationId === generationId && generationIsMine(stateGeneration)) {
-                    localGeneration = { ...localGeneration, ...clone(stateGeneration) };
-                    generationServerReadyId = ['started', 'streaming'].includes(stateGeneration.phase) ? generationId : generationServerReadyId;
-                    generationHeartbeatFailures = 0;
-                    generationMismatchSince = 0;
-                    updateGenerationUi();
-                    return;
-                }
+if (
+    stateGeneration &&
+    stateGeneration.generationId === generationId &&
+    generationIsMine(stateGeneration)
+) {
+    const phase = String(
+        stateGeneration.phase || '',
+    ).toLowerCase();
+
+    if (terminalGenerationPhases.has(phase)) {
+        generationTerminalPhase = phase;
+
+        if (
+            stateGeneration.stopRequested ||
+            phase === 'stopped'
+        ) {
+            rememberStopRequestedGeneration(
+                generationId,
+            );
+        }
+
+        clearGenerationStreamWork(
+            generationId,
+        );
+        clearGenerationTerminalTimer();
+
+        void sendGenerationTerminal(phase)
+            .catch(error => warn(
+                '[MCS] terminal cleanup after heartbeat terminal state failed',
+                error,
+            ));
+
+        return;
+    }
+
+    if (terminalizingGenerationId === generationId) {
+        return;
+    }
+
+    localGeneration = {
+        ...localGeneration,
+        ...clone(stateGeneration),
+    };
+
+    generationServerReadyId =
+        ['started', 'streaming'].includes(phase)
+            ? generationId
+            : generationServerReadyId;
+
+    generationHeartbeatFailures = 0;
+    generationMismatchSince = 0;
+
+    updateGenerationUi();
+    return;
+}
 
                 const confirmedResult = await api('/state', 'POST', {
                     scope: scopeAtGeneration,
@@ -4590,17 +5412,72 @@ function startGenerationHeartbeat(epoch) {
                     return;
                 }
 
-                if (!confirmed) {
-                    if (generationIsStopRequested(generationId) || generationTerminalPhase === 'stopped') {
-                        clearGenerationStreamWork(generationId);
-                        void sendGenerationTerminal('stopped').catch(error => warn('terminal after lost stop-requested generation failed', error));
-                        return;
-                    }
-                    generationMismatchSince = 0;
-                    await openScope(epoch);
-                    void reacquireGenerationOwnership('heartbeat-recovery').catch(error => warn('heartbeat recovery failed', error));
-                    return;
-                }
+if (!confirmed) {
+    const terminalPhase = String(
+        generationTerminalPhase || '',
+    ).toLowerCase();
+
+    const alreadyTerminal =
+        terminalizingGenerationId === generationId ||
+        generationIsStopRequested(generationId) ||
+        terminalGenerationPhases.has(terminalPhase);
+
+    if (alreadyTerminal) {
+        clearGenerationStreamWork(
+            generationId,
+        );
+        clearGenerationTerminalTimer();
+
+        if (
+            terminalizingGenerationId !==
+                generationId &&
+            localGeneration?.generationId ===
+                generationId
+        ) {
+            void sendGenerationTerminal(
+                generationIsStopRequested(
+                    generationId,
+                )
+                    ? 'stopped'
+                    : terminalPhase ||
+                        'stopped',
+            ).catch(error => warn(
+                '[MCS] terminal after lost generation failed',
+                error,
+            ));
+        }
+
+        return;
+    }
+
+    generationMismatchSince = 0;
+
+    await openScope(epoch);
+
+    if (
+        localGeneration?.generationId ===
+            generationId &&
+        !generationIsStopRequested(
+            generationId,
+        ) &&
+        terminalizingGenerationId !==
+            generationId &&
+        !terminalGenerationPhases.has(
+            String(
+                generationTerminalPhase || '',
+            ).toLowerCase(),
+        )
+    ) {
+        void reacquireGenerationOwnership(
+            'heartbeat-recovery',
+        ).catch(error => warn(
+            '[MCS] heartbeat recovery failed',
+            error,
+        ));
+    }
+
+    return;
+}
 
                 if (confirmed.generationId !== generationId && generationActive(confirmed)) {
                     generationMismatchSince = generationMismatchSince || Date.now();
@@ -4616,15 +5493,59 @@ function startGenerationHeartbeat(epoch) {
                     const finalState = finalStateResult?.state || null;
                     const finalGeneration = finalState?.generation || null;
 
-                    if (
-                        finalGeneration &&
-                        finalGeneration.generationId !== generationId &&
-                        generationActive(finalGeneration) &&
-                        !generationIsMine(finalGeneration)
-                    ) {
-                        generationTerminalPhase = 'stopped';
-                        try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
-                    } else if (finalGeneration?.generationId === generationId && generationIsMine(finalGeneration)) {
+if (
+    finalGeneration &&
+    finalGeneration.generationId !== generationId &&
+    generationActive(finalGeneration) &&
+    !generationIsMine(finalGeneration)
+) {
+    generationTerminalPhase = 'stopped';
+    rememberStopRequestedGeneration(
+        generationId,
+    );
+    clearGenerationStreamWork(
+        generationId,
+    );
+
+    try {
+        const stopped =
+            ctx?.stopGeneration?.();
+
+        if (
+            stopped === false &&
+            localGeneration?.generationId ===
+                generationId
+        ) {
+            void sendGenerationTerminal(
+                'stopped',
+            ).catch(error => warn(
+                '[MCS] terminal after ownership loss failed',
+                error,
+            ));
+        }
+    } catch (error) {
+        warn(
+            '[MCS] failed stopping local generation after ownership loss',
+            error,
+        );
+
+        if (
+            localGeneration?.generationId ===
+            generationId
+        ) {
+            void sendGenerationTerminal(
+                'stopped',
+            ).catch(terminalError => warn(
+                '[MCS] fallback ownership-loss terminal failed',
+                terminalError,
+            ));
+        }
+    }
+} else if (
+    finalGeneration?.generationId ===
+        generationId &&
+    generationIsMine(finalGeneration)
+) {
                         serverState = finalState;
                         localGeneration = clone(finalGeneration);
                         generationMismatchSince = 0;
@@ -4633,8 +5554,14 @@ function startGenerationHeartbeat(epoch) {
                         void reacquireGenerationOwnership('post-conflict-recovery');
                     }
                 }
-            } catch (error) {
-                generationHeartbeatFailures += 1;
+} catch (error) {
+    generationHeartbeatFailures += 1;
+
+    // Terminalization owns this generation now. Do not start recovery,
+    // readiness retries, or ownership reacquisition from a stale heartbeat.
+    if (terminalizingGenerationId === generationId) {
+        return;
+    }
 
                 if (error?.status === 403 && error?.payload?.error === 'not_member') {
                     await openScope(epoch);
@@ -4654,9 +5581,24 @@ function startGenerationHeartbeat(epoch) {
                     }
 
                     generationMismatchSince = generationMismatchSince || Date.now();
-                    if (!generationIsStopRequested(generationId) && generationTerminalPhase !== 'stopped' && Date.now() - generationMismatchSince >= OWNERSHIP_RECOVERY_GRACE_MS) {
-                        void reacquireGenerationOwnership('heartbeat-409-recovery');
-                    }
+if (
+    !generationIsStopRequested(generationId) &&
+    !terminalizingGenerationId &&
+    !terminalGenerationPhases.has(
+        String(
+            generationTerminalPhase || '',
+        ).toLowerCase(),
+    ) &&
+    Date.now() - generationMismatchSince >=
+        OWNERSHIP_RECOVERY_GRACE_MS
+) {
+    void reacquireGenerationOwnership(
+        'heartbeat-409-recovery',
+    ).catch(error => warn(
+        '[MCS] heartbeat ownership recovery failed',
+        error,
+    ));
+}
                     return;
                 }
 
@@ -4760,12 +5702,27 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                         try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
                     }
                 }
-            } else if (!serverGeneration) {
-                generationMismatchSince = 0;
-                if (!generationIsStopRequested(localId) && generationTerminalPhase !== 'stopped') {
-                    void reacquireGenerationOwnership('resync-no-generation');
-                }
-            }
+} else if (!serverGeneration) {
+    generationMismatchSince = 0;
+
+    const terminalPhase = String(
+        generationTerminalPhase || '',
+    ).toLowerCase();
+
+    const alreadyTerminal =
+        terminalizingGenerationId === localId ||
+        generationIsStopRequested(localId) ||
+        terminalGenerationPhases.has(terminalPhase);
+
+    if (!alreadyTerminal) {
+        void reacquireGenerationOwnership(
+            'resync-no-generation',
+        ).catch(error => warn(
+            '[MCS] generation reacquisition after resync failed',
+            error,
+        ));
+    }
+}
         } else if (serverGeneration && generationIsMine(serverGeneration)) {
             if (!generationClaimedThisPage && generationClaimInFlightId !== serverGeneration.generationId) {
                 const staleId = serverGeneration.generationId;
@@ -4859,13 +5816,16 @@ function resyncCurrentScope(epoch = scopeEpoch) {
     if (!currentScope) return Promise.resolve();
 
     const key = `${scopeKeyValue}:${epoch}`;
+
     if (resyncInFlight && resyncInFlightKey === key) {
         return resyncInFlight;
     }
 
-    const run = resyncChain
+    // Do not globally serialize different scopes behind one stale /state
+    // request. Epoch/scope guards make an old result harmless.
+    const run = Promise.resolve()
         .then(() => resyncCurrentScopeInternal(epoch))
-        .catch(error => warn('resync chain failed', error));
+        .catch(error => warn('resync failed', error));
 
     resyncInFlight = run;
     resyncInFlightKey = key;
@@ -4877,7 +5837,6 @@ function resyncCurrentScope(epoch = scopeEpoch) {
         }
     });
 
-    resyncChain = run.then(() => undefined, () => undefined);
     return run;
 }
 
@@ -4927,77 +5886,132 @@ async function terminateGenerationOnServer(generation, scope, phase, snapshot, o
     }
 }
 
-async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
+async function leaveCurrentScope({
+    preserveNativeGeneration = false,
+} = {}) {
     if (joinAbortController) {
-        try { joinAbortController.abort(); } catch { /* ignore */ }
+        try {
+            joinAbortController.abort();
+        } catch {
+            /* ignore */
+        }
+
         joinAbortController = null;
     }
+
     if (!currentScope) return;
 
     const leavingScope = clone(currentScope);
-    const leavingGenerationId = localGeneration?.generationId || null;
+    const leavingGenerationId =
+        localGeneration?.generationId || null;
 
-    // Durably capture any unsynced local change BEFORE tearing the scope
-    // down — clearing the dirty flag without a queue row would lose it.
-    if (isLocalDirty(leavingScope) && nativeScopeStable(leavingScope)) {
+    // Do not queue a pre-terminalization generation snapshot. The generation
+    // terminal snapshot is newer and authoritative. Queueing the older state
+    // first could later overwrite the final generation state.
+    if (
+        isLocalDirty(leavingScope) &&
+        nativeScopeStable(leavingScope) &&
+        (!localGeneration || preserveNativeGeneration)
+    ) {
         try {
-            const latestSnapshot = syncSnapshot(durableSnapshot());
+            const latestSnapshot =
+                syncSnapshot(
+                    durableSnapshot(),
+                );
+
             await enqueueSnapshot(
                 latestSnapshot,
-                Number(serverState?.revision || 0),
-                serverState?.snapshot || { messages: [], metadata: {} },
+                Number(
+                    serverState?.revision || 0,
+                ),
+                serverState?.snapshot || {
+                    messages: [],
+                    metadata: {},
+                },
                 leavingScope,
                 'snapshot',
                 null,
                 newId(),
             );
-        } catch (error) {
-            warn('[MCS] failed to durably queue local state before leaving scope', error);
-        }
-    }
-
-if (localGeneration && localGenerationScope && !preserveNativeGeneration) {
-    try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
-
-    let terminalized = false;
-
-    try {
-        terminalized = await sendGenerationTerminal('stopped');
-    } catch (error) {
-        warn('generation cleanup failed while leaving scope', error);
-    }
-
-    // The terminal call can still fail because the network is disappearing
-    // during a chat switch/disable. Preserve the final native snapshot in the
-    // durable queue before the scope is torn down so the generation's last
-    // state is not silently lost.
-    if (!terminalized && nativeScopeStable(leavingScope)) {
-        try {
-            refreshLiveContext();
-
-            const finalSnapshot = syncSnapshot(durableSnapshot());
-
-            markLocalDirty(leavingScope);
-
-            await enqueueSnapshot(
-                finalSnapshot,
-                Number(serverState?.revision || 0),
-                serverState?.snapshot || { messages: [], metadata: {} },
-                leavingScope,
-                'snapshot',
-                null,
-                newId(),
-            );
-
-            scheduleQueueFlushRetry();
         } catch (error) {
             warn(
-                '[MCS] failed to durably queue final generation snapshot while leaving scope',
+                '[MCS] failed to durably queue local state before leaving scope',
                 error,
             );
         }
     }
-}
+
+    if (
+        localGeneration &&
+        localGenerationScope &&
+        !preserveNativeGeneration
+    ) {
+        const generationIdBeforeLeave =
+            localGeneration.generationId;
+
+        try {
+            ctx?.stopGeneration?.();
+        } catch {
+            /* ignore */
+        }
+
+        let terminalized = false;
+
+        try {
+            terminalized =
+                await sendGenerationTerminal(
+                    'stopped',
+                );
+        } catch (error) {
+            warn(
+                'generation cleanup failed while leaving scope',
+                error,
+            );
+        }
+
+        // If terminalization was ambiguous/failed, preserve the latest native
+        // generation state in the durable queue before tearing the scope down.
+        if (
+            !terminalized &&
+            nativeScopeStable(leavingScope)
+        ) {
+            try {
+                refreshLiveContext();
+
+                const finalSnapshot =
+                    syncSnapshot(
+                        durableSnapshot(),
+                    );
+
+                markLocalDirty(
+                    leavingScope,
+                );
+
+                await enqueueSnapshot(
+                    finalSnapshot,
+                    Number(
+                        serverState?.revision || 0,
+                    ),
+                    serverState?.snapshot ||
+                        localGenerationBaseSnapshot || {
+                            messages: [],
+                            metadata: {},
+                        },
+                    leavingScope,
+                    'snapshot',
+                    null,
+                    newId(),
+                );
+
+                scheduleQueueFlushRetry();
+            } catch (error) {
+                warn(
+                    `[MCS] failed to queue final generation snapshot while leaving scope (${generationIdBeforeLeave})`,
+                    error,
+                );
+            }
+        }
+    }
 
     try {
         await api('/leave', 'POST', {
@@ -5006,22 +6020,53 @@ if (localGeneration && localGenerationScope && !preserveNativeGeneration) {
             deviceId,
             connectionId: membershipConnectionId,
         });
-    } catch { /* best effort */ }
+    } catch {
+        /* best effort */
+    }
 
     disconnectSse();
     stopHeartbeats();
     stopGenerationHeartbeat();
 
-    if (scopeRetryTimer) clearTimeout(scopeRetryTimer);
-    if (queueRetryTimer) clearTimeout(queueRetryTimer);
-    if (generationStartRetryTimer) clearTimeout(generationStartRetryTimer);
-    if (terminalRetryTimer) clearTimeout(terminalRetryTimer);
-    if (streamTimer) clearTimeout(streamTimer);
-    if (streamRetryTimer) clearTimeout(streamRetryTimer);
-    if (remoteRenderTimer) clearTimeout(remoteRenderTimer);
-    if (streamCaptureTimer) clearTimeout(streamCaptureTimer);
-    if (remoteUiRefreshTimer) clearTimeout(remoteUiRefreshTimer);
-    if (localPublishTimer) clearTimeout(localPublishTimer);
+    if (scopeRetryTimer) {
+        clearTimeout(scopeRetryTimer);
+    }
+
+    if (queueRetryTimer) {
+        clearTimeout(queueRetryTimer);
+    }
+
+    if (generationStartRetryTimer) {
+        clearTimeout(generationStartRetryTimer);
+    }
+
+    if (terminalRetryTimer) {
+        clearTimeout(terminalRetryTimer);
+    }
+
+    if (streamTimer) {
+        clearTimeout(streamTimer);
+    }
+
+    if (streamRetryTimer) {
+        clearTimeout(streamRetryTimer);
+    }
+
+    if (remoteRenderTimer) {
+        clearTimeout(remoteRenderTimer);
+    }
+
+    if (streamCaptureTimer) {
+        clearTimeout(streamCaptureTimer);
+    }
+
+    if (remoteUiRefreshTimer) {
+        clearTimeout(remoteUiRefreshTimer);
+    }
+
+    if (localPublishTimer) {
+        clearTimeout(localPublishTimer);
+    }
 
     scopeRetryTimer = null;
     queueRetryTimer = null;
@@ -5035,20 +6080,27 @@ if (localGeneration && localGenerationScope && !preserveNativeGeneration) {
 
     serverState = null;
     baseSnapshot = null;
+
     clearLocalGenerationState();
     clearRemoteStreamState();
     resetChunkAssemblies();
+
     lastSyncedMessageMap = new Map();
     lastSseEventId = 0;
     nativeHeartbeatAppliedSeq = 0;
     nativeHeartbeatRequestSeq = 0;
     membershipConnectionId = null;
+
     setSendLock('');
     setRemoteSendButtonMode(false);
     renderBanner('');
     clearLocalDirty();
 
-    log('[MCS] left scope', leavingScope, leavingGenerationId);
+    log(
+        '[MCS] left scope',
+        leavingScope,
+        leavingGenerationId,
+    );
 }
 
 function switchScopeInternal(reason = 'scope-change') {
@@ -5362,85 +6414,245 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
             }
         }
 
-        if (existing && generationActive(existing)) {
+if (existing && generationActive(existing)) {
+    if (generationIsMine(existing)) {
+        // The server still proves this client owns the generation, even
+        // though local generation bookkeeping was lost during reconnect,
+        // reload, or a lifecycle transition.
+        localGeneration = clone(existing);
+        localGenerationScope = clone(scopeAtClaim);
+        localGenerationEpoch = epochAtClaim;
+
+        localGenerationBaseSnapshot =
+            clone(
+                serverState?.snapshot ||
+                baseSnapshot || {
+                    messages: [],
+                    metadata: {},
+                },
+            );
+
+        localGenerationBaseRevision =
+            Number(serverState?.revision || 0);
+
+        localGenerationSettings = {
+            syncMessages: !!settings.syncMessages,
+            syncMetadata: !!settings.syncMetadata,
+        };
+
+        localStreamMessageId = null;
+        localStreamMessageIndex = null;
+        generationClaimedThisPage = true;
+        generationMismatchSince = 0;
+        generationTerminalPhase = null;
+
+        if (existing.stopRequested) {
+            rememberStopRequestedGeneration(
+                existing.generationId,
+            );
+
+            generationTerminalPhase = 'stopped';
             abort(false);
-            if (settings.notifications) statusText('Another client is already generating this shared chat.', true);
-            updateGenerationUi();
             return;
         }
+
+        startGenerationHeartbeat(epochAtClaim);
+
+        const recovered =
+            await ensureGenerationStarted();
+
+        if (!recovered) {
+            abort(false);
+            updateGenerationUi();
+        }
+
+        return;
     }
 
-    const generationId = newId();
-    generationClaimInFlightId = generationId;
-    const claimOpId = newId();
+    abort(false);
 
-    let desired = null;
-    let claimBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
-    let revision = Number(serverState?.revision || 0);
-    let claimResult = null;
+    if (settings.notifications) {
+        statusText(
+            'Another client is already generating this shared chat.',
+            true,
+        );
+    }
 
-    try {
-        const idsReady = await ensureIdsPersisted(scopeAtClaim);
-        if (!idsReady || !currentScopeGuard(epochAtClaim)) {
+    updateGenerationUi();
+    return;
+}
+    }
+
+const generationId = newId();
+generationClaimInFlightId = generationId;
+
+// Same exact payload => same opId across transport retries.
+// Changed payload after a conflict => new opId.
+let claimOpId = newId();
+
+let desired = null;
+let claimBase =
+    baseSnapshot ||
+    serverState?.snapshot || {
+        messages: [],
+        metadata: {},
+    };
+let revision = Number(serverState?.revision || 0);
+let claimResult = null;
+
+try {
+    const idsReady = await ensureIdsPersisted(scopeAtClaim);
+
+    if (!idsReady || !currentScopeGuard(epochAtClaim)) {
+        abort(false);
+        return;
+    }
+
+    desired = syncSnapshot(durableSnapshot());
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+        if (
+            !currentScopeGuard(epochAtClaim) ||
+            !nativeScopeStable(scopeAtClaim) ||
+            terminalizingGenerationId === generationId
+        ) {
             abort(false);
             return;
         }
 
-        desired = syncSnapshot(durableSnapshot());
+        try {
+            claimResult = await api('/generation/claim', 'POST', {
+                scope: scopeAtClaim,
+                clientId,
+                deviceId,
+                connectionId: membershipConnectionId,
+                opId: claimOpId,
+                generationId,
+                generationType: String(type || 'normal'),
+                baseRevision: revision,
+                snapshot: desired,
+            });
 
-        for (let attempt = 0; attempt < 4; attempt += 1) {
-            if (!currentScopeGuard(epochAtClaim) || !nativeScopeStable(scopeAtClaim)) {
+            break;
+        } catch (error) {
+            const payload = error?.payload;
+
+            if (error?.status === 409 && payload?.state) {
+                if (payload.error === 'generation_active') {
+                    const other = payload.state.generation;
+
+                    // If the original claim actually committed and only its
+                    // response was lost, the server proves success here.
+                    if (
+                        other?.generationId === generationId &&
+                        generationIsMine(other)
+                    ) {
+                        claimResult = payload;
+                        break;
+                    }
+
+                    serverState = payload.state;
+                    baseSnapshot = payload.state.snapshot;
+
+                    abort(false);
+
+                    if (settings.notifications) {
+                        statusText(
+                            'Another client is already generating this shared chat.',
+                            true,
+                        );
+                    }
+
+                    updateGenerationUi();
+                    return;
+                }
+
+                const remoteSnapshot =
+                    payload.state.snapshot || {
+                        messages: [],
+                        metadata: {},
+                    };
+
+                const merged = mergeSnapshots(
+                    claimBase,
+                    desired,
+                    remoteSnapshot,
+                );
+
+                serverState = payload.state;
+                baseSnapshot = remoteSnapshot;
+                desired = merged;
+                claimBase = remoteSnapshot;
+                revision = Number(payload.state.revision || 0);
+
+                // Payload changed. This is a new logical operation.
+                claimOpId = newId();
+
+                continue;
+            }
+
+            // Ambiguous transport failure: first prove whether the exact
+            // generation claim committed before issuing another claim.
+            const confirmedResult = await api('/state', 'POST', {
+                scope: scopeAtClaim,
+                clientId,
+                deviceId,
+                connectionId: membershipConnectionId,
+            }).catch(() => null);
+
+            const confirmedState = confirmedResult?.state || null;
+            const confirmedGeneration =
+                confirmedState?.generation || null;
+
+            if (
+                confirmedState &&
+                confirmedGeneration?.generationId === generationId &&
+                generationIsMine(confirmedGeneration)
+            ) {
+                claimResult = {
+                    state: confirmedState,
+                };
+                break;
+            }
+
+            if (
+                confirmedState &&
+                confirmedGeneration &&
+                confirmedGeneration.generationId !== generationId &&
+                generationActive(confirmedGeneration) &&
+                !generationIsMine(confirmedGeneration)
+            ) {
+                serverState = confirmedState;
+                baseSnapshot = confirmedState.snapshot;
+
                 abort(false);
+
+                if (settings.notifications) {
+                    statusText(
+                        'Another client is already generating this shared chat.',
+                        true,
+                    );
+                }
+
+                updateGenerationUi();
                 return;
             }
 
-            try {
-                claimResult = await api('/generation/claim', 'POST', {
-                    scope: scopeAtClaim,
-                    clientId,
-                    deviceId,
-                    connectionId: membershipConnectionId,
-                    opId: claimOpId,
-                    generationId,
-                    generationType: String(type || 'normal'),
-                    baseRevision: revision,
-                    snapshot: desired,
-                });
-                break;
-            } catch (error) {
-                const payload = error?.payload;
-                if (error?.status === 409 && payload?.state) {
-                    if (payload.error === 'generation_active') {
-                        const other = payload.state.generation;
-                        if (other?.generationId === generationId) {
-                            claimResult = payload;
-                            break;
-                        }
-
-                        serverState = payload.state;
-                        baseSnapshot = payload.state.snapshot;
-                        abort(false);
-                        if (settings.notifications) statusText('Another client is already generating this shared chat.', true);
-                        updateGenerationUi();
-                        return;
-                    }
-
-                    const merged = mergeSnapshots(claimBase, desired, payload.state.snapshot);
-                    serverState = payload.state;
-                    baseSnapshot = payload.state.snapshot;
-                    desired = merged;
-                    claimBase = payload.state.snapshot;
-                    revision = Number(payload.state.revision);
-                    continue;
-                }
-                throw error;
+            // No proof of commit and no conflicting generation. Retry the
+            // exact same payload using the same opId.
+            if (attempt < 3) {
+                await sleep(Math.min(250 * 2 ** attempt, 1000));
+                continue;
             }
-        }
 
-        if (!claimResult) {
-            abort(false);
-            return;
+            throw error;
         }
+    }
+
+    if (!claimResult) {
+        abort(false);
+        return;
+    }
 
         if (!currentScopeGuard(epochAtClaim) || !nativeScopeStable(scopeAtClaim)) {
             try {
@@ -5763,7 +6975,19 @@ if (!id) {
 // concurrent remote edit conflict resolves by timestamp.
 syncMeta.lastModified = Date.now();
 
-const message = clone(target);
+let message;
+
+try {
+    message = clone(target);
+} catch (error) {
+    // A malformed/native extension object must never crash the token hot path.
+    warn(
+        '[MCS] unable to clone streaming message; skipping this stream frame',
+        error,
+    );
+    return;
+}
+
 id = messageId(message);
 if (!id) return;
 
@@ -5930,17 +7154,45 @@ function onGenerationEnded() {
 
     if (groupWrapperDepth > 0) return;
 
-    generationTerminalPhase = 'completed';
-    clearGenerationTerminalTimer();
-    generationTerminalTimer = safeSetTimer(() => {
-        generationTerminalTimer = null;
-        if (!localGeneration || localGeneration.generationId !== generationId) return;
-        if (generationIsStopRequested(generationId)) {
-            void sendGenerationTerminal('stopped').catch(error => warn('stopped terminal after late stop failed', error));
-            return;
-        }
-        void sendGenerationTerminal('completed').catch(error => warn('completed terminal failed', error));
-    }, GENERATION_CONTINUATION_GRACE_MS);
+generationTerminalPhase = 'completed';
+clearGenerationTerminalTimer();
+
+generationTerminalTimer = safeSetTimer(() => {
+    generationTerminalTimer = null;
+
+    if (
+        !localGeneration ||
+        localGeneration.generationId !== generationId
+    ) {
+        return;
+    }
+
+    if (terminalizingGenerationId === generationId) {
+        return;
+    }
+
+    if (generationIsStopRequested(generationId)) {
+        generationTerminalPhase = 'stopped';
+
+        void sendGenerationTerminal('stopped')
+            .catch(error => warn(
+                'stopped terminal after late stop failed',
+                error,
+            ));
+
+        return;
+    }
+
+    if (generationTerminalPhase !== 'completed') {
+        return;
+    }
+
+    void sendGenerationTerminal('completed')
+        .catch(error => warn(
+            'completed terminal failed',
+            error,
+        ));
+}, GENERATION_CONTINUATION_GRACE_MS);
 }
 
 function onGenerationStopped() {
@@ -5978,25 +7230,65 @@ function onGroupWrapperFinished() {
     const generationId = localGeneration.generationId;
     clearGenerationTerminalTimer();
 
-    if (generationIsStopRequested(generationId) || generationTerminalPhase === 'stopped') {
-        generationTerminalPhase = 'stopped';
-        generationTerminalTimer = safeSetTimer(() => {
-            generationTerminalTimer = null;
-            if (localGeneration?.generationId !== generationId) return;
-            void sendGenerationTerminal('stopped').catch(error => warn('group stopped terminal failed', error));
-        }, 60);
-    } else {
-        generationTerminalPhase = 'completed';
-        generationTerminalTimer = safeSetTimer(() => {
-            generationTerminalTimer = null;
-            if (!localGeneration || localGeneration.generationId !== generationId) return;
-            if (generationIsStopRequested(generationId)) {
-                void sendGenerationTerminal('stopped').catch(error => warn('group late-stop terminal failed', error));
-            } else {
-                void sendGenerationTerminal('completed').catch(error => warn('group completed terminal failed', error));
-            }
-        }, GENERATION_CONTINUATION_GRACE_MS);
-    }
+if (
+    generationIsStopRequested(generationId) ||
+    generationTerminalPhase === 'stopped'
+) {
+    generationTerminalPhase = 'stopped';
+
+    generationTerminalTimer = safeSetTimer(() => {
+        generationTerminalTimer = null;
+
+        if (
+            localGeneration?.generationId !== generationId ||
+            terminalizingGenerationId === generationId
+        ) {
+            return;
+        }
+
+        void sendGenerationTerminal('stopped')
+            .catch(error => warn(
+                'group stopped terminal failed',
+                error,
+            ));
+    }, 60);
+} else {
+    generationTerminalPhase = 'completed';
+
+    generationTerminalTimer = safeSetTimer(() => {
+        generationTerminalTimer = null;
+
+        if (
+            !localGeneration ||
+            localGeneration.generationId !== generationId ||
+            terminalizingGenerationId === generationId
+        ) {
+            return;
+        }
+
+        if (generationIsStopRequested(generationId)) {
+            generationTerminalPhase = 'stopped';
+
+            void sendGenerationTerminal('stopped')
+                .catch(error => warn(
+                    'group late-stop terminal failed',
+                    error,
+                ));
+
+            return;
+        }
+
+        if (generationTerminalPhase !== 'completed') {
+            return;
+        }
+
+        void sendGenerationTerminal('completed')
+            .catch(error => warn(
+                'group completed terminal failed',
+                error,
+            ));
+    }, GENERATION_CONTINUATION_GRACE_MS);
+}
 
     updateGenerationUi();
 }
@@ -6053,45 +7345,125 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
         return queued;
     }
 
-    let run;
+const publishKey =
+    `${makeScopeKey(scopeAtEvent)}:${epochAtEvent}`;
 
-    run = publishChain.then(async () => {
-        if (scopeEpoch !== epochAtEvent || scopeKeyValue !== makeScopeKey(scopeAtEvent)) return false;
-        if (!nativeScopeStable(scopeAtEvent)) return false;
-        if (localGeneration && makeScopeKey(localGenerationScope) === makeScopeKey(scopeAtEvent) && !allowDuringGeneration) return false;
-        if (localGeneration && generationIsStopRequested(localGeneration.generationId)) return false;
-        if (localGeneration && localGeneration.phase === 'streaming' && allowDuringGeneration) return false;
+const previousChain =
+    publishChains.get(publishKey) ||
+    Promise.resolve();
 
-        activeLocalPublishPromise = run;
-        try {
-            const deltaResult = await publishLocalDelta({ scope: scopeAtEvent, opId: newId(), mutationVersion });
-            if (deltaResult.ok) return true;
-            if (deltaResult.abandoned || deltaResult.ambiguous) return false;
+let run;
 
-            // Definitive fallback (conflict, metadata change, bulk edit): a
-            // DIFFERENT payload is a NEW logical operation — new opId. Capture
-            // the chat NOW, not at event-callback time.
-            if (scopeEpoch !== epochAtEvent || scopeKeyValue !== makeScopeKey(scopeAtEvent) || !nativeScopeStable(scopeAtEvent)) {
-                return false;
-            }
+run = previousChain.then(async () => {
+    if (
+        scopeEpoch !== epochAtEvent ||
+        scopeKeyValue !== makeScopeKey(scopeAtEvent)
+    ) {
+        return false;
+    }
 
-            const currentSnapshot = syncSnapshot(durableSnapshot());
-            return await publishLocalSnapshot(currentSnapshot, {
+    if (!nativeScopeStable(scopeAtEvent)) {
+        return false;
+    }
+
+    if (
+        localGeneration &&
+        makeScopeKey(localGenerationScope) ===
+            makeScopeKey(scopeAtEvent) &&
+        !allowDuringGeneration
+    ) {
+        return false;
+    }
+
+    if (
+        localGeneration &&
+        generationIsStopRequested(
+            localGeneration.generationId,
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        localGeneration &&
+        localGeneration.phase === 'streaming' &&
+        allowDuringGeneration
+    ) {
+        return false;
+    }
+
+    activeLocalPublishPromise = run;
+    activeLocalPublishScopeKey = publishKey;
+
+    try {
+        const deltaResult = await publishLocalDelta({
+            scope: scopeAtEvent,
+            opId: newId(),
+            mutationVersion,
+        });
+
+        if (deltaResult.ok) return true;
+
+        if (
+            deltaResult.abandoned ||
+            deltaResult.ambiguous
+        ) {
+            return false;
+        }
+
+        if (
+            scopeEpoch !== epochAtEvent ||
+            scopeKeyValue !== makeScopeKey(scopeAtEvent) ||
+            !nativeScopeStable(scopeAtEvent)
+        ) {
+            return false;
+        }
+
+        const currentSnapshot =
+            syncSnapshot(durableSnapshot());
+
+        return await publishLocalSnapshot(
+            currentSnapshot,
+            {
                 allowDuringGeneration,
                 scope: scopeAtEvent,
                 opId: newId(),
-                expectedMutationVersion: mutationVersion,
-            });
-        } catch (error) {
-            warn('publish after local event failed', error);
-            return false;
-        } finally {
-            if (activeLocalPublishPromise === run) activeLocalPublishPromise = null;
-        }
-    });
+                expectedMutationVersion:
+                    mutationVersion,
+            },
+        );
+    } catch (error) {
+        warn(
+            'publish after local event failed',
+            error,
+        );
 
-    publishChain = run.then(() => undefined, error => warn('local publish chain failed', error));
-    return run;
+        return false;
+    } finally {
+        if (activeLocalPublishPromise === run) {
+            activeLocalPublishPromise = null;
+            activeLocalPublishScopeKey = '';
+        }
+    }
+});
+
+const chain = run.then(
+    () => undefined,
+    error => warn(
+        'local publish chain failed',
+        error,
+    ),
+);
+
+publishChains.set(publishKey, chain);
+
+void chain.finally(() => {
+    if (publishChains.get(publishKey) === chain) {
+        publishChains.delete(publishKey);
+    }
+});
+
+return run;
 }
 
 // Noisy render-adjacent events (edit-box rerenders, reasoning panels) are
@@ -6402,63 +7774,162 @@ function wireUiGuards() {
 }
 
 async function waitForRemoteStopConfirmation(scope, generationId, epoch) {
-    for (let attempt = 0; attempt < REMOTE_STOP_CONFIRM_ATTEMPTS; attempt += 1) {
-        if (!currentScopeGuard(epoch)) return false;
+    let lastSeenRevision =
+        Number(serverState?.revision || 0);
+
+    for (
+        let attempt = 0;
+        attempt < REMOTE_STOP_CONFIRM_ATTEMPTS;
+        attempt += 1
+    ) {
+        if (!currentScopeGuard(epoch)) {
+            return false;
+        }
 
         try {
-            // Revision-based comparison only: never compare a server timestamp
-            // against the local machine's clock.
-            const revisionAtRequest = Number(serverState?.revision || 0);
+            const result = await api(
+                '/state',
+                'POST',
+                {
+                    scope,
+                    clientId,
+                    deviceId,
+                    connectionId:
+                        membershipConnectionId,
+                },
+                '',
+                {
+                    timeoutMs:
+                        STOP_API_TIMEOUT_MS,
+                },
+            );
 
-            const result = await api('/state', 'POST', {
-                scope,
-                clientId,
-                deviceId,
-                connectionId: membershipConnectionId,
-            }, '', { timeoutMs: STOP_API_TIMEOUT_MS });
+            if (!currentScopeGuard(epoch)) {
+                return false;
+            }
 
-            if (!currentScopeGuard(epoch)) return false;
+            const incomingState =
+                result?.state || null;
 
-            serverState = result.state;
-            const generation = result.state?.generation || null;
+            if (!incomingState) {
+                await sleep(
+                    REMOTE_STOP_CONFIRM_MS,
+                );
+                continue;
+            }
+
+            const incomingRevision =
+                Number(
+                    incomingState.revision || 0,
+                );
+
+            // Never let an older confirmation poll overwrite a newer SSE/API
+            // state that this tab has already accepted.
+            if (incomingRevision < lastSeenRevision) {
+                await sleep(
+                    REMOTE_STOP_CONFIRM_MS,
+                );
+                continue;
+            }
+
+            lastSeenRevision = Math.max(
+                lastSeenRevision,
+                incomingRevision,
+            );
+
+            const currentRevision =
+                Number(
+                    serverState?.revision || 0,
+                );
+
+            if (
+                incomingRevision >=
+                currentRevision
+            ) {
+                serverState = incomingState;
+            }
+
+            const generation =
+                incomingState.generation || null;
 
             if (!generation) {
-                rememberTerminatedGeneration(generationId);
+                rememberTerminatedGeneration(
+                    generationId,
+                );
+
                 remoteStopGenerationId = null;
                 updateGenerationUi();
                 return true;
             }
 
-            if (generation.generationId !== generationId) {
-                const replacementRevision = Number(result.state?.revision || 0);
-                const replacementIsNewer = replacementRevision >= revisionAtRequest;
-                if (replacementIsNewer && generationActive(generation)) {
-                    rememberTerminatedGeneration(generationId);
-                    remoteStopGenerationId = generation.generationId;
+            if (
+                generation.generationId !==
+                generationId
+            ) {
+                // A newly created generation necessarily advances the
+                // authoritative revision. Equal revision is not enough proof.
+                if (
+                    incomingRevision >
+                        currentRevision &&
+                    generationActive(
+                        generation,
+                    )
+                ) {
+                    rememberTerminatedGeneration(
+                        generationId,
+                    );
+
+                    remoteStopGenerationId =
+                        generation.generationId;
+
                     updateGenerationUi();
                     return true;
                 }
-                return false;
+
+                await sleep(
+                    REMOTE_STOP_CONFIRM_MS,
+                );
+                continue;
             }
 
             if (generation.stopRequested) {
-                rememberStopRequestedGeneration(generationId);
-                remoteStopGenerationId = generationId;
+                rememberStopRequestedGeneration(
+                    generationId,
+                );
+
+                remoteStopGenerationId =
+                    generationId;
+
                 updateGenerationUi();
                 return true;
             }
 
-            const phase = String(generation.phase || '').toLowerCase();
-            if (terminalGenerationPhases.has(phase) && generation.generationId === generationId) {
-                rememberTerminatedGeneration(generationId);
+            const phase = String(
+                generation.phase || '',
+            ).toLowerCase();
+
+            if (
+                terminalGenerationPhases.has(
+                    phase,
+                )
+            ) {
+                rememberTerminatedGeneration(
+                    generationId,
+                );
+
                 updateGenerationUi();
                 return true;
             }
         } catch (error) {
-            log('remote stop confirmation poll failed', error);
+            log(
+                'remote stop confirmation poll failed',
+                error,
+            );
         }
 
-        await sleep(REMOTE_STOP_CONFIRM_MS);
+        await sleep(
+            REMOTE_STOP_CONFIRM_MS,
+        );
     }
 
     return false;
@@ -6620,9 +8091,24 @@ if (localGeneration) {
             const confirmationState = confirmation?.state || null;
             const confirmationGeneration = confirmationState?.generation || null;
 
-            if (confirmationState && currentScopeGuard(epochAtRequest)) {
-                serverState = confirmationState;
-            }
+if (
+    confirmationState &&
+    currentScopeGuard(epochAtRequest)
+) {
+    const incomingRevision =
+        Number(
+            confirmationState.revision || 0,
+        );
+
+    const currentRevision =
+        Number(
+            serverState?.revision || 0,
+        );
+
+    if (incomingRevision >= currentRevision) {
+        serverState = confirmationState;
+    }
+}
 
             if (
                 confirmationState &&
@@ -6726,24 +8212,67 @@ async function releaseGenerationClaim(phase = 'stopped') {
             baseSnapshot = result.state.snapshot;
         }
 
-        if (result.success) {
-            rememberTerminatedGeneration(generation.generationId);
+if (result.success) {
+    rememberTerminatedGeneration(
+        generation.generationId,
+    );
 
-            if (mutationVersionAtStart === localMutationVersion) {
-                clearLocalDirty(scopeAtGeneration);
-            }
+    if (
+        mutationVersionAtStart === localMutationVersion
+    ) {
+        clearLocalDirty(scopeAtGeneration);
+    } else {
+        // A local edit happened after terminalization began. The terminal
+        // snapshot therefore cannot be considered authoritative for that edit.
+        markLocalDirty(scopeAtGeneration);
 
-            clearLocalGenerationState();
-            updateGenerationUi();
+        try {
+            refreshLiveContext();
 
-            // A failed/ambiguous publish may have left durable work behind.
-            // Flush it now that the generation has definitely released.
-            void flushQueue().catch(error => {
-                warn('[MCS] queue flush after generation release failed', error);
-            });
+            const latestSnapshot =
+                syncSnapshot(
+                    durableSnapshot(),
+                );
 
-            return true;
+            await enqueueSnapshot(
+                latestSnapshot,
+                Number(
+                    serverState?.revision || 0,
+                ),
+                serverState?.snapshot ||
+                    localGenerationBaseSnapshot || {
+                        messages: [],
+                        metadata: {},
+                    },
+                scopeAtGeneration,
+                'snapshot',
+                null,
+                newId(),
+            );
+
+            scheduleQueueFlushRetry();
+        } catch (queueError) {
+            warn(
+                '[MCS] failed to queue mutation made during generation release',
+                queueError,
+            );
         }
+    }
+
+    clearLocalGenerationState();
+    terminalizingGenerationId = null;
+
+    updateGenerationUi();
+
+    void flushQueue().catch(error => {
+        warn(
+            '[MCS] queue flush after generation release failed',
+            error,
+        );
+    });
+
+    return true;
+}
 
         terminalizingGenerationId = null;
         generationTerminalPhase = phase;
@@ -6794,15 +8323,35 @@ async function sendGenerationTerminal(phase = 'completed') {
     const epochAtGeneration = localGenerationEpoch || scopeEpoch;
     const mutationVersionAtStart = localMutationVersion;
 
-    if (terminalizingGenerationId === g.generationId) return false;
+if (terminalizingGenerationId === g.generationId) {
+    return false;
+}
 
-    if (generationIsStopRequested(g.generationId)) phase = 'stopped';
-    if (generationStartPromiseId === g.generationId && generationStartPromise) {
-        try { await generationStartPromise; } catch { /* ignore */ }
+if (generationIsStopRequested(g.generationId)) {
+    phase = 'stopped';
+}
+
+// Set this BEFORE waiting for an in-flight start request. This prevents the
+// start path from establishing readiness after terminalization has begun.
+terminalizingGenerationId = g.generationId;
+
+stopGenerationHeartbeat();
+clearGenerationTerminalTimer();
+clearTerminalRetryTimer();
+
+if (
+    generationStartPromiseId === g.generationId &&
+    generationStartPromise
+) {
+    try {
+        await Promise.race([
+            generationStartPromise,
+            sleep(2500),
+        ]);
+    } catch {
+        /* terminalization remains authoritative */
     }
-
-    terminalizingGenerationId = g.generationId;
-    stopGenerationHeartbeat();
+}
     clearGenerationStreamWork(g.generationId);
 
     // Abort the in-flight stream transport: the last token must never race
@@ -6910,10 +8459,30 @@ async function onActivate() {
         unwireUiGuards();
         uninstallRemoteUiObserver();
 
-        try { bc?.close?.(); } catch { /* ignore */ }
-        bc = 'BroadcastChannel' in window ? new BroadcastChannel(BC_NAME) : null;
+try {
+    bc?.close?.();
+} catch {
+    /* ignore */
+}
 
-        bc?.addEventListener('message', message => {
+bc = null;
+
+try {
+    if (typeof BroadcastChannel === 'function') {
+        bc = new BroadcastChannel(BC_NAME);
+    }
+} catch (error) {
+    // Sync must continue via SSE/API when BroadcastChannel is blocked by the
+    // browser, private mode, permissions policy, or site-storage restrictions.
+    bc = null;
+
+    log(
+        '[MCS] BroadcastChannel unavailable; continuing without tab wakeups',
+        error,
+    );
+}
+
+bc?.addEventListener('message', message => {
             const data = message.data;
             if (data?.scopeKey !== scopeKeyValue) return;
 
