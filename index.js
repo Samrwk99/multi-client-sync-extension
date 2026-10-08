@@ -1793,11 +1793,53 @@ function setSendLock(reason = '') {
 
 function isRemoteGenerationActive() {
     const g = serverState?.generation;
-    if (!generationActive(g)) return false;
-    if (generationClaimInFlightId && g.generationId === generationClaimInFlightId) return false;
-    if (generationIsStaleOwned(g)) return false;
-    if (localGeneration && g.generationId === localGeneration.generationId) return false;
-    if (generationIsMine(g) && localGeneration) return false;
+
+    if (!generationActive(g)) {
+        return false;
+    }
+
+    const generationId = String(
+        g.generationId || '',
+    );
+
+    if (!generationId) {
+        return false;
+    }
+
+    // A generation that this client has just claimed is not remote, even
+    // before localGeneration has been fully installed.
+    if (
+        generationClaimInFlightId &&
+        generationId === String(
+            generationClaimInFlightId,
+        )
+    ) {
+        return false;
+    }
+
+    // A server generation owned by this client is NEVER a remote generation.
+    // This is important during reconnect/recovery, where serverState can
+    // still contain our generation while localGeneration is temporarily null.
+    if (generationIsMine(g)) {
+        return false;
+    }
+
+    // A locally tracked generation is also never remote.
+    if (
+        localGeneration &&
+        generationId === String(
+            localGeneration.generationId || '',
+        )
+    ) {
+        return false;
+    }
+
+    // Do not block native Send controls based on a stale same-client lease
+    // that the server no longer considers authoritative.
+    if (generationIsStaleOwned(g)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -7814,7 +7856,19 @@ function wireUiGuards() {
             markManualGenerationRequest();
         }
 
-        if (!isRemoteGenerationActive()) return;
+if (!isRemoteGenerationActive()) return;
+
+// Never let stale remote-generation state block native SillyTavern input
+// while this tab is still transitioning/reconnecting its shared scope.
+// The server/SSE state will be reconciled before generation coordination
+// takes effect again.
+if (
+    !currentScope ||
+    !nativeScopeStable(currentScope) ||
+    !sseIsOpen()
+) {
+    return;
+}
 
         const mutationTarget = event.target.closest(remoteMutationGuardSelector());
 
