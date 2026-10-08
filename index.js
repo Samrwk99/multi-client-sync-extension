@@ -31,6 +31,9 @@ const CHUNK_MAX_BYTES = 512 * 1024;
 // Headroom above the server's 12 MiB snapshot limit: the event envelope can
 // push a legal snapshot past the assembly ceiling.
 const MAX_CHUNK_ASSEMBLY_BYTES = 12 * 1024 * 1024 + 256 * 1024;
+// Absolute bound on chunks per transfer; also cross-checked against
+// totalBytes so a lying chunkCount can never wedge an assembly.
+const MAX_CHUNK_COUNT = 256;
 const MAX_CHUNK_ASSEMBLIES = 8;
 const CHUNK_ASSEMBLY_TIMEOUT_MS = 30_000;
 const MAX_CHUNK_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -56,6 +59,31 @@ const forbiddenKeys = new Set(['__proto__', 'prototype', 'constructor']);
 const terminalGenerationPhases = new Set(['completed', 'stopped', 'failed', 'terminal']);
 const quietGenerationTypes = new Set(['quiet', 'quiet_escape', 'background']);
 
+function normalizeSettings(incoming) {
+    const source = incoming && typeof incoming === 'object' ? incoming : {};
+    // Malformed persisted values never become program state: anything that is
+    // not an explicit boolean falls back to the default.
+    const bool = key => (typeof source[key] === 'boolean' ? source[key] : DEFAULT_SETTINGS[key]);
+    return {
+        enabled: bool('enabled'),
+        autoConnect: bool('autoConnect'),
+        syncMessages: bool('syncMessages'),
+        syncMetadata: bool('syncMetadata'),
+        coordinateGeneration: bool('coordinateGeneration'),
+        remoteStop: bool('remoteStop'),
+        notifications: bool('notifications'),
+        debug: bool('debug'),
+    };
+}
+
+function loadSettings() {
+    try {
+        return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
+    } catch {
+        return { ...DEFAULT_SETTINGS };
+    }
+}
+
 let settings = loadSettings();
 
 let clientId = loadSessionId(CLIENT_KEY);
@@ -67,6 +95,11 @@ let eventSource = null;
 let currentScope = null;
 let scopeKeyValue = '';
 let scopeEpoch = 0;
+// scopeEpoch = distributed connection lifetime.
+// nativeLoadEpoch = native ST chat-load lifetime. The two can move
+// independently (a reconnect keeps the same native chat; a chat switch can
+// race an in-flight reconciliation), so both must be captured and checked.
+let nativeLoadEpoch = 0;
 let serverState = null;
 let baseSnapshot = null;
 let applyingRemoteDepth = 0;
@@ -78,6 +111,7 @@ let generationStartRetryTimer = null;
 let streamTimer = null;
 let streamInFlight = false;
 let streamInFlightPromise = null;
+let streamAbortController = null;
 let remoteRenderTimer = null;
 let lastStreamSentAt = 0;
 let pendingStream = null;
@@ -105,6 +139,9 @@ let heartbeatTimer = null;
 let generationHeartbeatTimer = null;
 let settingsPanelMounted = false;
 let bc = null;
+// Exact membership connection identity: a delayed /leave or /heartbeat from
+// a previous connection must never evict the current membership.
+let membershipConnectionId = null;
 let localGenerationScope = null;
 let localGenerationEpoch = 0;
 let localGenerationBaseSnapshot = null;
@@ -127,6 +164,9 @@ let streamInFlightSeq = 0;
 let streamRetryTimer = null;
 let streamCaptureTimer = null;
 let resyncChain = Promise.resolve();
+let resyncInFlight = null;
+let resyncInFlightKey = '';
+let localPublishTimer = null;
 let queueFlushChain = Promise.resolve();
 let nativeMembershipHeartbeatInFlight = null;
 let nativeHeartbeatRequestSeq = 0;
@@ -170,7 +210,18 @@ function warn(...args) {
 }
 
 function clone(value) {
-    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+    if (value === undefined) return undefined;
+    try {
+        return structuredClone(value);
+    } catch {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch (error) {
+            // Silently converting application state into null is more
+            // dangerous than an explicit failure the caller can catch.
+            throw new Error(`MCS clone failed: ${error?.message || 'invalid value'}`);
+        }
+    }
 }
 
 function sleep(ms) {
@@ -186,21 +237,27 @@ function utf8ByteLength(value) {
     return new Blob([JSON.stringify(value)]).size;
 }
 
-function stableStringify(value) {
-    const normalize = input => {
-        if (Array.isArray(input)) return input.map(normalize);
-        if (input && typeof input === 'object') {
-            const out = {};
-            for (const key of Object.keys(input).sort()) {
-                if (forbiddenKeys.has(key)) continue;
-                const val = input[key];
-                if (val !== undefined) out[key] = normalize(val);
+function stableStringify(value, depth = 0, seen = new WeakSet()) {
+    if (depth > 32) throw new Error('MCS serialization depth exceeded');
+    if (value && typeof value === 'object') {
+        if (seen.has(value)) throw new Error('MCS circular data detected');
+        seen.add(value);
+        try {
+            if (Array.isArray(value)) {
+                return `[${value.map(item => stableStringify(item, depth + 1, seen)).join(',')}]`;
             }
-            return out;
+            const parts = [];
+            for (const key of Object.keys(value).sort()) {
+                if (forbiddenKeys.has(key)) continue;
+                const val = value[key];
+                if (val !== undefined) parts.push(`${JSON.stringify(key)}:${stableStringify(val, depth + 1, seen)}`);
+            }
+            return `{${parts.join(',')}}`;
+        } finally {
+            seen.delete(value);
         }
-        return input;
-    };
-    return JSON.stringify(normalize(value));
+    }
+    return JSON.stringify(value) ?? 'null';
 }
 
 function deepEqual(a, b) {
@@ -225,15 +282,6 @@ function loadSessionId(key) {
     const value = crypto.randomUUID();
     try { sessionStorage.setItem(key, value); } catch { /* ignore */ }
     return value;
-}
-
-function loadSettings() {
-    try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-        return { ...DEFAULT_SETTINGS, ...(stored && typeof stored === 'object' ? stored : {}) };
-    } catch {
-        return { ...DEFAULT_SETTINGS };
-    }
 }
 
 function saveSettings() {
@@ -399,7 +447,8 @@ function ensureMessageIds(messages) {
 }
 
 function messageId(message) {
-    return message?.extra?.multi_client_sync?.messageId || null;
+    const id = message?.extra?.multi_client_sync?.messageId;
+    return typeof id === 'string' ? id : null;
 }
 
 function messageSyncMeta(message) {
@@ -407,7 +456,27 @@ function messageSyncMeta(message) {
 }
 
 function messageLastModified(message) {
-    return Number(messageSyncMeta(message).lastModified || message?.send_date || message?.gen_started || 0);
+    const meta = messageSyncMeta(message);
+    const candidates = [
+        meta.lastModified,
+        message?.send_date,
+        message?.gen_started,
+        message?.gen_started_at,
+    ];
+
+    for (const raw of candidates) {
+        if (raw == null) continue;
+
+        const numeric = Number(raw);
+        if (Number.isFinite(numeric) && numeric > 0) return numeric;
+
+        if (typeof raw === 'string') {
+            const parsed = Date.parse(raw);
+            if (Number.isFinite(parsed) && parsed > 0) return parsed;
+        }
+    }
+
+    return 0;
 }
 
 function durableMessages({ persistIds = true } = {}) {
@@ -846,11 +915,13 @@ function comparableHash(message) {
     return `${fnv1a(s, 0x811c9dc5).toString(16).padStart(8, '0')}${fnv1a(s, 0x9747b28c).toString(16).padStart(8, '0')}`;
 }
 
+// Null-prototype ledger: message IDs are arbitrary strings and must never
+// resolve through Object.prototype.
 function readLedger(metadata) {
     const meta = metadata?.[MCS_META_KEY];
     const tomb = meta?.tombstones;
-    if (!tomb || typeof tomb !== 'object' || Array.isArray(tomb)) return {};
-    const out = {};
+    if (!tomb || typeof tomb !== 'object' || Array.isArray(tomb)) return Object.create(null);
+    const out = Object.create(null);
     for (const [key, value] of Object.entries(tomb)) {
         if (forbiddenKeys.has(key)) continue;
         const ts = Number(value);
@@ -903,7 +974,7 @@ function stampLocalMutations() {
     let changed = false;
 
     for (const id of lastSyncedMessageMap.keys()) {
-        if (!currentHashes.has(id) && !tomb[id]) {
+        if (!Object.hasOwn(currentHashes, id) && !Object.hasOwn(tomb, id)) {
             tomb[id] = nowTs;
             changed = true;
         }
@@ -922,13 +993,13 @@ function stampLocalMutations() {
 
     const cutoff = nowTs - TOMBSTONE_RETENTION_MS;
     for (const id of Object.keys(tomb)) {
-        if (tomb[id] < cutoff || currentHashes.has(id)) {
+        if (tomb[id] < cutoff || Object.hasOwn(currentHashes, id)) {
             delete tomb[id];
             changed = true;
         }
     }
 
-    if (changed) bucket.tombstones = tomb;
+    if (changed) bucket.tombstones = JSON.parse(JSON.stringify(tomb));
 }
 
 // ---------------------------------------------------------------------------
@@ -962,8 +1033,12 @@ function validateChunkEnvelope(data) {
     if (!Number.isInteger(data.logicalEventId) || data.logicalEventId < 0) return 'bad_logical_event_id';
     if (!Number.isInteger(data.chunkIndex) || data.chunkIndex < 0) return 'bad_chunk_index';
     if (!Number.isInteger(data.chunkCount) || data.chunkCount <= 0) return 'bad_chunk_count';
+    if (data.chunkCount > MAX_CHUNK_COUNT) return 'bad_chunk_count';
     if (data.chunkIndex >= data.chunkCount) return 'chunk_index_overflow';
     if (!Number.isInteger(data.totalBytes) || data.totalBytes <= 0 || data.totalBytes > MAX_CHUNK_ASSEMBLY_BYTES) return 'bad_total_bytes';
+    // chunkCount must be sufficient to carry totalBytes at the per-chunk cap;
+    // a lying count can never wedge an assembly open forever.
+    if (Math.ceil(data.totalBytes / CHUNK_MAX_BYTES) > data.chunkCount) return 'bad_chunk_count';
     if (!Number.isInteger(data.chunkBytes) || data.chunkBytes <= 0 || data.chunkBytes > CHUNK_MAX_BYTES) return 'bad_chunk_bytes';
     if (typeof data.eventSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(data.eventSha256)) return 'bad_event_hash';
     if (typeof data.chunkSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(data.chunkSha256)) return 'bad_chunk_hash';
@@ -1036,8 +1111,6 @@ async function handleEventChunk(data) {
             return failResync();
         }
 
-        if (assembly.chunks.has(data.chunkIndex)) return null;
-
         const chunkBytes = base64ToArrayBuffer(data.payload);
         if (chunkBytes.byteLength !== data.chunkBytes) {
             warn('chunk byte length mismatch');
@@ -1049,7 +1122,16 @@ async function handleEventChunk(data) {
             return failResync();
         }
 
-        assembly.chunks.set(data.chunkIndex, chunkBytes);
+        // A duplicate chunk index must be byte-identical: a conflicting
+        // duplicate is a corrupt transfer, never a silent ignore.
+        const existing = assembly.chunks.get(data.chunkIndex);
+        if (existing) {
+            if (existing.hash === chunkHash) return null;
+            warn('conflicting duplicate chunk', data.transferId, data.chunkIndex);
+            return failResync();
+        }
+
+        assembly.chunks.set(data.chunkIndex, { bytes: chunkBytes, hash: chunkHash });
         assembly.receivedBytes += chunkBytes.byteLength;
 
         if (assembly.chunks.size < assembly.chunkCount) return null;
@@ -1057,10 +1139,10 @@ async function handleEventChunk(data) {
         const ordered = [];
         let totalLen = 0;
         for (let i = 0; i < assembly.chunkCount; i += 1) {
-            const buf = assembly.chunks.get(i);
-            if (!buf) { warn('missing chunk after completion', i); return failResync(); }
-            ordered.push(buf);
-            totalLen += buf.byteLength;
+            const chunk = assembly.chunks.get(i);
+            if (!chunk) { warn('missing chunk after completion', i); return failResync(); }
+            ordered.push(chunk.bytes);
+            totalLen += chunk.bytes.byteLength;
         }
         if (totalLen !== assembly.totalBytes) { warn('reconstructed byte count mismatch'); return failResync(); }
 
@@ -1388,6 +1470,17 @@ async function api(path, method = 'GET', body = undefined, query = '', options =
 
 function currentScopeGuard(epoch) {
     return epoch === scopeEpoch && scopeKeyValue === makeScopeKey(currentScope);
+}
+
+// Core concurrency invariant: after any await, a destructive operation must
+// confirm the distributed epoch, the native scope, AND the native chat-load
+// epoch are all unchanged before side effects.
+function asyncScopeStillCurrent(epoch, expectedScope, nativeEpoch = null) {
+    if (!currentScopeGuard(epoch)) return false;
+    if (!currentScope || !expectedScope) return false;
+    if (makeScopeKey(currentScope) !== makeScopeKey(expectedScope)) return false;
+    if (nativeEpoch != null && nativeLoadEpoch !== nativeEpoch) return false;
+    return true;
 }
 
 // Compact server responses (generation heartbeat/started/stream/stop, delta
@@ -1787,7 +1880,10 @@ function clearRemoteStreamState() {
     suppressedRemoteStreamMessageIds.clear();
 }
 
-function mergeMetadata(base, local, remote) {
+// Bounded-depth three-way metadata merge: depth capping prevents pathological
+// (or hostile) nesting from blowing the stack; semantics are unchanged.
+function mergeMetadata(base, local, remote, depth = 0) {
+    if (depth > 32) return clone(remote);
     if (deepEqual(local, base)) return clone(remote);
     if (deepEqual(remote, base)) return clone(local);
     if (deepEqual(local, remote)) return clone(local);
@@ -1811,7 +1907,7 @@ function mergeMetadata(base, local, remote) {
 
         if (deepEqual(l, b)) out[key] = clone(r);
         else if (deepEqual(r, b)) out[key] = clone(l);
-        else if (l && r && typeof l === 'object' && typeof r === 'object') out[key] = mergeMetadata(b, l, r);
+        else if (l && r && typeof l === 'object' && typeof r === 'object') out[key] = mergeMetadata(b, l, r, depth + 1);
         else out[key] = clone(r);
     }
 
@@ -1936,10 +2032,10 @@ function mergeSnapshots(base, local, remote) {
     const remoteTomb = readLedger(r.metadata);
     const baseTomb = readLedger(b.metadata);
 
-    const mergedTomb = {};
+    const mergedTomb = Object.create(null);
     for (const source of [baseTomb, localTomb, remoteTomb]) {
         for (const [id, ts] of Object.entries(source)) {
-            if (!mergedTomb[id] || ts > mergedTomb[id]) mergedTomb[id] = ts;
+            if (!Object.hasOwn(mergedTomb, id) || ts > mergedTomb[id]) mergedTomb[id] = ts;
         }
     }
 
@@ -1953,8 +2049,8 @@ function mergeSnapshots(base, local, remote) {
         const rv = rm.get(id);
 
         const mid = id.startsWith('id:') ? id.slice(3) : null;
-        const lt = mid ? (localTomb[mid] || null) : null;
-        const rt = mid ? (remoteTomb[mid] || null) : null;
+        const lt = mid ? (Object.hasOwn(localTomb, mid) ? localTomb[mid] : null) : null;
+        const rt = mid ? (Object.hasOwn(remoteTomb, mid) ? remoteTomb[mid] : null) : null;
 
         let value = null;
 
@@ -2013,7 +2109,7 @@ function mergeSnapshots(base, local, remote) {
     if (Object.keys(mergedTomb).length) {
         metadata = {
             ...metadata,
-            [MCS_META_KEY]: { ...(metadata[MCS_META_KEY] || {}), tombstones: mergedTomb },
+            [MCS_META_KEY]: { ...(metadata[MCS_META_KEY] || {}), tombstones: JSON.parse(JSON.stringify(mergedTomb)) },
         };
     }
 
@@ -2029,6 +2125,9 @@ async function safeNativeSave(expectedScope = currentScope) {
         if (nativeRestoreInProgress || !ctx || !expectedScope) return false;
         if (localGeneration && makeScopeKey(localGenerationScope) === makeScopeKey(expectedScope)) return false;
         if (!nativeScopeStable(expectedScope)) return false;
+        // A save belonging to a previously loaded chat must never land after
+        // a chat transition.
+        const nativeLoadEpochAtSave = nativeLoadEpoch;
 
         let chatId = '';
         try {
@@ -2058,6 +2157,7 @@ async function safeNativeSave(expectedScope = currentScope) {
         if (expectedScope.kind === 'group') return false;
 
         await sleep(50);
+        if (nativeLoadEpochAtSave !== nativeLoadEpoch) return false;
         if (!nativeScopeStable(expectedScope)) return false;
 
         try {
@@ -2096,6 +2196,7 @@ async function applySnapshotNow(
 
     const expectedKey = makeScopeKey(expectedScope);
     const epochAtStart = scopeEpoch;
+    const nativeLoadEpochAtStart = nativeLoadEpoch;
 
     if (expectedGenerationId) {
         const expectedId = String(expectedGenerationId);
@@ -2143,6 +2244,7 @@ async function applySnapshotNow(
         if (
             save &&
             epochAtStart === scopeEpoch &&
+            nativeLoadEpochAtStart === nativeLoadEpoch &&
             !nativeRestoreInProgress &&
             nativeScopeStable(expectedScope) &&
             makeScopeKey(currentScope) === expectedKey
@@ -2162,7 +2264,12 @@ async function applySnapshotNow(
     } finally {
         applyingRemoteDepth -= 1;
         if (!applied && previousMessages && ctx) {
-            if (scopeEpoch === epochAtStart && currentScope && makeScopeKey(currentScope) === expectedKey) {
+            if (
+                scopeEpoch === epochAtStart &&
+                nativeLoadEpochAtStart === nativeLoadEpoch &&
+                currentScope &&
+                makeScopeKey(currentScope) === expectedKey
+            ) {
                 try {
                     ctx.chat.splice(0, ctx.chat.length, ...previousMessages);
                     if (ctx.chatMetadata && typeof ctx.chatMetadata === 'object') {
@@ -2248,7 +2355,7 @@ function computeDeltaOpsFromLiveChat() {
     }
 
     const bucket = chatSyncMetaBucket();
-    const tombstones = bucket ? readLedger(ctx.chatMetadata) : {};
+    const tombstones = bucket ? readLedger(ctx.chatMetadata) : Object.create(null);
     const nowTs = Date.now();
     const ops = [];
     let previousLocalId = null;
@@ -2283,7 +2390,7 @@ function computeDeltaOpsFromLiveChat() {
 
     // Deletes last: anchors used by surviving messages already exist when applied.
     for (const id of deletedIds) {
-        let deletedAt = Number(tombstones[id] || 0);
+        let deletedAt = Object.hasOwn(tombstones, id) ? Number(tombstones[id]) : 0;
         if (!deletedAt) {
             deletedAt = nowTs;
             tombstones[id] = deletedAt;
@@ -2291,7 +2398,7 @@ function computeDeltaOpsFromLiveChat() {
         ops.push({ op: 'delete', messageId: id, deletedAt });
     }
 
-    if (bucket) bucket.tombstones = tombstones;
+    if (bucket) bucket.tombstones = JSON.parse(JSON.stringify(tombstones));
 
     if (settings.syncMetadata && !deepEqual(
         stripDeltaMetadata(ctx.chatMetadata || {}),
@@ -2316,7 +2423,7 @@ function writeDeltaTombstonesClient(metadata, tombstones) {
         }
         return out;
     }
-    out[MCS_META_KEY] = { ...(out[MCS_META_KEY] || {}), tombstones };
+    out[MCS_META_KEY] = { ...(out[MCS_META_KEY] || {}), tombstones: JSON.parse(JSON.stringify(tombstones)) };
     return out;
 }
 
@@ -2353,7 +2460,7 @@ function applyDeltaToSnapshotFast(baseSnapshot, ops) {
             ensureMetadataCopy();
             const deletedAt = Number(op.deletedAt || Date.now());
             if (!Number.isFinite(deletedAt) || deletedAt <= 0) throw new Error('invalid_delete_timestamp');
-            if (!tombstones[id] || deletedAt > tombstones[id]) tombstones[id] = deletedAt;
+            if (!Object.hasOwn(tombstones, id) || deletedAt > tombstones[id]) tombstones[id] = deletedAt;
             continue;
         }
 
@@ -2363,7 +2470,7 @@ function applyDeltaToSnapshotFast(baseSnapshot, ops) {
             const modifiedAt = Number(op.modifiedAt || Date.now());
             if (!id) throw new Error('message_ids_required');
             if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) throw new Error('invalid_modified_timestamp');
-            if (tombstones[id] && modifiedAt <= tombstones[id]) throw new Error('delta_stale_message');
+            if (Object.hasOwn(tombstones, id) && modifiedAt <= tombstones[id]) throw new Error('delta_stale_message');
 
             const existing = indexById.get(id);
             if (existing !== undefined) {
@@ -2379,7 +2486,7 @@ function applyDeltaToSnapshotFast(baseSnapshot, ops) {
                 messages.splice(insertAt, 0, message);
                 indexById = reindex();
             }
-            if (tombstones[id]) {
+            if (Object.hasOwn(tombstones, id)) {
                 ensureMetadataCopy();
                 delete tombstones[id];
             }
@@ -2416,8 +2523,8 @@ function recordRemoteTombstone(id, timestamp = Date.now()) {
     if (!bucket) return;
     const tombstones = readLedger(ctx.chatMetadata);
     const ts = Number(timestamp);
-    if (!tombstones[id] || ts > tombstones[id]) tombstones[id] = ts;
-    bucket.tombstones = tombstones;
+    if (!Object.hasOwn(tombstones, id) || ts > tombstones[id]) tombstones[id] = ts;
+    bucket.tombstones = JSON.parse(JSON.stringify(tombstones));
 }
 
 // Try a cheap delta publish first. Result {ok, fallback, abandoned, ambiguous}:
@@ -2458,6 +2565,7 @@ async function publishLocalDelta({ scope = currentScope, opId, mutationVersion }
                 scope: scopeAtPublish,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
                 opId: localOpId,
                 baseRevision,
                 ops,
@@ -2474,6 +2582,7 @@ async function publishLocalDelta({ scope = currentScope, opId, mutationVersion }
                     scope: scopeAtPublish,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                 }).catch(() => null);
 
                 const authoritative = confirmation?.state || null;
@@ -2540,6 +2649,7 @@ async function publishLocalDelta({ scope = currentScope, opId, mutationVersion }
             scope: scopeAtPublish,
             clientId,
             deviceId,
+            connectionId: membershipConnectionId,
         });
         const authoritative = confirmation.state;
         serverState = authoritative;
@@ -2701,9 +2811,9 @@ async function handleSnapshotDeltaEvent(data) {
                         const bucket = chatSyncMetaBucket();
                         if (bucket) {
                             const tomb = readLedger(ctx.chatMetadata);
-                            if (tomb[id] && modifiedAt > tomb[id]) {
+                            if (Object.hasOwn(tomb, id) && modifiedAt > tomb[id]) {
                                 delete tomb[id];
-                                bucket.tombstones = tomb;
+                                bucket.tombstones = JSON.parse(JSON.stringify(tomb));
                             }
                         }
                         continue;
@@ -2717,7 +2827,7 @@ async function handleSnapshotDeltaEvent(data) {
                         ctx.chat.splice(currentIndex, 1);
                         let insertAt = 0;
                         if (op.afterMessageId != null) {
-                            const afterIndex = ctx.chat.findIndex(message => messageId(message) === String(op.afterMessageId));
+                            const afterIndex = ctx.chat.findIndex(item => messageId(item) === String(op.afterMessageId));
                             if (afterIndex < 0) throw new Error('delta_move_anchor_missing');
                             insertAt = afterIndex + 1;
                         }
@@ -2796,6 +2906,28 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
     const byteSize = utf8ByteLength(row);
     let existingRows = await idbList(scopeKey);
 
+    // Proactive coalescing: pending normal rows are absolute desired states,
+    // so the newest subsumes the older ones long before capacity is hit.
+    // Keeps the earliest base so conflict merges stay anchored.
+    if (kind === 'snapshot' && !generationId) {
+        const normalSnapshots = existingRows
+            .filter(existing => existing.kind === 'snapshot' && !existing.generationId)
+            .sort((a, b) => (a.queueSequence || 0) - (b.queueSequence || 0));
+
+        if (normalSnapshots.length) {
+            const latest = normalSnapshots[normalSnapshots.length - 1];
+            if (deepEqual(latest.snapshot, row.snapshot)) return;
+
+            const earliest = normalSnapshots[0];
+            row.baseRevision = Math.min(row.baseRevision, Number(earliest.baseRevision || 0));
+            row.baseSnapshot = clone(earliest.baseSnapshot || row.baseSnapshot);
+            for (const old of normalSnapshots) {
+                await idbDelete(old.id);
+            }
+            existingRows = existingRows.filter(existing => !normalSnapshots.includes(existing));
+        }
+    }
+
     const duplicate = existingRows.find(existing =>
         existing.kind === kind &&
         existing.generationId === row.generationId &&
@@ -2850,22 +2982,42 @@ async function sendSnapshotDirect(snapshot, baseRev, opId, scope = currentScope)
         scope: clone(scope),
         clientId,
         deviceId,
+        connectionId: membershipConnectionId,
         opId,
         baseRevision: baseRev,
         snapshot,
     });
 }
 
-async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringGeneration = false, scope = currentScope, opId = null, expectedMutationVersion = null } = {}) {
+async function publishLocalSnapshot(
+    snapshot = durableSnapshot(),
+    {
+        allowDuringGeneration = false,
+        scope = currentScope,
+        opId = null,
+        expectedMutationVersion = null,
+    } = {},
+) {
     if (!scope || !settings.enabled || !syncEnabled()) return false;
     if (!nativeScopeStable(scope)) return false;
-    if (localGeneration && !allowDuringGeneration) return false;
-    if (localGeneration && allowDuringGeneration && localGeneration.phase === 'streaming') return false;
-    if (generationActive(serverState?.generation) && !localGeneration) return false;
 
-    if (deepEqual(snapshot, serverState?.snapshot)) {
-        clearLocalDirty(scope);
-        rebuildLastSyncedMap(snapshot.messages);
+    if (localGeneration && !allowDuringGeneration) return false;
+
+    if (localGeneration && allowDuringGeneration && localGeneration.phase === 'streaming') {
+        return false;
+    }
+
+    if (generationActive(serverState?.generation) && !localGeneration) {
+        return false;
+    }
+
+    const desiredSnapshot = syncSnapshot(snapshot);
+
+    if (deepEqual(desiredSnapshot, serverState?.snapshot)) {
+        if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
+            clearLocalDirty(scope);
+            rebuildLastSyncedMap(desiredSnapshot.messages);
+        }
         return true;
     }
 
@@ -2873,19 +3025,35 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
     const scopeKeyAtPublish = makeScopeKey(scopeAtPublish);
     // Immutable baseline reference: snapshots are never mutated in place, so
     // cloning the baseline is pure memory waste on a large chat.
-    const base = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
+    const baseline = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
     const revision = Number(serverState?.revision || 0);
     const localOpId = opId || newId();
 
     try {
-        const result = await sendSnapshotDirect(snapshot, revision, localOpId, scopeAtPublish);
+        const result = await sendSnapshotDirect(desiredSnapshot, revision, localOpId, scopeAtPublish);
         if (scopeKeyValue !== scopeKeyAtPublish || !currentScope || makeScopeKey(currentScope) !== scopeKeyAtPublish) return false;
         serverState = result.state;
         baseSnapshot = result.state.snapshot;
+
         if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
             clearLocalDirty(scopeAtPublish);
-            rebuildLastSyncedMap(snapshot.messages);
+            rebuildLastSyncedMap(desiredSnapshot.messages);
+        } else {
+            // A newer local mutation happened while the request was in
+            // flight. Never clear its dirty flag — durably capture it.
+            const latest = syncSnapshot(durableSnapshot());
+            await enqueueSnapshot(
+                latest,
+                Number(result.state.revision || 0),
+                result.state.snapshot,
+                scopeAtPublish,
+                'snapshot',
+                null,
+                newId(),
+            );
+            scheduleQueueFlushRetry();
         }
+
         return true;
     } catch (error) {
         if (scopeKeyValue !== scopeKeyAtPublish) return false;
@@ -2894,16 +3062,34 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
             const remoteState = error.payload.state;
             if (error.payload.error === 'generation_active') return false;
 
-            const merged = mergeSnapshots(base, snapshot, remoteState.snapshot);
+            // The request may have actually committed and only the response
+            // was lost: an authoritative snapshot equal to the desired one
+            // proves the commit.
+            if (deepEqual(remoteState.snapshot, desiredSnapshot)) {
+                serverState = remoteState;
+                baseSnapshot = remoteState.snapshot;
+
+                if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
+                    clearLocalDirty(scopeAtPublish);
+                    rebuildLastSyncedMap(desiredSnapshot.messages);
+                }
+
+                return true;
+            }
+
+            const merged = mergeSnapshots(baseline, desiredSnapshot, remoteState.snapshot);
             serverState = remoteState;
             baseSnapshot = remoteState.snapshot;
 
-            const retryBase = Number(remoteState.revision);
+            // The payload changed, therefore it is a NEW logical operation.
+            const retryOpId = deepEqual(merged, desiredSnapshot) ? localOpId : newId();
+
             try {
-                const result = await sendSnapshotDirect(merged, retryBase, localOpId, scopeAtPublish);
-                if (scopeKeyValue !== scopeKeyAtPublish) return false;
+                const result = await sendSnapshotDirect(merged, Number(remoteState.revision), retryOpId, scopeAtPublish);
+                if (scopeKeyValue !== scopeKeyAtPublish || !currentScope || makeScopeKey(currentScope) !== scopeKeyAtPublish) return false;
                 serverState = result.state;
                 baseSnapshot = result.state.snapshot;
+
                 const applied = await applySnapshot(merged, {
                     save: true,
                     render: true,
@@ -2911,29 +3097,84 @@ async function publishLocalSnapshot(snapshot = durableSnapshot(), { allowDuringG
                     clearDirty: false,
                 });
                 if (!applied) return false;
+
                 if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
                     clearLocalDirty(scopeAtPublish);
                     rebuildLastSyncedMap(merged.messages);
+                } else {
+                    const latest = syncSnapshot(durableSnapshot());
+                    await enqueueSnapshot(
+                        latest,
+                        Number(result.state.revision || 0),
+                        result.state.snapshot,
+                        scopeAtPublish,
+                        'snapshot',
+                        null,
+                        newId(),
+                    );
+                    scheduleQueueFlushRetry();
                 }
+
                 return true;
             } catch (retryError) {
                 if (retryError?.status === 409 && retryError?.payload?.error === 'generation_active') return false;
                 await enqueueSnapshot(
                     merged,
-                    retryError?.payload?.state?.revision ?? retryBase,
+                    retryError?.payload?.state?.revision ?? Number(remoteState.revision),
                     retryError?.payload?.state?.snapshot ?? remoteState.snapshot,
                     scopeAtPublish,
                     'snapshot',
                     null,
-                    localOpId,
+                    newId(),
                 );
                 scheduleQueueFlushRetry();
                 return false;
             }
         }
 
+        // Network timeout/connection failure is ambiguous. Confirm
+        // authoritative server state before generating another operation.
+        try {
+            const confirmation = await api('/state', 'POST', {
+                scope: scopeAtPublish,
+                clientId,
+                deviceId,
+                connectionId: membershipConnectionId,
+            });
+
+            if (scopeKeyValue === scopeKeyAtPublish && confirmation?.state) {
+                serverState = confirmation.state;
+                baseSnapshot = confirmation.state.snapshot;
+
+                if (deepEqual(confirmation.state.snapshot, desiredSnapshot)) {
+                    if (expectedMutationVersion == null || expectedMutationVersion === localMutationVersion) {
+                        clearLocalDirty(scopeAtPublish);
+                        rebuildLastSyncedMap(desiredSnapshot.messages);
+                    }
+                    return true;
+                }
+            }
+        } catch {
+            /* fall through to durable queue */
+        }
+
         if (localGeneration && allowDuringGeneration) return false;
-        await enqueueSnapshot(snapshot, revision, base, scopeAtPublish, 'snapshot', null, localOpId);
+
+        let queuePayload = desiredSnapshot;
+        if (expectedMutationVersion != null && expectedMutationVersion !== localMutationVersion) {
+            queuePayload = syncSnapshot(durableSnapshot());
+        }
+
+        await enqueueSnapshot(
+            queuePayload,
+            Number(serverState?.revision || revision),
+            serverState?.snapshot || baseline,
+            scopeAtPublish,
+            'snapshot',
+            null,
+            newId(),
+        );
+
         scheduleQueueFlushRetry();
         return false;
     }
@@ -2946,36 +3187,72 @@ async function flushQueueInternal() {
 
     const scopeAtFlush = clone(currentScope);
     const scopeKeyAtFlush = makeScopeKey(scopeAtFlush);
+    const nativeLoadEpochAtFlush = nativeLoadEpoch;
+
     const rows = await idbList(scopeKeyAtFlush);
 
-    for (const row of rows) {
-        if (!currentScope || scopeKeyValue !== scopeKeyAtFlush || !nativeScopeStable(scopeAtFlush)) return;
+    for (const originalRow of rows) {
+        if (
+            !currentScope ||
+            scopeKeyValue !== scopeKeyAtFlush ||
+            !nativeScopeStable(scopeAtFlush) ||
+            nativeLoadEpoch !== nativeLoadEpochAtFlush
+        ) {
+            return;
+        }
+
         if (localGeneration || generationActive(serverState?.generation)) return;
+
+        // Work on a detached row so an in-flight local edit can never mutate
+        // the object being sent underneath us.
+        const row = {
+            ...originalRow,
+            snapshot: clone(originalRow.snapshot),
+            baseSnapshot: clone(originalRow.baseSnapshot || { messages: [], metadata: {} }),
+            baseRevision: Number(originalRow.baseRevision || 0),
+            opId: String(originalRow.opId || newId()),
+        };
+
+        const mutationVersionAtStart = localMutationVersion;
 
         try {
             let nextSnapshot = clone(row.snapshot);
-            let nextBase = clone(row.baseSnapshot || { messages: [], metadata: {} });
+            let nextBase = clone(row.baseSnapshot);
             let nextRevision = Number(row.baseRevision || 0);
+
             const remote = serverState?.snapshot || null;
             const remoteRevision = Number(serverState?.revision || nextRevision);
 
+            // Before sending, reconcile against the newest authoritative
+            // server revision.
             if (remote && remoteRevision !== nextRevision) {
+                // The queued desired state may already be the server state
+                // (a lost response committed it after all).
+                if (deepEqual(remote, nextSnapshot)) {
+                    await idbDelete(row.id);
+                    rebuildLastSyncedMap(remote.messages);
+                    continue;
+                }
+
                 nextSnapshot = mergeSnapshots(nextBase, nextSnapshot, remote);
-                nextBase = remote;
+                nextBase = clone(remote);
                 nextRevision = remoteRevision;
-                // The payload/base changed: this is a NEW logical operation.
-                // Keep the row id stable, rotate the idempotency key —
-                // otherwise a server-side duplicate check could discard the
-                // rebased local change.
-                row.opId = newId();
                 row.snapshot = clone(nextSnapshot);
                 row.baseSnapshot = clone(nextBase);
                 row.baseRevision = nextRevision;
+
+                // Rebasing changes the logical payload: rotate the
+                // idempotency key so a duplicate check cannot discard it.
+                row.opId = newId();
+
                 await idbPut(row);
             }
 
             if (deepEqual(nextSnapshot, serverState?.snapshot)) {
                 await idbDelete(row.id);
+                if (mutationVersionAtStart === localMutationVersion) {
+                    clearLocalDirty(scopeAtFlush);
+                }
                 rebuildLastSyncedMap(nextSnapshot.messages);
                 continue;
             }
@@ -2994,11 +3271,65 @@ async function flushQueueInternal() {
                 }
             }
 
-            if (sendError) throw sendError;
-            if (!result || scopeKeyValue !== scopeKeyAtFlush) return;
+            if (sendError) {
+                // A timeout/network failure is not proof that the server
+                // rejected the mutation — confirm before deciding.
+                if (!sendError.status || sendError.status >= 500 || sendError.name === 'AbortError' || sendError.name === 'TimeoutError') {
+                    const confirmation = await api('/state', 'POST', {
+                        scope: scopeAtFlush,
+                        clientId,
+                        deviceId,
+                        connectionId: membershipConnectionId,
+                    }).catch(() => null);
+
+                    const confirmedState = confirmation?.state || null;
+
+                    if (confirmedState) {
+                        serverState = confirmedState;
+                        baseSnapshot = confirmedState.snapshot;
+
+                        if (deepEqual(confirmedState.snapshot, nextSnapshot)) {
+                            await idbDelete(row.id);
+                            if (mutationVersionAtStart === localMutationVersion) {
+                                clearLocalDirty(scopeAtFlush);
+                            }
+                            rebuildLastSyncedMap(nextSnapshot.messages);
+                            continue;
+                        }
+                    }
+                }
+
+                throw sendError;
+            }
+
+            if (!result?.state) throw new Error('snapshot_flush_missing_state');
+            if (scopeKeyValue !== scopeKeyAtFlush || nativeLoadEpoch !== nativeLoadEpochAtFlush) return;
 
             serverState = result.state;
             baseSnapshot = result.state.snapshot;
+
+            // A new local mutation occurred while this row was in flight.
+            // Never overwrite that newer native state with the older row.
+            if (mutationVersionAtStart !== localMutationVersion) {
+                const latestLocal = syncSnapshot(durableSnapshot());
+                const rebasedLatest = mergeSnapshots(nextSnapshot, latestLocal, result.state.snapshot);
+
+                row.baseSnapshot = clone(result.state.snapshot);
+                row.baseRevision = Number(result.state.revision || 0);
+                row.snapshot = clone(rebasedLatest);
+                row.opId = newId();
+
+                await idbPut(row);
+                markLocalDirty(scopeAtFlush);
+                rebuildLastSyncedMap(result.state.snapshot.messages);
+                continue;
+            }
+
+            // Scope transition during the network request must never turn
+            // into a native-chat overwrite.
+            if (!nativeScopeStable(scopeAtFlush) || !currentScope || scopeKeyValue !== scopeKeyAtFlush) {
+                return;
+            }
 
             const applied = await applySnapshot(incomingSnapshot(result.state.snapshot), {
                 save: true,
@@ -3008,25 +3339,49 @@ async function flushQueueInternal() {
             if (!applied) return;
 
             await idbDelete(row.id);
-            clearLocalDirty(scopeAtFlush);
+
+            if (mutationVersionAtStart === localMutationVersion) {
+                clearLocalDirty(scopeAtFlush);
+            } else {
+                markLocalDirty(scopeAtFlush);
+            }
+
+            rebuildLastSyncedMap(result.state.snapshot.messages);
         } catch (error) {
             if (scopeKeyValue !== scopeKeyAtFlush) return;
 
             if (error?.status === 409 && error?.payload?.state) {
-                const remote = error.payload.state;
-                if (remote.generation || error.payload.error === 'generation_active') {
-                    serverState = remote;
-                    baseSnapshot = remote.snapshot;
+                const remoteState = error.payload.state;
+
+                // The rejected send may actually have committed (lost
+                // response): an authoritative match proves it.
+                if (remoteState.snapshot && deepEqual(remoteState.snapshot, row.snapshot)) {
+                    await idbDelete(row.id);
+                    serverState = remoteState;
+                    baseSnapshot = remoteState.snapshot;
+                    if (localMutationVersion === mutationVersionAtStart) {
+                        clearLocalDirty(scopeAtFlush);
+                    }
+                    continue;
+                }
+
+                if (remoteState.generation || error.payload.error === 'generation_active') {
+                    serverState = remoteState;
+                    baseSnapshot = remoteState.snapshot;
+                    scheduleQueueFlushRetry();
                     return;
                 }
 
-                const merged = mergeSnapshots(row.baseSnapshot, row.snapshot, remote.snapshot);
+                const merged = mergeSnapshots(row.baseSnapshot, row.snapshot, remoteState.snapshot);
+
                 row.opId = newId();
                 row.snapshot = clone(merged);
-                row.baseSnapshot = remote.snapshot;
-                row.baseRevision = Number(remote.revision);
-                serverState = remote;
-                baseSnapshot = remote.snapshot;
+                row.baseSnapshot = clone(remoteState.snapshot);
+                row.baseRevision = Number(remoteState.revision || 0);
+
+                serverState = remoteState;
+                baseSnapshot = remoteState.snapshot;
+
                 await idbPut(row);
                 continue;
             }
@@ -3088,11 +3443,17 @@ async function openScope(epoch) {
     const joinController = new AbortController();
     joinAbortController = joinController;
 
+    // Fresh membership connection identity for THIS join attempt: a delayed
+    // leave/heartbeat from a previous attempt can never evict this one.
+    const connectionIdAtJoin = newId();
+    membershipConnectionId = connectionIdAtJoin;
+
     try {
         let result = await api('/join', 'POST', {
             scope: scopeAtJoin,
             clientId,
             deviceId,
+            connectionId: connectionIdAtJoin,
         }, '', { signal: joinController.signal, timeoutMs: API_TIMEOUT_MS });
 
         if (result?.seedRequired) {
@@ -3100,12 +3461,16 @@ async function openScope(epoch) {
                 scope: scopeAtJoin,
                 clientId,
                 deviceId,
+                connectionId: connectionIdAtJoin,
                 snapshot: syncSnapshot(durableSnapshot()),
             }, '', { signal: joinController.signal, timeoutMs: API_TIMEOUT_MS * 3 });
         }
 
         if (!currentScopeGuard(epoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtJoin)) {
-            try { await api('/leave', 'POST', { scope: scopeAtJoin, clientId, deviceId }); } catch { /* best effort */ }
+            try {
+                await api('/leave', 'POST', { scope: scopeAtJoin, clientId, deviceId, connectionId: connectionIdAtJoin });
+            } catch { /* best effort */ }
+            if (membershipConnectionId === connectionIdAtJoin) membershipConnectionId = null;
             return;
         }
 
@@ -3136,6 +3501,7 @@ async function openScope(epoch) {
                     scope: scopeAtJoin,
                     clientId,
                     deviceId,
+                    connectionId: connectionIdAtJoin,
                     generationId: staleOwnedGenerationId,
                     phase: 'stopped',
                     snapshot: clone(serverState.snapshot),
@@ -3194,6 +3560,7 @@ async function openScope(epoch) {
         await flushQueue();
     } catch (error) {
         if (joinAbortController === joinController) joinAbortController = null;
+        if (membershipConnectionId === connectionIdAtJoin) membershipConnectionId = null;
         if (error?.name === 'AbortError') return;
         warn('join failed', error);
         statusText(`Offline: ${error?.message || 'connection failed'}`);
@@ -3231,6 +3598,8 @@ function handleServerHello(data) {
 
     if (data.protocol !== PROTOCOL || data.schema !== SCHEMA) {
         statusText(`Protocol mismatch (${data.protocol}/${data.schema})`);
+        // Do not leave an incompatible EventSource alive.
+        disconnectSse();
         return;
     }
 
@@ -3321,6 +3690,7 @@ async function handleSnapshotEvent(data) {
     return new Promise(resolve => {
         const run = stateApplyChain.then(async () => {
             const revision = Number(data?.revision || 0);
+            const mutationVersionAtStart = localMutationVersion;
             if (!revision || revision <= Number(serverState?.revision || 0)) return true;
             if (!currentScope || !nativeScopeStable(currentScope)) {
                 log('[MCS] snapshot arrived during transient scope instability; deferring to scope switch');
@@ -3342,7 +3712,14 @@ async function handleSnapshotEvent(data) {
                 return true;
             }
 
-            if (data.sourceClientId === clientId) {
+            // Self-echo clears dirty ONLY when no newer local edit happened
+            // and the live chat actually matches what the server committed —
+            // an old echo must never clear a newer edit.
+            if (
+                data.sourceClientId === clientId &&
+                mutationVersionAtStart === localMutationVersion &&
+                deepEqual(remote, local)
+            ) {
                 clearLocalDirty(scopeAtEvent);
                 rebuildLastSyncedMap(remote.messages);
                 updateGenerationUi();
@@ -3362,6 +3739,7 @@ async function handleSnapshotEvent(data) {
                     await resyncCurrentScope(scopeEpoch);
                     return false;
                 }
+                if (mutationVersionAtStart !== localMutationVersion) markLocalDirty(scopeAtEvent);
             } else {
                 rebuildLastSyncedMap(appliedSnapshot.messages);
             }
@@ -3373,7 +3751,9 @@ async function handleSnapshotEvent(data) {
                     if (scopeKeyValue === makeScopeKey(scopeAtEvent)) {
                         serverState = result.state;
                         baseSnapshot = result.state.snapshot;
-                        clearLocalDirty(scopeAtEvent);
+                        if (mutationVersionAtStart === localMutationVersion) {
+                            clearLocalDirty(scopeAtEvent);
+                        }
                     }
                 } catch (publishError) {
                     if (publishError?.status === 409 && publishError?.payload?.state) {
@@ -3384,7 +3764,7 @@ async function handleSnapshotEvent(data) {
                         scheduleQueueFlushRetry();
                     }
                 }
-            } else {
+            } else if (mutationVersionAtStart === localMutationVersion) {
                 clearLocalDirty(scopeAtEvent);
             }
 
@@ -3480,6 +3860,7 @@ async function handleGenerationRecovered(data) {
             scope: scopeAtRecovery,
             clientId,
             deviceId,
+            connectionId: membershipConnectionId,
         });
 
         if (!currentScopeGuard(epoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtRecovery)) return true;
@@ -3597,7 +3978,13 @@ function handleGenerationStreamEvent(data) {
     if (seq <= lastRemoteStreamSeq) return;
 
     const hadGap = seq > 0 && lastRemoteStreamSeq >= 0 && seq > lastRemoteStreamSeq + 1;
-    if (hadGap) resyncCurrentScope(scopeEpoch).catch(error => warn('stream gap resync failed', error));
+    if (hadGap) {
+        // A stream gap invalidates the preview ordering. Start authoritative
+        // reconciliation, but do not treat this event as proof that the
+        // native chat is fully caught up — applyRemoteStreamNow stays a
+        // preview path only.
+        void resyncCurrentScope(scopeEpoch).catch(error => warn('stream gap resync failed', error));
+    }
 
     lastRemoteStreamSeq = seq;
     serverState = {
@@ -3635,6 +4022,7 @@ async function applyRemoteStreamNow(item) {
     applyingRemoteDepth += 1;
 
     const epochAtStart = scopeEpoch;
+    const nativeLoadEpochAtStart = nativeLoadEpoch;
     const expectedKey = makeScopeKey(currentScope);
     // Slim rollback state: only the touched message/index, never the whole chat.
     let previousIndex = -1;
@@ -3659,7 +4047,16 @@ async function applyRemoteStreamNow(item) {
                     return false;
                 }
             } else {
-                if (ctx.chat.length && ctx.chat[ctx.chat.length - 1]?.is_user) return false;
+                // Only reject an append when it would place a user/system
+                // message after a user message; a normal assistant generation
+                // preview appends legitimately.
+                if (
+                    ctx.chat.length &&
+                    ctx.chat[ctx.chat.length - 1]?.is_user &&
+                    (item.message?.is_user || item.message?.is_system)
+                ) {
+                    return false;
+                }
                 ctx.chat.push(clone(item.message));
                 index = ctx.chat.length - 1;
                 insertedIndex = index;
@@ -3693,6 +4090,7 @@ async function applyRemoteStreamNow(item) {
         warn('applyRemoteStreamNow failed; rolling back preview', error);
         const scopeIntact = ctx?.chat &&
             scopeEpoch === epochAtStart &&
+            nativeLoadEpoch === nativeLoadEpochAtStart &&
             currentScope &&
             makeScopeKey(currentScope) === expectedKey;
 
@@ -3754,6 +4152,10 @@ async function handleGenerationTerminalEvent(data) {
     const currentRevision = Number(serverState?.revision || 0);
     if (!generationId) return false;
 
+    const epochAtEvent = scopeEpoch;
+    const mutationVersionAtStart = localMutationVersion;
+    const nativeLoadEpochAtStart = nativeLoadEpoch;
+
     const activeId = localGeneration?.generationId || serverState?.generation?.generationId || null;
     if (activeId && activeId !== generationId) {
         rememberTerminatedGeneration(generationId);
@@ -3784,8 +4186,18 @@ async function handleGenerationTerminalEvent(data) {
 
     if (mine) {
         clearLocalGenerationState();
-        clearLocalDirty(scopeAtEvent);
-    } else if (scopeAtEvent && nativeScopeStable(scopeAtEvent) && data?.snapshot) {
+        if (mutationVersionAtStart === localMutationVersion) {
+            clearLocalDirty(scopeAtEvent);
+        } else {
+            markLocalDirty(scopeAtEvent);
+        }
+    } else if (
+        scopeAtEvent &&
+        nativeScopeStable(scopeAtEvent) &&
+        currentScopeGuard(epochAtEvent) &&
+        nativeLoadEpochAtStart === nativeLoadEpoch &&
+        data?.snapshot
+    ) {
         let finalSnapshot = terminalSnapshot;
         if (dirty) finalSnapshot = mergeSnapshots(knownBase, local, terminalSnapshot);
 
@@ -3814,7 +4226,11 @@ async function handleGenerationTerminalEvent(data) {
                     }
                 }
             }
-            clearLocalDirty(scopeAtEvent);
+            if (mutationVersionAtStart === localMutationVersion) {
+                clearLocalDirty(scopeAtEvent);
+            } else {
+                markLocalDirty(scopeAtEvent);
+            }
         } else {
             await resyncCurrentScope(scopeEpoch);
         }
@@ -3942,6 +4358,7 @@ function startHeartbeats(epoch) {
                 scope: scopeAtHeartbeat,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
             });
 
             if (!currentScopeGuard(epoch) || requestSeq < nativeHeartbeatAppliedSeq) return;
@@ -4005,6 +4422,7 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
                 scope: scopeAtGeneration,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
             });
 
             if (!localGenerationMatches(generationId, scopeAtGeneration) || !currentScopeGuard(epochAtGeneration)) return false;
@@ -4045,6 +4463,7 @@ async function reacquireGenerationOwnership(reason = 'recovery') {
                 scope: scopeAtGeneration,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
                 opId: claimOpId,
                 generationId,
                 generationType: String(generation.generationType || 'normal'),
@@ -4113,6 +4532,7 @@ function startGenerationHeartbeat(epoch) {
                     scope: scopeAtGeneration,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     generationId,
                 });
 
@@ -4152,6 +4572,7 @@ function startGenerationHeartbeat(epoch) {
                     scope: scopeAtGeneration,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                 }).catch(() => null);
 
                 if (!localGeneration || localGeneration.generationId !== generationId || !currentScopeGuard(epoch)) return;
@@ -4187,6 +4608,7 @@ function startGenerationHeartbeat(epoch) {
                         scope: scopeAtGeneration,
                         clientId,
                         deviceId,
+                        connectionId: membershipConnectionId,
                     }).catch(() => null);
 
                     const finalState = finalStateResult?.state || null;
@@ -4256,12 +4678,15 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
     if (!nativeScopeStable(currentScope)) return;
 
     const scopeAtRequest = clone(currentScope);
+    const mutationVersionAtStart = localMutationVersion;
+    const nativeLoadEpochAtStart = nativeLoadEpoch;
 
     try {
         const result = await api('/state', 'POST', {
             scope: scopeAtRequest,
             clientId,
             deviceId,
+            connectionId: membershipConnectionId,
         });
 
         if (!currentScopeGuard(epoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtRequest)) return;
@@ -4269,6 +4694,32 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
         const state = result.state;
         const serverGeneration = state.generation || null;
         if (serverGeneration?.stopRequested) rememberStopRequestedGeneration(serverGeneration.generationId);
+
+        // Native chat changed while the resync request was in flight: never
+        // apply the stale remote snapshot over it. Record the authoritative
+        // state and durably queue the local one for reconciliation.
+        if (mutationVersionAtStart !== localMutationVersion || nativeLoadEpochAtStart !== nativeLoadEpoch) {
+            serverState = state;
+            baseSnapshot = state.snapshot;
+            lastSseEventId = Number(state?.lastEventId || lastSseEventId);
+
+            if (currentScopeGuard(epoch) && nativeScopeStable(scopeAtRequest)) {
+                const latestLocal = syncSnapshot(durableSnapshot());
+                markLocalDirty(scopeAtRequest);
+                await enqueueSnapshot(
+                    latestLocal,
+                    Number(state.revision || 0),
+                    state.snapshot || { messages: [], metadata: {} },
+                    scopeAtRequest,
+                    'snapshot',
+                    null,
+                    newId(),
+                );
+                scheduleQueueFlushRetry();
+            }
+            return;
+        }
+
         const remote = incomingSnapshot(state.snapshot);
         const dirty = isLocalDirty(scopeAtRequest);
         const local = syncSnapshot(durableSnapshot());
@@ -4295,6 +4746,7 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                         scope: scopeAtRequest,
                         clientId,
                         deviceId,
+                        connectionId: membershipConnectionId,
                     }).catch(() => null);
                     const confirmed = confirm?.state?.generation || null;
                     if (confirmed?.generationId === localId && generationIsMine(confirmed)) {
@@ -4320,6 +4772,7 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                         scope: scopeAtRequest,
                         clientId,
                         deviceId,
+                        connectionId: membershipConnectionId,
                         generationId: staleId,
                         phase: 'stopped',
                         snapshot: clone(state.snapshot),
@@ -4358,7 +4811,9 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                         const publishResult = await sendSnapshotDirect(merged, Number(serverState.revision), newId(), scopeAtRequest);
                         serverState = publishResult.state;
                         baseSnapshot = publishResult.state.snapshot;
-                        clearLocalDirty(scopeAtRequest);
+                        if (mutationVersionAtStart === localMutationVersion) {
+                            clearLocalDirty(scopeAtRequest);
+                        }
                         rebuildLastSyncedMap(merged.messages);
                     } catch (publishError) {
                         if (publishError?.status === 409 && publishError?.payload?.state) {
@@ -4370,7 +4825,9 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                         }
                     }
                 } else {
-                    clearLocalDirty(scopeAtRequest);
+                    if (mutationVersionAtStart === localMutationVersion) {
+                        clearLocalDirty(scopeAtRequest);
+                    }
                     rebuildLastSyncedMap(merged.messages);
                 }
             } else if (!deepEqual(local, remote)) {
@@ -4380,7 +4837,9 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
                     expectedScope: scopeAtRequest,
                 });
                 if (!applied) return;
-                clearLocalDirty(scopeAtRequest);
+                if (mutationVersionAtStart === localMutationVersion) {
+                    clearLocalDirty(scopeAtRequest);
+                }
             } else {
                 rebuildLastSyncedMap(remote.messages);
             }
@@ -4392,9 +4851,31 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
     }
 }
 
+// Single-flight: N concurrent callers for the same scope+epoch share ONE
+// /state request instead of queueing N sequential ones.
 function resyncCurrentScope(epoch = scopeEpoch) {
-    const run = resyncChain.then(() => resyncCurrentScopeInternal(epoch));
-    resyncChain = run.then(() => undefined, error => warn('resync chain failed', error));
+    if (!currentScope) return Promise.resolve();
+
+    const key = `${scopeKeyValue}:${epoch}`;
+    if (resyncInFlight && resyncInFlightKey === key) {
+        return resyncInFlight;
+    }
+
+    const run = resyncChain
+        .then(() => resyncCurrentScopeInternal(epoch))
+        .catch(error => warn('resync chain failed', error));
+
+    resyncInFlight = run;
+    resyncInFlightKey = key;
+
+    void run.finally(() => {
+        if (resyncInFlight === run) {
+            resyncInFlight = null;
+            resyncInFlightKey = '';
+        }
+    });
+
+    resyncChain = run.then(() => undefined, () => undefined);
     return run;
 }
 
@@ -4408,6 +4889,7 @@ async function terminateGenerationOnServer(generation, scope, phase, snapshot, o
                 scope,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
                 generationId: generation.generationId,
                 phase,
                 snapshot,
@@ -4431,6 +4913,7 @@ async function terminateGenerationOnServer(generation, scope, phase, snapshot, o
             scope,
             clientId,
             deviceId,
+            connectionId: membershipConnectionId,
         });
         const state = stateResult.state;
         if (!state?.generation || state.generation.generationId !== generation.generationId) {
@@ -4452,6 +4935,25 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
     const leavingScope = clone(currentScope);
     const leavingGenerationId = localGeneration?.generationId || null;
 
+    // Durably capture any unsynced local change BEFORE tearing the scope
+    // down — clearing the dirty flag without a queue row would lose it.
+    if (isLocalDirty(leavingScope) && nativeScopeStable(leavingScope)) {
+        try {
+            const latestSnapshot = syncSnapshot(durableSnapshot());
+            await enqueueSnapshot(
+                latestSnapshot,
+                Number(serverState?.revision || 0),
+                serverState?.snapshot || { messages: [], metadata: {} },
+                leavingScope,
+                'snapshot',
+                null,
+                newId(),
+            );
+        } catch (error) {
+            warn('[MCS] failed to durably queue local state before leaving scope', error);
+        }
+    }
+
     if (localGeneration && localGenerationScope && !preserveNativeGeneration) {
         try { ctx?.stopGeneration?.(); } catch { /* ignore */ }
         try { await sendGenerationTerminal('stopped'); } catch (error) { warn('generation cleanup failed while leaving scope', error); }
@@ -4462,6 +4964,7 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
             scope: leavingScope,
             clientId,
             deviceId,
+            connectionId: membershipConnectionId,
         });
     } catch { /* best effort */ }
 
@@ -4478,6 +4981,7 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
     if (remoteRenderTimer) clearTimeout(remoteRenderTimer);
     if (streamCaptureTimer) clearTimeout(streamCaptureTimer);
     if (remoteUiRefreshTimer) clearTimeout(remoteUiRefreshTimer);
+    if (localPublishTimer) clearTimeout(localPublishTimer);
 
     scopeRetryTimer = null;
     queueRetryTimer = null;
@@ -4487,6 +4991,7 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
     streamRetryTimer = null;
     streamCaptureTimer = null;
     remoteUiRefreshTimer = null;
+    localPublishTimer = null;
 
     serverState = null;
     baseSnapshot = null;
@@ -4497,6 +5002,7 @@ async function leaveCurrentScope({ preserveNativeGeneration = false } = {}) {
     lastSseEventId = 0;
     nativeHeartbeatAppliedSeq = 0;
     nativeHeartbeatRequestSeq = 0;
+    membershipConnectionId = null;
     setSendLock('');
     setRemoteSendButtonMode(false);
     renderBanner('');
@@ -4538,6 +5044,9 @@ function switchScopeInternal(reason = 'scope-change') {
             return;
         }
 
+        // The native chat-load lifetime advances with the distributed
+        // connection lifetime, but they are checked independently.
+        ++nativeLoadEpoch;
         ++scopeEpoch;
         const epoch = scopeEpoch;
         clearGenerationTerminalTimer();
@@ -4597,7 +5106,10 @@ async function ensureGenerationStarted() {
     const generationId = localGeneration.generationId;
     const scopeAtGeneration = clone(localGenerationScope);
 
-    if (generationIsStopRequested(generationId) || terminalizingGenerationId === generationId) return false;
+    // No start/continuation racing an in-flight terminalization of the same
+    // generation — that is the terminal/continuation race.
+    if (terminalizingGenerationId === generationId) return false;
+    if (generationIsStopRequested(generationId)) return false;
     if (generationServerReadyId === generationId) return true;
     if (!localGenerationMatches(generationId, scopeAtGeneration)) return false;
 
@@ -4611,11 +5123,13 @@ async function ensureGenerationStarted() {
             try {
                 if (!localGenerationMatches(generationId, scopeAtGeneration)) return false;
                 if (generationIsStopRequested(generationId)) return false;
+                if (terminalizingGenerationId === generationId) return false;
 
                 const result = await api('/generation/started', 'POST', {
                     scope: scopeAtGeneration,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     generationId,
                 });
 
@@ -4687,6 +5201,15 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
 
     if (localGeneration) {
         const generationId = localGeneration.generationId;
+
+        // The previous shared generation is still finalizing: a new
+        // start/continuation here would race its terminal commit.
+        if (terminalizingGenerationId === generationId) {
+            abort(false);
+            statusText('The shared generation is finishing; please try again after it releases.', true);
+            return;
+        }
+
         const manualRequest = consumeManualGenerationRequest();
         const internalContinuation =
             !manualRequest &&
@@ -4758,6 +5281,7 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
                     scope: scopeAtClaim,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     generationId: existing.generationId,
                     phase: 'stopped',
                     snapshot: clone(serverState?.snapshot || { messages: [], metadata: {} }),
@@ -4811,6 +5335,7 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
                     scope: scopeAtClaim,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     opId: claimOpId,
                     generationId,
                     generationType: String(type || 'normal'),
@@ -4859,6 +5384,7 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
                     scope: scopeAtClaim,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     generationId,
                     phase: 'stopped',
                     snapshot: clone(claimResult.state?.snapshot || claimBase),
@@ -4975,17 +5501,23 @@ function scheduleGenerationStream(delayOverride = null) {
         streamInFlight = true;
         streamInFlightSeq = Number(payload.seq || 0);
 
+        // Abortable stream transport: terminalization cancels an in-flight
+        // stream POST so the last token can never race the terminal snapshot.
+        const controller = new AbortController();
+        streamAbortController = controller;
+
         const request = (async () => {
             try {
                 const result = await api('/generation/stream', 'POST', {
                     scope: scopeAtStream,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     generationId,
                     seq: payload.seq,
                     message: payload.message,
                     messageIndex: payload.messageIndex,
-                });
+                }, '', { signal: controller.signal });
 
                 if (!localGenerationMatches(generationId, scopeAtStream) || generationIsStopRequested(generationId)) return;
 
@@ -5002,6 +5534,13 @@ function scheduleGenerationStream(delayOverride = null) {
                 const code = error?.payload?.error || '';
 
                 if (generationIsStopRequested(generationId) || terminalizingGenerationId === generationId) return;
+
+                // The server is the final authority: a terminalizing or
+                // stop-requested generation accepts no more frames.
+                if (code === 'generation_stop_requested' || code === 'generation_terminal') {
+                    pendingStream = null;
+                    return;
+                }
 
                 if (code === 'generation_not_started') {
                     if (localGenerationMatches(generationId, scopeAtStream)) {
@@ -5028,6 +5567,7 @@ function scheduleGenerationStream(delayOverride = null) {
                         scope: scopeAtStream,
                         clientId,
                         deviceId,
+                        connectionId: membershipConnectionId,
                     }).catch(() => null);
                     const state = confirmed?.state || null;
                     const g = state?.generation;
@@ -5052,6 +5592,7 @@ function scheduleGenerationStream(delayOverride = null) {
                     await openScope(epochAtStream);
                     if (!generationIsStopRequested(generationId)) scheduleGenerationStream(STREAM_SEND_MS);
                 } else {
+                    if (error?.name === 'AbortError' && terminalizingGenerationId === generationId) return;
                     if (localGenerationMatches(generationId, scopeAtStream)) {
                         if (!pendingStream || Number(pendingStream.seq || 0) < Number(payload.seq || 0)) pendingStream = payload;
                         if (!streamRetryTimer && terminalizingGenerationId !== generationId) {
@@ -5066,6 +5607,7 @@ function scheduleGenerationStream(delayOverride = null) {
             } finally {
                 streamInFlight = false;
                 if (streamInFlightSeq === Number(payload.seq || 0)) streamInFlightSeq = 0;
+                if (streamAbortController === controller) streamAbortController = null;
             }
         })();
 
@@ -5087,7 +5629,8 @@ function scheduleGenerationStream(delayOverride = null) {
 // captured — never a full-chat snapshot. The full snapshot is built at
 // terminalization, where it is actually needed.
 function captureLocalStream() {
-    if (terminalizingGenerationId || !localGeneration || !localGenerationScope || !ctx?.chat?.length) return;
+    if (terminalizingGenerationId || !localGeneration || !localGenerationScope) return;
+    if (!Array.isArray(ctx?.chat) || !ctx.chat.length) return;
     const generationId = localGeneration.generationId;
     if (generationIsStopRequested(generationId)) return;
     if (!currentScope || makeScopeKey(currentScope) !== makeScopeKey(localGenerationScope)) return;
@@ -5112,11 +5655,17 @@ function captureLocalStream() {
     if (index < 0) return;
     ensureMessageIds(messages);
 
-    // Streaming content is a local mutation: stamp lastModified so a
-    // concurrent remote edit conflict resolves by timestamp.
-    messages[index].extra.multi_client_sync.lastModified = Date.now();
+    const target = messages[index];
+    if (!target || typeof target !== 'object') return;
 
-    const message = clone(messages[index]);
+    // Streaming content is a local mutation: stamp lastModified so a
+    // concurrent remote edit conflict resolves by timestamp. Defensive
+    // initialization — invalid native data must never crash this path.
+    target.extra ??= {};
+    target.extra.multi_client_sync ??= {};
+    target.extra.multi_client_sync.lastModified = Date.now();
+
+    const message = clone(target);
     const id = messageId(message);
     if (!id) return;
 
@@ -5187,48 +5736,25 @@ async function handleRemoteStopEvent(data) {
     remoteStopGenerationId = generationId;
 
     if (!localGeneration) {
-        const eventProvesOwnership =
-            !!eventGeneration &&
-            eventGeneration.generationId === generationId &&
-            generationIsMine(eventGeneration) &&
-            nativeGenerationLooksActive();
+        // Server-authoritative ownership confirmation only. BroadcastChannel
+        // payloads are a wake-up hint, never proof of ownership.
+        const stateResult = await api('/state', 'POST', {
+            scope: clone(currentScope),
+            clientId,
+            deviceId,
+            connectionId: membershipConnectionId,
+        }).catch(() => null);
+        const state = stateResult?.state || null;
+        const current = state?.generation || null;
+        if (!current || current.generationId !== generationId || !generationIsMine(current)) return true;
 
-        if (eventProvesOwnership) {
-            const adopted = {
-                ...(serverState?.generation?.generationId === generationId
-                    ? clone(serverState.generation)
-                    : {}),
-                ...clone(eventGeneration),
-                generationId,
-                stopRequested: true,
-            };
-            serverState = {
-                ...(serverState || {}),
-                generation: adopted,
-                scope: clone(currentScope),
-            };
-            localGeneration = adopted;
-            localGenerationScope = clone(currentScope);
-            localGenerationEpoch = scopeEpoch;
-            generationClaimedThisPage = true;
-        } else {
-            const stateResult = await api('/state', 'POST', {
-                scope: clone(currentScope),
-                clientId,
-                deviceId,
-            }).catch(() => null);
-            const state = stateResult?.state || null;
-            const current = state?.generation || null;
-            if (!current || current.generationId !== generationId || !generationIsMine(current)) return true;
+        if (!nativeGenerationLooksActive()) return true;
 
-            if (!nativeGenerationLooksActive()) return true;
-
-            serverState = state;
-            localGeneration = { ...clone(current), stopRequested: true };
-            localGenerationScope = clone(currentScope);
-            localGenerationEpoch = scopeEpoch;
-            generationClaimedThisPage = true;
-        }
+        serverState = state;
+        localGeneration = { ...clone(current), stopRequested: true };
+        localGenerationScope = clone(currentScope);
+        localGenerationEpoch = scopeEpoch;
+        generationClaimedThisPage = true;
     }
 
     if (!localGenerationMatches(generationId, currentScope)) return true;
@@ -5372,13 +5898,15 @@ function onGroupWrapperFinished() {
 }
 
 function capturePotentialDeletedStreamingMessage() {
-    if (!localGeneration || !localStreamMessageId || !ctx?.chat) return;
+    if (!localGeneration || !localStreamMessageId || !Array.isArray(ctx?.chat)) return;
     const stillExists = ctx.chat.some(message => messageId(message) === localStreamMessageId);
     if (!stillExists) log('[MCS] local streaming message disappeared before terminalization', localStreamMessageId);
 }
 
 function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = false } = {}) {
-    if (applyingRemoteDepth > 0 || !currentScope || !settings.enabled || !syncEnabled() || terminalizingGenerationId) return Promise.resolve(false);
+    if (applyingRemoteDepth > 0 || !currentScope || !settings.enabled || !syncEnabled()) {
+        return Promise.resolve(false);
+    }
 
     refreshLiveContext();
     capturePotentialDeletedStreamingMessage();
@@ -5386,7 +5914,6 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
     const scopeAtEvent = clone(currentScope);
     const epochAtEvent = scopeEpoch;
     const mutationVersion = ++localMutationVersion;
-    const deltaOpId = newId();
 
     if (!nativeScopeStable(scopeAtEvent)) {
         if (localGeneration) {
@@ -5399,6 +5926,29 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
     stampLocalMutations();
     markLocalDirty(scopeAtEvent);
 
+    // Never silently drop a real local edit merely because terminalization is
+    // in progress: the server generation can finish independently while the
+    // edit belongs in the durable queue and flushes afterwards.
+    if (terminalizingGenerationId) {
+        const snapshot = syncSnapshot(durableSnapshot());
+        const queued = enqueueSnapshot(
+            snapshot,
+            Number(serverState?.revision || 0),
+            serverState?.snapshot || { messages: [], metadata: {} },
+            scopeAtEvent,
+            'snapshot',
+            null,
+            newId(),
+        ).then(() => {
+            scheduleQueueFlushRetry();
+            return true;
+        }).catch(error => {
+            warn('[MCS] failed to durably queue edit during terminalization', error);
+            return false;
+        });
+        return queued;
+    }
+
     let run;
 
     run = publishChain.then(async () => {
@@ -5410,13 +5960,17 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
 
         activeLocalPublishPromise = run;
         try {
-            const deltaResult = await publishLocalDelta({ scope: scopeAtEvent, opId: deltaOpId, mutationVersion });
+            const deltaResult = await publishLocalDelta({ scope: scopeAtEvent, opId: newId(), mutationVersion });
             if (deltaResult.ok) return true;
             if (deltaResult.abandoned || deltaResult.ambiguous) return false;
 
             // Definitive fallback (conflict, metadata change, bulk edit): a
             // DIFFERENT payload is a NEW logical operation — new opId. Capture
             // the chat NOW, not at event-callback time.
+            if (scopeEpoch !== epochAtEvent || scopeKeyValue !== makeScopeKey(scopeAtEvent) || !nativeScopeStable(scopeAtEvent)) {
+                return false;
+            }
+
             const currentSnapshot = syncSnapshot(durableSnapshot());
             return await publishLocalSnapshot(currentSnapshot, {
                 allowDuringGeneration,
@@ -5436,7 +5990,21 @@ function publishAfterLocalEvent(_event = undefined, { allowDuringGeneration = fa
     return run;
 }
 
+// Noisy render-adjacent events (edit-box rerenders, reasoning panels) are
+// coalesced into a single next-tick publish instead of one publish each.
+function scheduleDeferredLocalPublish(delay = 0) {
+    if (localPublishTimer) return;
+    localPublishTimer = safeSetTimer(() => {
+        localPublishTimer = null;
+        void publishAfterLocalEvent().catch(error => warn('deferred local publish failed', error));
+    }, delay);
+}
+
 async function handleChatLifecycleEvent() {
+    // The native chat-load lifetime advances before any async reconciliation
+    // so in-flight operations can detect that they now belong to a stale chat.
+    ++nativeLoadEpoch;
+
     await sleep(50);
     refreshLiveContext();
     if (nativeRestoreInProgress) return;
@@ -5470,8 +6038,15 @@ function wireEvents() {
     const types = ctx?.eventTypes || {};
     const es = ctx?.eventSource;
 
+    // Multiple ST event constants can resolve to the same event string —
+    // dedupe by type so no handler is ever registered twice.
+    const registeredTypes = new Set();
+
     const listen = (eventType, fn) => {
         if (!eventType || !es?.on) return;
+        if (registeredTypes.has(eventType)) return;
+
+        registeredTypes.add(eventType);
         es.on(eventType, fn);
         registeredEventHandlers.push([eventType, fn]);
     };
@@ -5493,12 +6068,12 @@ function wireEvents() {
     listen(types.MESSAGE_SENT, event => publishAfterLocalEvent(event, { allowDuringGeneration: true }));
     listen(types.MESSAGE_RECEIVED, publishAfterLocalEvent);
     listen(types.MESSAGE_EDITED, publishAfterLocalEvent);
-    listen(types.MESSAGE_UPDATED, publishAfterLocalEvent);
+    listen(types.MESSAGE_UPDATED, scheduleDeferredLocalPublish);
     listen(types.MESSAGE_DELETED, publishAfterLocalEvent);
     listen(types.MESSAGE_SWIPED, publishAfterLocalEvent);
     listen(types.MESSAGE_SWIPE_DELETED, publishAfterLocalEvent);
-    listen(types.MESSAGE_REASONING_EDITED, publishAfterLocalEvent);
-    listen(types.MESSAGE_REASONING_DELETED, publishAfterLocalEvent);
+    listen(types.MESSAGE_REASONING_EDITED, scheduleDeferredLocalPublish);
+    listen(types.MESSAGE_REASONING_DELETED, scheduleDeferredLocalPublish);
     listen(types.MESSAGE_FILE_EMBEDDED, publishAfterLocalEvent);
     listen(types.FILE_ATTACHMENT_DELETED, publishAfterLocalEvent);
     listen(types.MEDIA_ATTACHMENT_DELETED, publishAfterLocalEvent);
@@ -5677,10 +6252,15 @@ async function waitForRemoteStopConfirmation(scope, generationId, epoch) {
         if (!currentScopeGuard(epoch)) return false;
 
         try {
+            // Revision-based comparison only: never compare a server timestamp
+            // against the local machine's clock.
+            const revisionAtRequest = Number(serverState?.revision || 0);
+
             const result = await api('/state', 'POST', {
                 scope,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
             }, '', { timeoutMs: STOP_API_TIMEOUT_MS });
 
             if (!currentScopeGuard(epoch)) return false;
@@ -5696,8 +6276,8 @@ async function waitForRemoteStopConfirmation(scope, generationId, epoch) {
             }
 
             if (generation.generationId !== generationId) {
-                const replacementTime = Number(generation.startedAt || generation.claimedAt || 0);
-                const replacementIsNewer = !remoteStopRequestedAt || !replacementTime || replacementTime >= remoteStopRequestedAt;
+                const replacementRevision = Number(result.state?.revision || 0);
+                const replacementIsNewer = replacementRevision >= revisionAtRequest;
                 if (replacementIsNewer && generationActive(generation)) {
                     rememberTerminatedGeneration(generationId);
                     remoteStopGenerationId = generation.generationId;
@@ -5808,6 +6388,7 @@ async function requestRemoteStop() {
                     scope: scopeAtRequest,
                     clientId,
                     deviceId,
+                    connectionId: membershipConnectionId,
                     generationId,
                     opId: stopOpId,
                 }, '', { timeoutMs: STOP_API_TIMEOUT_MS });
@@ -5840,6 +6421,7 @@ async function requestRemoteStop() {
                 scope: scopeAtRequest,
                 clientId,
                 deviceId,
+                connectionId: membershipConnectionId,
             }, '', { timeoutMs: STOP_API_TIMEOUT_MS }).catch(() => null);
 
             const confirmationState = confirmation?.state || null;
@@ -5894,8 +6476,23 @@ async function releaseGenerationClaim(phase = 'stopped') {
 
     const generation = clone(localGeneration);
     const scopeAtGeneration = clone(localGenerationScope);
+    const epochAtGeneration = localGenerationEpoch || scopeEpoch;
+    const mutationVersionAtStart = localMutationVersion;
+
     terminalizingGenerationId = generation.generationId;
+    stopGenerationHeartbeat();
     clearGenerationStreamWork(generation.generationId);
+
+    try { streamAbortController?.abort(); } catch { /* ignore */ }
+    streamAbortController = null;
+
+    // Terminalization is the authoritative final capture point: flush any
+    // deferred stream capture so the final token reaches the snapshot.
+    if (streamCaptureTimer) {
+        clearTimeout(streamCaptureTimer);
+        streamCaptureTimer = null;
+    }
+    refreshLiveContext();
 
     try {
         const snapshot = nativeScopeStable(scopeAtGeneration)
@@ -5904,14 +6501,16 @@ async function releaseGenerationClaim(phase = 'stopped') {
 
         const result = await terminateGenerationOnServer(generation, scopeAtGeneration, phase, snapshot);
 
-        if (result.state) {
+        if (result.state && currentScopeGuard(epochAtGeneration)) {
             serverState = result.state;
             baseSnapshot = result.state.snapshot;
         }
 
         if (result.success) {
             rememberTerminatedGeneration(generation.generationId);
-            clearLocalDirty(scopeAtGeneration);
+            if (mutationVersionAtStart === localMutationVersion) {
+                clearLocalDirty(scopeAtGeneration);
+            }
             clearLocalGenerationState();
             updateGenerationUi();
             return true;
@@ -5919,6 +6518,9 @@ async function releaseGenerationClaim(phase = 'stopped') {
 
         terminalizingGenerationId = null;
         generationTerminalPhase = phase;
+        if (localGenerationMatches(generation.generationId, scopeAtGeneration)) {
+            startGenerationHeartbeat(epochAtGeneration);
+        }
         scheduleTerminalRetry(generation.generationId, phase, TERMINAL_RETRY_MS);
         updateGenerationUi();
         return false;
@@ -5933,6 +6535,7 @@ async function sendGenerationTerminal(phase = 'completed') {
     const g = clone(localGeneration);
     const scopeAtGeneration = clone(localGenerationScope);
     const epochAtGeneration = localGenerationEpoch || scopeEpoch;
+    const mutationVersionAtStart = localMutationVersion;
 
     if (terminalizingGenerationId === g.generationId) return false;
 
@@ -5942,7 +6545,21 @@ async function sendGenerationTerminal(phase = 'completed') {
     }
 
     terminalizingGenerationId = g.generationId;
+    stopGenerationHeartbeat();
     clearGenerationStreamWork(g.generationId);
+
+    // Abort the in-flight stream transport: the last token must never race
+    // the terminal snapshot commit.
+    try { streamAbortController?.abort(); } catch { /* ignore */ }
+    streamAbortController = null;
+
+    // Terminalization is the authoritative final capture point. A deferred
+    // stream-capture timer is not sufficient — event-loop ordering must never
+    // determine whether the final token reaches the durable snapshot.
+    if (streamCaptureTimer) {
+        clearTimeout(streamCaptureTimer);
+        streamCaptureTimer = null;
+    }
 
     const terminalOpId = newId();
 
@@ -5955,23 +6572,35 @@ async function sendGenerationTerminal(phase = 'completed') {
 
         if (!localGenerationMatches(g.generationId, scopeAtGeneration)) return false;
 
+        refreshLiveContext();
         const snapshot = nativeScopeStable(scopeAtGeneration)
             ? syncSnapshot(durableSnapshot())
             : clone(serverState?.snapshot || localGenerationBaseSnapshot || { messages: [], metadata: {} });
 
+        // A remote Stop arriving during the finalization window wins.
+        if (generationIsStopRequested(g.generationId)) phase = 'stopped';
+
         const result = await terminateGenerationOnServer(g, scopeAtGeneration, phase, snapshot, terminalOpId);
         const stillSameLocal = localGenerationMatches(g.generationId, scopeAtGeneration);
+        const stillCurrent =
+            currentScopeGuard(epochAtGeneration) &&
+            !!currentScope &&
+            makeScopeKey(currentScope) === makeScopeKey(scopeAtGeneration);
 
-        if (result.state) {
-            if (currentScopeGuard(epochAtGeneration) || makeScopeKey(currentScope) === makeScopeKey(scopeAtGeneration)) {
-                serverState = result.state;
-                baseSnapshot = result.state.snapshot;
-            }
+        // Never mutate the current scope's state with an old generation's
+        // result after a scope switch.
+        if (result.state && stillCurrent) {
+            serverState = result.state;
+            baseSnapshot = result.state.snapshot;
         }
 
         if (result.success) {
             rememberTerminatedGeneration(g.generationId);
-            if (stillSameLocal) clearLocalDirty(scopeAtGeneration);
+            if (stillSameLocal && mutationVersionAtStart === localMutationVersion) {
+                clearLocalDirty(scopeAtGeneration);
+            } else if (stillSameLocal) {
+                markLocalDirty(scopeAtGeneration);
+            }
 
             if (stillSameLocal) clearLocalGenerationState();
             else if (localGeneration?.generationId === g.generationId) clearLocalGenerationState();
@@ -5997,12 +6626,18 @@ async function sendGenerationTerminal(phase = 'completed') {
 
         terminalizingGenerationId = null;
         generationTerminalPhase = phase;
+        if (localGenerationMatches(g.generationId, scopeAtGeneration)) {
+            startGenerationHeartbeat(epochAtGeneration);
+        }
         scheduleTerminalRetry(g.generationId, phase, TERMINAL_RETRY_MS);
         updateGenerationUi();
         return false;
     } catch (error) {
         terminalizingGenerationId = null;
         generationTerminalPhase = phase;
+        if (localGenerationMatches(g.generationId, scopeAtGeneration)) {
+            startGenerationHeartbeat(epochAtGeneration);
+        }
         scheduleTerminalRetry(g.generationId, phase, TERMINAL_RETRY_MS);
         warn('generation terminal failed', error);
         return false;
@@ -6041,7 +6676,7 @@ async function onActivate() {
                     const incoming = JSON.parse(event.newValue);
                     if (!incoming || typeof incoming !== 'object') return;
                     const previousEnabled = !!settings.enabled;
-                    settings = { ...DEFAULT_SETTINGS, ...incoming };
+                    settings = normalizeSettings(incoming);
                     updateSettingsControls();
 
                     if (previousEnabled !== !!settings.enabled) {
@@ -6129,6 +6764,7 @@ function onDisableInternal() {
         generationRecoveryInFlight = null;
         localGenerationBaseRevision = 0;
         streamInFlightSeq = 0;
+        membershipConnectionId = null;
         clearLocalDirty();
         setRemoteSendButtonMode(false);
         clearGenerationMarkers();
