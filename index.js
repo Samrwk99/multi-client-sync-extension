@@ -2616,6 +2616,11 @@ function stopHeartbeats() {
 // hello carries generation METADATA only; the live message arrives via the
 // generation_state transfer immediately after.
 function handleServerHello(data) {
+    // hello is always the first event of a fresh SSE connection. Any assembly
+    // still in the map belongs to a dead connection and can never complete —
+    // clear it now instead of waiting out the 30s expiry.
+    resetChunkAssemblies();
+
     if (data.protocol !== PROTOCOL || data.schema !== SCHEMA) {
         statusText(`Protocol mismatch (${data.protocol}/${data.schema})`);
         return;
