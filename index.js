@@ -7,7 +7,7 @@ const MAX_QUEUE = 1000;
 const MAX_QUEUE_BYTES = 64 * 1024 * 1024;
 const HEARTBEAT_MS = 10_000;
 const GENERATION_HEARTBEAT_MS = 5_000;
-const STREAM_SEND_MS = 60;
+const STREAM_SEND_MS = 35;
 // Coalesced render on the next tick: pendingRemoteStream is overwritten by
 // newer stream events, so only the latest message renders. No fixed latency.
 const REMOTE_RENDER_MS = 16;
@@ -524,8 +524,16 @@ function durableSnapshot() {
     };
 }
 
+function hasValidSnapshotShape(snapshot) {
+    return !!snapshot &&
+        typeof snapshot === 'object' &&
+        !Array.isArray(snapshot) &&
+        Array.isArray(snapshot.messages) &&
+        (!snapshot.metadata || (typeof snapshot.metadata === 'object' && !Array.isArray(snapshot.metadata)));
+}
+
 function normalizeSnapshot(snapshot) {
-    if (!snapshot || !Array.isArray(snapshot.messages)) {
+    if (!hasValidSnapshotShape(snapshot)) {
         return { messages: [], metadata: {} };
     }
 
@@ -1272,7 +1280,36 @@ function handleSseFrame(rawEvent, type, localSseEpoch, epoch) {
         return;
     }
 
+    // generation_stream is transient: the server deliberately omits its SSE id, but EventSource
+    // reports the preceding durable id on the event. Never deduplicate a stream frame using that
+    // inherited cursor, or live tokens disappear until a later durable event triggers reconciliation.
+    if (type === 'generation_stream') {
+        try {
+            dispatchGenerationFastLane({ ...data, type, scope: data?.scope || currentScope });
+        } catch (error) {
+            warn('[MCS] direct stream dispatch failed', error);
+        }
+        return;
+    }
+
     if (eventId > 0 && eventId <= lastSseEventId) return;
+
+    // Process latency-sensitive generation events immediately, outside the serialized snapshot/delta
+    // queue. Durable ones are still queued as already-handled markers so the cursor advances in order.
+    if (FAST_GENERATION_EVENT_TYPES.has(type)) {
+        try {
+            dispatchGenerationFastLane({ ...data, type, scope: data?.scope || currentScope });
+        } catch (error) {
+            warn('[MCS] direct generation dispatch failed', error);
+        }
+        if (eventId > 0) {
+            enqueueSseLogicalEvent({
+                kind: 'logical', logicalType: type, eventId,
+                data: { ...data, __mcsFastHandled: true }, epoch, scopeKey: scopeKeyValue,
+            });
+        }
+        return;
+    }
 
     enqueueSseLogicalEvent({ kind: 'logical', logicalType: type, eventId, data, epoch, scopeKey: scopeKeyValue });
 }
@@ -1300,6 +1337,17 @@ function processSseLogicalEvent(item) {
     const event = item?.kind === 'logical'
         ? { ...item.data, type: item.logicalType }
         : item;
+
+    // Latency-sensitive durable events were already dispatched synchronously
+    // by handleSseFrame. Their queued marker exists only to advance the durable
+    // cursor in sequence; do not repeat Stop/terminal/start side effects.
+    if (item?.kind === 'logical' && item.data?.__mcsFastHandled) {
+        if (Number(item.eventId) > 0) {
+            lastSseEventId = Math.max(lastSseEventId, Number(item.eventId));
+        }
+        return;
+    }
+
     const type = generationEventType(event);
 
     if (FAST_GENERATION_EVENT_TYPES.has(type)) {
@@ -1522,7 +1570,9 @@ async function processAuthoritativeSseLogicalEvent(item) {
 
     const { logicalType, eventId, data } = item;
 
-    const accepted = await dispatchLogicalEvent(logicalType, data);
+    const accepted = data?.__mcsFastHandled
+        ? true
+        : await dispatchLogicalEvent(logicalType, data);
     if (!accepted) {
         warn('logical event not accepted; resyncing', logicalType, eventId);
         return 'resync';
@@ -2504,6 +2554,10 @@ async function applySnapshotNow(
         if (!currentScope || makeScopeKey(currentScope) !== expectedKey || !nativeScopeStable(expectedScope)) return false;
 
         if (!Array.isArray(ctx.chat)) return false;
+        if (normalized.messages.length === 0 && ctx.chat.length > 0) {
+            warn('[MCS] refused empty snapshot replacement of a non-empty chat', expectedScope);
+            return false;
+        }
         previousMessages = clone(ctx.chat);
         previousMetadata = ctx.chatMetadata && typeof ctx.chatMetadata === 'object' ? clone(ctx.chatMetadata) : {};
 
@@ -4145,7 +4199,42 @@ async function openScope(epoch) {
         if (!queued.length || serverState.generation) {
             const incoming = incomingSnapshot(serverState.snapshot);
             const localSnapshot = syncSnapshot(durableSnapshot());
-            if (!deepEqual(localSnapshot, incoming) && !generationIsMine(serverState.generation)) {
+            if (incoming.messages.length === 0 && localSnapshot.messages.length > 0) {
+                // Never let joining/reconnecting on a temporarily empty server checkpoint erase the
+                // already-loaded chat. Repair when generation ownership is idle; otherwise retain the
+                // local chat until the authoritative terminal checkpoint can reconcile it.
+                markLocalDirty(scopeAtJoin);
+                if (!serverState.generation) {
+                    try {
+                        const repaired = await sendSnapshotDirect(
+                            localSnapshot,
+                            Number(serverState.revision || 0),
+                            newId(),
+                            scopeAtJoin,
+                        );
+                        serverState = repaired.state;
+                        baseSnapshot = repaired.state.snapshot;
+                        if (!queued.length) clearLocalDirty(scopeAtJoin);
+                    } catch (repairError) {
+                        if (repairError?.status === 409 && repairError?.payload?.state) {
+                            serverState = repairError.payload.state;
+                            baseSnapshot = repairError.payload.state.snapshot;
+                        } else {
+                            await enqueueSnapshot(
+                                localSnapshot,
+                                Number(serverState.revision || 0),
+                                serverState.snapshot || { messages: [], metadata: {} },
+                                scopeAtJoin,
+                                'snapshot',
+                                null,
+                                newId(),
+                            );
+                            scheduleQueueFlushRetry();
+                        }
+                    }
+                }
+                rebuildLastSyncedMap(localSnapshot.messages);
+            } else if (!deepEqual(localSnapshot, incoming) && !generationIsMine(serverState.generation)) {
                 const applied = await applySnapshot(incoming, {
                     save: true,
                     render: true,
@@ -4156,7 +4245,9 @@ async function openScope(epoch) {
             } else {
                 rebuildLastSyncedMap(serverState.snapshot.messages);
             }
-            if (!queued.length) clearLocalDirty(scopeAtJoin);
+            if (!queued.length && !(incoming.messages.length === 0 && localSnapshot.messages.length > 0)) {
+                clearLocalDirty(scopeAtJoin);
+            }
         }
 
         // Live connection first; queue reconciliation must never delay it.
@@ -4305,11 +4396,47 @@ async function handleSnapshotEvent(data) {
             }
 
             const scopeAtEvent = clone(currentScope);
+            if (!hasValidSnapshotShape(data?.snapshot)) {
+                warn('[MCS] ignored malformed snapshot event; requesting authoritative state');
+                void resyncCurrentScope(scopeEpoch);
+                return false;
+            }
             const remote = incomingSnapshot(data.snapshot);
             const knownBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
             const local = syncSnapshot(durableSnapshot());
             const dirty = isLocalDirty(scopeAtEvent);
             const incomingGenerationId = String(data?.generationId || '');
+
+            if (
+                remote.messages.length === 0 &&
+                local.messages.length > 0 &&
+                !incomingGenerationId &&
+                !serverState?.generation
+            ) {
+                // Empty checkpoints are a known destructive failure mode. Keep the live chat and
+                // repair the server checkpoint rather than accepting an empty replacement.
+                serverState = { ...(serverState || {}), revision, snapshot: clone(data.snapshot) };
+                baseSnapshot = data.snapshot;
+                markLocalDirty(scopeAtEvent);
+                try {
+                    const repaired = await sendSnapshotDirect(local, revision, newId(), scopeAtEvent);
+                    if (scopeKeyValue === makeScopeKey(scopeAtEvent)) {
+                        serverState = repaired.state;
+                        baseSnapshot = repaired.state.snapshot;
+                        if (mutationVersionAtStart === localMutationVersion) clearLocalDirty(scopeAtEvent);
+                    }
+                } catch (repairError) {
+                    if (repairError?.status === 409 && repairError?.payload?.state) {
+                        serverState = repairError.payload.state;
+                        baseSnapshot = repairError.payload.state.snapshot;
+                    } else {
+                        await enqueueSnapshot(local, revision, knownBase, scopeAtEvent);
+                        scheduleQueueFlushRetry();
+                    }
+                }
+                updateGenerationUi();
+                return true;
+            }
 
             serverState = { ...(serverState || {}), revision, snapshot: clone(data.snapshot) };
             baseSnapshot = data.snapshot;
@@ -4770,7 +4897,7 @@ function scheduleRemoteRender() {
 async function handleGenerationTerminalEvent(data) {
     const terminalGeneration = data?.generation || null;
     const generationId = terminalGeneration?.generationId || data?.generationId || null;
-    const revision = Number(data?.revision || 0);
+    const revision = Number(data?.revision || data?.state?.revision || 0);
     const currentRevision = Number(serverState?.revision || 0);
     if (!generationId) return false;
 
@@ -4791,10 +4918,16 @@ async function handleGenerationTerminalEvent(data) {
     const hadLocalGeneration = !!localGeneration && localGeneration.generationId === generationId;
     const mine = hadLocalGeneration && !!terminalGeneration && generationIsMine(terminalGeneration);
 
-    const terminalSnapshot = incomingSnapshot(data.snapshot || serverState?.snapshot || { messages: [], metadata: {} });
+    const terminalSourceSnapshot = hasValidSnapshotShape(data?.snapshot)
+        ? data.snapshot
+        : (hasValidSnapshotShape(data?.state?.snapshot)
+            ? data.state.snapshot
+            : (hasValidSnapshotShape(serverState?.snapshot) ? serverState.snapshot : durableSnapshot()));
+    const terminalSnapshot = incomingSnapshot(terminalSourceSnapshot);
     const knownBase = baseSnapshot || serverState?.snapshot || { messages: [], metadata: {} };
     const dirty = !mine && isLocalDirty(scopeAtEvent);
-    const local = !mine && dirty ? syncSnapshot(durableSnapshot()) : null;
+    const localCurrent = !mine ? syncSnapshot(durableSnapshot()) : null;
+    const local = !mine && dirty ? localCurrent : null;
 
     rememberTerminatedGeneration(generationId);
     clearFastGenerationState(generationId);
@@ -4802,7 +4935,7 @@ async function handleGenerationTerminalEvent(data) {
     serverState = {
         ...(serverState || {}),
         revision: Math.max(currentRevision, revision),
-        snapshot: clone(data.snapshot || serverState?.snapshot || { messages: [], metadata: {} }),
+        snapshot: clone(terminalSourceSnapshot),
         generation: null,
     };
     baseSnapshot = serverState.snapshot;
@@ -4819,10 +4952,16 @@ async function handleGenerationTerminalEvent(data) {
         nativeScopeStable(scopeAtEvent) &&
         currentScopeGuard(epochAtEvent) &&
         nativeLoadEpochAtStart === nativeLoadEpoch &&
-        data?.snapshot
+        (hasValidSnapshotShape(data?.snapshot) || hasValidSnapshotShape(data?.state?.snapshot))
     ) {
         let finalSnapshot = terminalSnapshot;
-        if (dirty) finalSnapshot = mergeSnapshots(knownBase, local, terminalSnapshot);
+        if (terminalSnapshot.messages.length === 0 && localCurrent?.messages?.length > 0) {
+            // Preserve valid local messages if a terminal payload is incomplete or was captured
+            // during a transient empty-chat window. The terminal checkpoint can then be repaired.
+            finalSnapshot = localCurrent;
+        } else if (dirty) {
+            finalSnapshot = mergeSnapshots(knownBase, local, terminalSnapshot);
+        }
 
         const applied = await applySnapshot(finalSnapshot, {
             save: true,
@@ -6029,6 +6168,26 @@ async function resyncCurrentScopeInternal(epoch = scopeEpoch) {
         if (effectiveGeneration?.stopRequested) rememberStopRequestedGeneration(effectiveGeneration.generationId);
 
         if (!effectiveGeneration && !localGeneration) {
+            if (remote.messages.length === 0 && local.messages.length > 0) {
+                markLocalDirty(scopeAtRequest);
+                try {
+                    const repaired = await sendSnapshotDirect(local, Number(serverState.revision || 0), newId(), scopeAtRequest);
+                    serverState = repaired.state;
+                    baseSnapshot = repaired.state.snapshot;
+                    if (mutationVersionAtStart === localMutationVersion) clearLocalDirty(scopeAtRequest);
+                    rebuildLastSyncedMap(local.messages);
+                } catch (repairError) {
+                    if (repairError?.status === 409 && repairError?.payload?.state) {
+                        serverState = repairError.payload.state;
+                        baseSnapshot = repairError.payload.state.snapshot;
+                    } else {
+                        await enqueueSnapshot(local, Number(serverState.revision || 0), remote, scopeAtRequest, 'snapshot', null, newId());
+                        scheduleQueueFlushRetry();
+                    }
+                }
+                updateGenerationUi();
+                return;
+            }
             if (dirty) {
                 const merged = mergeSnapshots(knownBase, local, remote);
                 if (!deepEqual(local, merged)) {
@@ -8051,6 +8210,7 @@ function getFastGenerationState(generationId) {
             terminal: false,
             terminalSeq: 0,
             renderScheduled: false,
+            renderInFlight: false,
         };
 
         fastGenerationStates.set(id, state);
@@ -8157,26 +8317,31 @@ function waitForNextPaint() {
 }
 
 function scheduleFastGenerationRender(generationId) {
-    const state = getFastGenerationState(generationId);
-    if (!state || state.renderScheduled) return;
+    const id = String(generationId || '');
+    const state = getFastGenerationState(id);
+    if (!state || state.renderScheduled || state.renderInFlight || state.terminal) return;
 
     state.renderScheduled = true;
 
     const render = () => {
-        state.renderScheduled = false;
+        const current = fastGenerationStates.get(id);
+        if (!current) return;
+        current.renderScheduled = false;
+        if (!current.latestFrame || current.terminal || current.renderInFlight) return;
 
-        const current = fastGenerationStates.get(
-            String(generationId || ''),
-        );
-
-        if (!current || !current.latestFrame) return;
-        if (current.terminal) return;
-
-        // Only the newest frame is rendered; the fast lane coalesces
-        // intermediate frames into the latest cumulative state.
-        void handleGenerationStreamFrameVisualUpdate(
-            current.latestFrame,
-        );
+        // Capture one newest cumulative frame, then serialize visual mutations without waiting for
+        // snapshots/resyncs. Any frame arriving during the write replaces latestFrame and renders next.
+        const frame = current.latestFrame;
+        current.latestFrame = null;
+        current.renderInFlight = true;
+        Promise.resolve(handleGenerationStreamFrameVisualUpdate(frame))
+            .catch(error => warn('[MCS] fast stream render failed', error))
+            .finally(() => {
+                const latest = fastGenerationStates.get(id);
+                if (!latest) return;
+                latest.renderInFlight = false;
+                if (latest.latestFrame && !latest.terminal) scheduleFastGenerationRender(id);
+            });
     };
 
     if (typeof requestAnimationFrame === 'function') {
