@@ -27,6 +27,8 @@ const OWNERSHIP_CONFLICT_GRACE_MS = 3_500;
 const OWNERSHIP_RECOVERY_GRACE_MS = 1_200;
 const STOP_REQUESTED_RETENTION_MS = 60 * 60 * 1000;
 
+let terminalEventChain = Promise.resolve();
+
 const CHUNK_MAX_BYTES = 512 * 1024;
 // Headroom above the server's 12 MiB snapshot limit: the event envelope can
 // push a legal snapshot past the assembly ceiling.
@@ -524,12 +526,100 @@ function durableSnapshot() {
     };
 }
 
+// Initial seeding is the one moment when a temporarily empty native chat can
+// become the permanent server baseline. Require the same scope/load epoch and
+// repeated identical snapshots before allowing that operation. Empty chats need
+// a longer stability window because ST can expose [] while a chat is loading.
+async function captureStableSnapshot(
+    expectedScope,
+    expectedScopeEpoch,
+    expectedLoadEpoch,
+    { timeoutMs = 6000, intervalMs = 100 } = {},
+) {
+    const startedAt = Date.now();
+    const expectedKey = makeScopeKey(expectedScope);
+    let previousSignature = null;
+    let stableSamples = 0;
+    let stableSince = 0;
+
+    while (Date.now() - startedAt <= timeoutMs) {
+        refreshLiveContext();
+        const scopeOk =
+            currentScopeGuard(expectedScopeEpoch) &&
+            makeScopeKey(currentScope) === expectedKey &&
+            nativeLoadEpoch === expectedLoadEpoch &&
+            nativeScopeStable(expectedScope) &&
+            Array.isArray(ctx?.chat);
+
+        if (!scopeOk) {
+            previousSignature = null;
+            stableSamples = 0;
+            stableSince = 0;
+            await sleep(intervalMs);
+            continue;
+        }
+
+        let candidate;
+        let signature;
+        try {
+            candidate = syncSnapshot(durableSnapshot());
+            if (!hasValidSnapshotShape(candidate)) throw new Error('invalid_seed_snapshot');
+            signature = JSON.stringify(candidate);
+        } catch (error) {
+            previousSignature = null;
+            stableSamples = 0;
+            stableSince = 0;
+            await sleep(intervalMs);
+            continue;
+        }
+
+        if (signature === previousSignature) {
+            stableSamples += 1;
+        } else {
+            previousSignature = signature;
+            stableSamples = 1;
+            stableSince = Date.now();
+        }
+
+        const requiredStableMs = candidate.messages.length === 0 ? 1500 : 300;
+        if (
+            stableSamples >= 3 &&
+            Date.now() - stableSince >= requiredStableMs &&
+            currentScopeGuard(expectedScopeEpoch) &&
+            makeScopeKey(currentScope) === expectedKey &&
+            nativeLoadEpoch === expectedLoadEpoch &&
+            nativeScopeStable(expectedScope)
+        ) {
+            return clone(candidate);
+        }
+
+        await sleep(intervalMs);
+    }
+
+    throw new Error('native_chat_snapshot_not_stable');
+}
+
 function hasValidSnapshotShape(snapshot) {
-    return !!snapshot &&
-        typeof snapshot === 'object' &&
-        !Array.isArray(snapshot) &&
-        Array.isArray(snapshot.messages) &&
-        (!snapshot.metadata || (typeof snapshot.metadata === 'object' && !Array.isArray(snapshot.metadata)));
+    if (
+        !snapshot ||
+        typeof snapshot !== 'object' ||
+        Array.isArray(snapshot) ||
+        !Array.isArray(snapshot.messages)
+    ) {
+        return false;
+    }
+    if (!snapshot.messages.every(message =>
+        !!message && typeof message === 'object' && !Array.isArray(message)
+    )) {
+        return false;
+    }
+    if (
+        snapshot.metadata != null &&
+        (typeof snapshot.metadata !== 'object' || Array.isArray(snapshot.metadata))
+    ) {
+        return false;
+    }
+    return true;
 }
 
 function normalizeSnapshot(snapshot) {
@@ -892,6 +982,30 @@ async function idbDelete(id) {
             tx.oncomplete = () => finish();
             tx.onerror = () => finish(tx.error || new Error('IndexedDB delete failed'));
             tx.onabort = () => finish(tx.error || new Error('IndexedDB transaction aborted'));
+        } catch (error) {
+            finish(error);
+        }
+    });
+}
+
+async function idbReplaceMany(value, idsToDelete = []) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = error => {
+            if (settled) return;
+            settled = true;
+            try { db.close(); } catch { /* ignore */ }
+            if (error) reject(error); else resolve();
+        };
+        try {
+            const tx = db.transaction('ops', 'readwrite');
+            const store = tx.objectStore('ops');
+            for (const id of new Set(idsToDelete.filter(Boolean))) store.delete(id);
+            store.put(value);
+            tx.oncomplete = () => finish(null);
+            tx.onerror = () => finish(tx.error || new Error('IndexedDB atomic replace failed'));
+            tx.onabort = () => finish(tx.error || new Error('IndexedDB atomic replace aborted'));
         } catch (error) {
             finish(error);
         }
@@ -1472,6 +1586,7 @@ function handleGenerationFastStreamEvent(event) {
     // streaming-message state. Therefore a skipped intermediate seq does
     // not freeze the UI or force an immediate /state resync.
     state.latestFrame = event;
+    state.renderRetries = 0;
 
     scheduleFastGenerationRender(generationId);
 }
@@ -1520,7 +1635,9 @@ function handleGenerationFastTerminalEvent(event) {
     state.terminalSeq = seq || state.latestSeq;
 
     // Terminal UI must respond immediately.
-    handleGenerationTerminalEvent(event);
+    void handleGenerationTerminalEvent(event).catch(error => {
+        warn('[MCS] fast terminal reconciliation failed', error);
+    });
 
     // Wake any stop confirmation logic immediately when the SSE terminal
     // event itself is sufficient proof.
@@ -2349,6 +2466,13 @@ function orderMergedMessages(baseMessages, localMessages, remoteMessages, chosen
 }
 
 function mergeSnapshots(base, local, remote) {
+    if (
+        !hasValidSnapshotShape(base) ||
+        !hasValidSnapshotShape(local) ||
+        !hasValidSnapshotShape(remote)
+    ) {
+        throw new Error('invalid_snapshot_merge_input');
+    }
     const b = normalizeSnapshot(base);
     const l = normalizeSnapshot(local);
     const r = normalizeSnapshot(remote);
@@ -2392,12 +2516,17 @@ function mergeSnapshots(base, local, remote) {
             value = messageLastModified(rv) > lt ? rv : null;
         } else if (rt && lv) {
             value = messageLastModified(lv) > rt ? lv : null;
-        } else if (!lv && !rv) {
+        } else if (lt && !rv) {
             value = null;
+        } else if (rt && !lv) {
+            value = null;
+        } else if (!lv && !rv) {
+            // Absence without a tombstone is not deletion.
+            value = bv || null;
         } else if (!lv && bv) {
-            value = messagesEqual(rv, bv) ? null : rv;
+            value = rv || bv;
         } else if (!rv && bv) {
-            value = messagesEqual(lv, bv) ? null : lv;
+            value = lv || bv;
         } else if (!lv) {
             value = rv;
         } else if (!rv) {
@@ -2509,6 +2638,26 @@ async function safeNativeSave(expectedScope = currentScope) {
 // the restore in finally runs ONLY if the native scope is still the one that
 // was mutated. If the user switched chats mid-apply, ctx.chat now points at a
 // different chat and restoring here would corrupt it.
+function snapshotDropsUnexplainedMessages(incomingSnapshot, existingMessages) {
+    if (!hasValidSnapshotShape(incomingSnapshot) || !Array.isArray(existingMessages)) return true;
+
+    const incomingIds = new Set();
+    for (const message of incomingSnapshot.messages) {
+        const id = messageId(message);
+        if (!id) return true;
+        incomingIds.add(id);
+    }
+
+    const tombstones = readLedger(incomingSnapshot.metadata);
+    for (const message of existingMessages) {
+        const id = messageId(message);
+        if (!id) return true;
+        if (!incomingIds.has(id) && !Object.hasOwn(tombstones, id)) return true;
+    }
+
+    return false;
+}
+
 async function applySnapshotNow(
     snapshot,
     {
@@ -2520,6 +2669,10 @@ async function applySnapshotNow(
         expectedGenerationId = null,
     } = {},
 ) {
+    if (!hasValidSnapshotShape(snapshot)) {
+        warn('[MCS] refused malformed snapshot before normalization; live chat was left untouched');
+        return false;
+    }
     const normalized = normalizeSnapshot(snapshot);
     if (!ctx || !expectedScope || !nativeScopeStable(expectedScope)) {
         log('[MCS] refused snapshot apply because native scope is not stable', expectedScope);
@@ -2554,8 +2707,15 @@ async function applySnapshotNow(
         if (!currentScope || makeScopeKey(currentScope) !== expectedKey || !nativeScopeStable(expectedScope)) return false;
 
         if (!Array.isArray(ctx.chat)) return false;
+        // Assign stable IDs before comparison so absence can only mean a proven
+        // deletion (tombstone), not that one side has not finished loading.
+        ensureMessageIds(ctx.chat);
         if (normalized.messages.length === 0 && ctx.chat.length > 0) {
             warn('[MCS] refused empty snapshot replacement of a non-empty chat', expectedScope);
+            return false;
+        }
+        if (snapshotDropsUnexplainedMessages(normalized, ctx.chat)) {
+            warn('[MCS] refused snapshot that omits existing messages without tombstones', expectedScope);
             return false;
         }
         previousMessages = clone(ctx.chat);
@@ -2964,7 +3124,33 @@ async function publishLocalDelta({ scope = currentScope, opId, mutationVersion }
                 }).catch(() => null);
 
                 const authoritative = confirmation?.state || null;
-                if (!authoritative) return { ok: false, fallback: false, ambiguous: true };
+                if (!authoritative) {
+                    // The delta may have committed, but a failed confirmation
+                    // is not permission to abandon this local mutation. Queue a
+                    // new full-snapshot operation with a NEW opId; reusing the
+                    // delta opId with a different payload would be an idempotency
+                    // fingerprint conflict on the server.
+                    if (
+                        scopeKeyValue === scopeKeyAtPublish &&
+                        currentScope &&
+                        makeScopeKey(currentScope) === scopeKeyAtPublish &&
+                        nativeScopeStable(scopeAtPublish)
+                    ) {
+                        const recoverySnapshot = syncSnapshot(durableSnapshot());
+                        await enqueueSnapshot(
+                            recoverySnapshot,
+                            baseRevision,
+                            serverState?.snapshot || { messages: [], metadata: {} },
+                            scopeAtPublish,
+                            'snapshot',
+                            null,
+                            newId(),
+                        );
+                        scheduleQueueFlushRetry();
+                        return { ok: false, fallback: false, ambiguous: true, queued: true };
+                    }
+                    return { ok: false, fallback: false, ambiguous: true, queued: false };
+                }
 
                 serverState = authoritative;
                 baseSnapshot = clone(authoritative.snapshot);
@@ -3549,9 +3735,6 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
     const scopeKey = makeScopeKey(scope);
     if (!scopeKey) return;
 
-    // Row identity and idempotency identity are SEPARATE: the queue may
-    // rebase a row's payload (rotating its opId) while keeping the row key
-    // stable across retries.
     const row = {
         id: newId(),
         opId: opId || newId(),
@@ -3565,28 +3748,24 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
         snapshot: clone(snapshot),
     };
 
-    const byteSize = utf8ByteLength(row);
     let existingRows = await idbList(scopeKey);
+    const deleteIds = new Set();
+    const scheduleDeletes = rows => {
+        for (const old of rows) deleteIds.add(old.id);
+        existingRows = existingRows.filter(existing => !rows.some(old => old.id === existing.id));
+    };
 
-    // Proactive coalescing: pending normal rows are absolute desired states,
-    // so the newest subsumes the older ones long before capacity is hit.
-    // Keeps the earliest base so conflict merges stay anchored.
     if (kind === 'snapshot' && !generationId) {
         const normalSnapshots = existingRows
             .filter(existing => existing.kind === 'snapshot' && !existing.generationId)
             .sort((a, b) => (a.queueSequence || 0) - (b.queueSequence || 0));
-
         if (normalSnapshots.length) {
             const latest = normalSnapshots[normalSnapshots.length - 1];
             if (deepEqual(latest.snapshot, row.snapshot)) return;
-
             const earliest = normalSnapshots[0];
             row.baseRevision = Math.min(row.baseRevision, Number(earliest.baseRevision || 0));
             row.baseSnapshot = clone(earliest.baseSnapshot || row.baseSnapshot);
-            for (const old of normalSnapshots) {
-                await idbDelete(old.id);
-            }
-            existingRows = existingRows.filter(existing => !normalSnapshots.includes(existing));
+            scheduleDeletes(normalSnapshots);
         }
     }
 
@@ -3597,35 +3776,32 @@ async function enqueueSnapshot(snapshot, baseRev, baseSnap, scope = currentScope
     );
     if (duplicate) return;
 
-    let currentBytes = existingRows.reduce((sum, r) => sum + utf8ByteLength(r), 0);
+    let currentBytes = existingRows.reduce((sum, existing) => sum + utf8ByteLength(existing), 0);
+    const rowBytes = () => utf8ByteLength(row);
 
-    // Over capacity: consolidate, never evict or reject. Pending rows are
-    // full snapshots (absolute desired state), so the newest subsumes the
-    // older ones — keep the earliest base, drop the rest.
-    if (currentBytes + byteSize > MAX_QUEUE_BYTES || existingRows.length >= MAX_QUEUE) {
+    if (currentBytes + rowBytes() > MAX_QUEUE_BYTES || existingRows.length >= MAX_QUEUE) {
         const snapshotRows = existingRows
-            .filter(r => r.kind === 'snapshot' && !r.generationId)
+            .filter(existing => existing.kind === 'snapshot' && !existing.generationId)
             .sort((a, b) => (a.queueSequence || 0) - (b.queueSequence || 0));
         if (snapshotRows.length) {
             const earliest = snapshotRows[0];
             row.baseRevision = Math.min(row.baseRevision, Number(earliest.baseRevision || 0));
             row.baseSnapshot = clone(earliest.baseSnapshot || row.baseSnapshot);
-            for (const old of snapshotRows) {
-                await idbDelete(old.id);
-                currentBytes -= utf8ByteLength(old);
-            }
-            existingRows = existingRows.filter(r => !snapshotRows.includes(r));
-        }
-        if (currentBytes + byteSize > MAX_QUEUE_BYTES || existingRows.length >= MAX_QUEUE) {
-            // Only generation-bound rows remain: retain the change in the
-            // live chat (localDirty stays set) rather than drop it.
-            warn('[MCS] queue capacity reached; retaining local change for later retry');
-            scheduleQueueFlushRetry();
-            return;
+            scheduleDeletes(snapshotRows);
+            currentBytes = existingRows.reduce((sum, existing) => sum + utf8ByteLength(existing), 0);
         }
     }
 
-    await idbPut(row);
+    if (currentBytes + rowBytes() > MAX_QUEUE_BYTES || existingRows.length >= MAX_QUEUE) {
+        // Never discard a new durable checkpoint just because generation-bound
+        // rows occupy the soft queue budget. Temporarily exceed the budget and
+        // let flush/terminalization drain it; existing generation rows are kept.
+        warn('[MCS] durable snapshot queue temporarily exceeds configured capacity; preserving the new checkpoint');
+    }
+
+    // Deletes and insertion commit in ONE IndexedDB transaction. A crash or
+    // quota error aborts all of them, leaving the previous durable rows intact.
+    await idbReplaceMany(row, [...deleteIds]);
 }
 
 function scheduleQueueFlushRetry(delay = 2000) {
@@ -4086,6 +4262,7 @@ async function openScope(epoch) {
     if (!settings.enabled || !settings.autoConnect || !currentScope) return;
 
     const scopeAtJoin = clone(currentScope);
+    const nativeLoadEpochAtJoin = nativeLoadEpoch;
 
     if (!nativeScopeStable(scopeAtJoin)) {
         statusText('Waiting for active chat…');
@@ -4128,7 +4305,11 @@ async function openScope(epoch) {
             }, '', { signal: joinController.signal, timeoutMs: API_TIMEOUT_MS * 3 });
         }
 
-        if (!currentScopeGuard(epoch) || makeScopeKey(currentScope) !== makeScopeKey(scopeAtJoin)) {
+        if (
+            !currentScopeGuard(epoch) ||
+            makeScopeKey(currentScope) !== makeScopeKey(scopeAtJoin) ||
+            nativeLoadEpoch !== nativeLoadEpochAtJoin
+        ) {
             try {
                 await api('/leave', 'POST', { scope: scopeAtJoin, clientId, deviceId, connectionId: connectionIdAtJoin });
             } catch { /* best effort */ }
@@ -4415,8 +4596,9 @@ async function handleSnapshotEvent(data) {
             ) {
                 // Empty checkpoints are a known destructive failure mode. Keep the live chat and
                 // repair the server checkpoint rather than accepting an empty replacement.
-                serverState = { ...(serverState || {}), revision, snapshot: clone(data.snapshot) };
-                baseSnapshot = data.snapshot;
+                // Keep the previous authoritative baseline until the non-empty repair
+                // is accepted. This empty event may be stale or from a transient blank
+                // native-chat load.
                 markLocalDirty(scopeAtEvent);
                 try {
                     const repaired = await sendSnapshotDirect(local, revision, newId(), scopeAtEvent);
@@ -4427,15 +4609,43 @@ async function handleSnapshotEvent(data) {
                     }
                 } catch (repairError) {
                     if (repairError?.status === 409 && repairError?.payload?.state) {
-                        serverState = repairError.payload.state;
-                        baseSnapshot = repairError.payload.state.snapshot;
+                        const conflictState = repairError.payload.state;
+                        const conflictSnapshot = conflictState.snapshot;
+                        if (
+                            local.messages.length > 0 &&
+                            Array.isArray(conflictSnapshot?.messages) &&
+                            conflictSnapshot.messages.length === 0
+                        ) {
+                            await enqueueSnapshot(
+                                local,
+                                Number(conflictState.revision || revision),
+                                knownBase,
+                                scopeAtEvent,
+                                'snapshot',
+                                null,
+                                newId(),
+                            );
+                            scheduleQueueFlushRetry();
+                        } else {
+                            serverState = conflictState;
+                            baseSnapshot = conflictSnapshot;
+                        }
                     } else {
-                        await enqueueSnapshot(local, revision, knownBase, scopeAtEvent);
+                        await enqueueSnapshot(local, revision, knownBase, scopeAtEvent, 'snapshot', null, newId());
                         scheduleQueueFlushRetry();
                     }
                 }
                 updateGenerationUi();
                 return true;
+            }
+
+            if (snapshotDropsUnexplainedMessages(remote, knownBase.messages)) {
+                warn('[MCS] refused incoming snapshot that omits established messages without tombstones; requesting state reconciliation');
+                // Leave serverState/baseSnapshot untouched. A malformed or stale
+                // remote event must not become the next baseline merely because
+                // its revision is higher.
+                void resyncCurrentScope(scopeEpoch);
+                return false;
             }
 
             serverState = { ...(serverState || {}), revision, snapshot: clone(data.snapshot) };
@@ -4785,31 +4995,13 @@ async function applyRemoteStreamNow(item) {
         let index = ctx.chat.findIndex(message => messageId(message) === id);
 
         if (index < 0) {
-            if (Number.isInteger(item.messageIndex) && item.messageIndex >= 0 && item.messageIndex < ctx.chat.length) {
-                const existingAtIndex = ctx.chat[item.messageIndex];
-                if (existingAtIndex && !existingAtIndex.is_user && !existingAtIndex.is_system) {
-                    index = item.messageIndex;
-                    previousIndex = index;
-                    previousMessage = clone(ctx.chat[index]);
-                    ctx.chat[index] = clone(item.message);
-                } else {
-                    return false;
-                }
-            } else {
-                // Only reject an append when it would place a user/system
-                // message after a user message; a normal assistant generation
-                // preview appends legitimately.
-                if (
-                    ctx.chat.length &&
-                    ctx.chat[ctx.chat.length - 1]?.is_user &&
-                    (item.message?.is_user || item.message?.is_system)
-                ) {
-                    return false;
-                }
-                ctx.chat.push(clone(item.message));
-                index = ctx.chat.length - 1;
-                insertedIndex = index;
-            }
+            // A hinted index is not identity. If the stable message ID is not
+            // present, append a new preview rather than overwrite another
+            // assistant message that may have moved or been edited locally.
+            if (item.message?.is_user || item.message?.is_system) return false;
+            ctx.chat.push(clone(item.message));
+            index = ctx.chat.length - 1;
+            insertedIndex = index;
         } else {
             previousIndex = index;
             previousMessage = clone(ctx.chat[index]);
@@ -4894,7 +5086,31 @@ function scheduleRemoteRender() {
     }, REMOTE_RENDER_MS);
 }
 
-async function handleGenerationTerminalEvent(data) {
+function handleGenerationTerminalEvent(data) {
+    // Order authoritative terminal mutations after already-running snapshot/delta
+    // work, then serialize terminal events with one another. The fast handler
+    // marks its visual terminal flag before this promise completes.
+    const run = Promise.all([stateApplyChain, terminalEventChain])
+        .then(() => handleGenerationTerminalEventNow(data));
+
+    terminalEventChain = run.then(
+        () => undefined,
+        error => {
+            warn('[MCS] serialized generation terminal handler failed', error);
+            return undefined;
+        },
+    );
+    stateApplyChain = run.then(
+        () => undefined,
+        error => {
+            warn('[MCS] authoritative terminal state mutation failed', error);
+            return undefined;
+        },
+    );
+    return run;
+}
+
+async function handleGenerationTerminalEventNow(data) {
     const terminalGeneration = data?.generation || null;
     const generationId = terminalGeneration?.generationId || data?.generationId || null;
     const revision = Number(data?.revision || data?.state?.revision || 0);
@@ -6579,6 +6795,16 @@ if (nextKey === scopeKeyValue && currentScope) {
         await openScope(scopeEpoch);
     } else {
         updateGenerationUi();
+        // CHAT_LOADED/CHAT_CHANGED can replace ctx.chat without changing the
+        // scope key. Reconcile a newly loaded native chat with the server state;
+        // resyncCurrentScope() is deduplicated for the same scope/epoch.
+        if (serverState?.snapshot && !localGeneration && !generationActive(serverState?.generation)) {
+            const local = syncSnapshot(durableSnapshot());
+            const remote = incomingSnapshot(serverState.snapshot);
+            if (!deepEqual(local, remote)) {
+                await resyncCurrentScope(scopeEpoch);
+            }
+        }
     }
 
     return;
@@ -6841,14 +7067,37 @@ async function coordinatedGenerateInterceptor(chat, contextSize, abort, type) {
     const epochAtClaim = scopeEpoch;
 
     if (!serverState) {
-        abort(false);
-        statusText('Multi-Client Sync is not connected to this chat.', true);
-        return;
+        try {
+            await openScope(epochAtClaim);
+        } catch (error) {
+            warn('[MCS] failed to restore scope state before generation', error);
+        }
+        if (!currentScopeGuard(epochAtClaim) || !serverState) {
+            statusText('The prompt may remain in chat history, but MCS could not confirm the shared state and did not start AI generation. Reconnect and retry; check the chat before resending to avoid a duplicate.', true);
+            abort(false);
+            return;
+        }
     }
 
     if (generationClaimInFlightId) {
-        abort(false);
-        return;
+        // A concurrent interceptor can be between claim request and local state
+        // installation. Wait briefly for that decision instead of silently
+        // cancelling immediately. Then re-check both local and server ownership.
+        const claimWaitDeadline = Date.now() + API_TIMEOUT_MS;
+        while (generationClaimInFlightId && Date.now() < claimWaitDeadline) {
+            await sleep(50);
+            if (!currentScopeGuard(epochAtClaim)) break;
+        }
+        if (!currentScopeGuard(epochAtClaim) || generationClaimInFlightId) {
+            statusText('MCS could not confirm generation ownership. The prompt may be in chat history, but no AI response was started; reconnect and check the chat before retrying.', true);
+            abort(false);
+            return;
+        }
+        if (localGeneration || generationActive(serverState?.generation)) {
+            statusText('Another shared generation is active. This send was blocked; wait for it to finish or use Stop, then send again.', true);
+            abort(false);
+            return;
+        }
     }
 
     if (!nativeScopeStable(scopeAtClaim)) {
@@ -6976,6 +7225,7 @@ try {
     const idsReady = await ensureIdsPersisted(scopeAtClaim);
 
     if (!idsReady || !currentScopeGuard(epochAtClaim)) {
+        statusText('MCS could not verify the active chat before sending. No AI request was started. Wait for the chat to finish loading, then check history before retrying.', true);
         abort(false);
         return;
     }
@@ -6988,6 +7238,7 @@ try {
             !nativeScopeStable(scopeAtClaim) ||
             terminalizingGenerationId === generationId
         ) {
+            statusText('MCS cancelled the send because the active chat changed or the previous generation is still finalizing. No AI request was started; check the active chat before retrying.', true);
             abort(false);
             return;
         }
@@ -7122,6 +7373,7 @@ try {
     }
 
     if (!claimResult) {
+        statusText('MCS did not receive confirmation that generation ownership was claimed. No AI request was started; check chat history before retrying.', true);
         abort(false);
         return;
     }
@@ -7145,6 +7397,7 @@ try {
 
         const claimed = claimResult.state?.generation;
         if (!claimed || claimed.generationId !== generationId || !generationIsMine(claimed)) {
+            statusText('MCS could not verify generation ownership after the claim response. No AI request was started; check chat history before retrying.', true);
             abort(false);
             return;
         }
@@ -7189,6 +7442,7 @@ try {
         if (localGeneration?.generationId === generationId) {
             try { await releaseGenerationClaim('stopped'); } catch { /* ignore */ }
         } else {
+            statusText('MCS could not claim this generation. The prompt may remain in chat history, but the AI request was cancelled. Check chat history before resending.', true);
             abort(false);
         }
         return;
@@ -7308,14 +7562,25 @@ function scheduleGenerationStream(delayOverride = null) {
                     const expected = Number(error?.payload?.expected || 0);
                     if (expected > 0 && localGenerationMatches(generationId, scopeAtStream)) {
                         const pending = pendingStream;
-                        if (Number(payload.seq) < expected) {
-                            localGeneration.seq = Math.max(Number(localGeneration.seq || 0), expected - 1);
-                            if (pending) pendingStream = { ...pending, seq: Math.max(expected, Number(pending.seq || 0)) };
+                        const failedSeq = Number(payload.seq || 0);
+                        const pendingSeq = Number(pending?.seq || 0);
+                        const latestServerSeq = Number(error?.payload?.latestSeq ?? (expected - 1));
+                        localGeneration.seq = expected - 1;
+
+                        if (latestServerSeq > failedSeq) {
+                            // A later sequence is already committed; never replay this
+                            // older frame. Keep only a genuinely newer cumulative frame.
+                            pendingStream = pending && pendingSeq > failedSeq
+                                ? { ...pending, seq: expected }
+                                : null;
                         } else {
-                            pendingStream = pending && Number(pending.seq) > expected ? pending : { ...payload, seq: expected };
-                            localGeneration.seq = expected - 1;
+                            // Server is at/behind this frame. Its text may be the latest
+                            // payload whose same-seq retry was rejected; rebase the frame
+                            // or a newer pending cumulative frame to exactly `expected`.
+                            const newest = pending && pendingSeq > failedSeq ? pending : payload;
+                            pendingStream = { ...newest, seq: expected };
                         }
-                        scheduleGenerationStream(0);
+                        if (pendingStream) scheduleGenerationStream(0);
                     }
                 } else if (error?.status === 409 && code === 'generation_not_owned') {
                     const confirmed = await api('/state', 'POST', {
@@ -7349,6 +7614,16 @@ function scheduleGenerationStream(delayOverride = null) {
                 } else {
                     if (error?.name === 'AbortError' && terminalizingGenerationId === generationId) return;
                     if (localGenerationMatches(generationId, scopeAtStream)) {
+                        // A timeout/network error is ambiguous: the server may
+                        // already have accepted payload.seq. Advance the local
+                        // sequence floor so subsequent changed cumulative text
+                        // cannot reuse that sequence. If the server did not
+                        // accept it, its expected-sequence response will rebase
+                        // the pending frame in the existing conflict handler.
+                        localGeneration.seq = Math.max(
+                            Number(localGeneration.seq || 0),
+                            Number(payload.seq || 0),
+                        );
                         if (!pendingStream || Number(pendingStream.seq || 0) < Number(payload.seq || 0)) pendingStream = payload;
                         if (!streamRetryTimer && terminalizingGenerationId !== generationId) {
                             streamRetryTimer = safeSetTimer(() => {
@@ -7901,10 +8176,12 @@ run = previousChain.then(async () => {
 
         if (deltaResult.ok) return true;
 
-        if (
-            deltaResult.abandoned ||
-            deltaResult.ambiguous
-        ) {
+        if (deltaResult.abandoned) return false;
+        if (deltaResult.ambiguous) {
+            if (deltaResult.queued) return true;
+            // Keep localDirty set. A later lifecycle/resync will reconcile it;
+            // do not claim success or silently clear the dirty marker.
+            scheduleQueueFlushRetry();
             return false;
         }
 
@@ -8211,6 +8488,7 @@ function getFastGenerationState(generationId) {
             terminalSeq: 0,
             renderScheduled: false,
             renderInFlight: false,
+            renderRetries: 0,
         };
 
         fastGenerationStates.set(id, state);
@@ -8322,33 +8600,42 @@ function scheduleFastGenerationRender(generationId) {
     if (!state || state.renderScheduled || state.renderInFlight || state.terminal) return;
 
     state.renderScheduled = true;
-
-    const render = () => {
+    const render = async () => {
         const current = fastGenerationStates.get(id);
         if (!current) return;
         current.renderScheduled = false;
         if (!current.latestFrame || current.terminal || current.renderInFlight) return;
 
-        // Capture one newest cumulative frame, then serialize visual mutations without waiting for
-        // snapshots/resyncs. Any frame arriving during the write replaces latestFrame and renders next.
         const frame = current.latestFrame;
         current.latestFrame = null;
         current.renderInFlight = true;
-        Promise.resolve(handleGenerationStreamFrameVisualUpdate(frame))
-            .catch(error => warn('[MCS] fast stream render failed', error))
-            .finally(() => {
-                const latest = fastGenerationStates.get(id);
-                if (!latest) return;
-                latest.renderInFlight = false;
-                if (latest.latestFrame && !latest.terminal) scheduleFastGenerationRender(id);
-            });
+        let applied = false;
+        try {
+            applied = await handleGenerationStreamFrameVisualUpdate(frame);
+        } catch (error) {
+            warn('[MCS] fast stream render failed', error);
+        } finally {
+            const latest = fastGenerationStates.get(id);
+            if (!latest) return;
+            latest.renderInFlight = false;
+            if (applied) {
+                latest.renderRetries = 0;
+            } else if (!latest.terminal && latest.renderRetries < 5) {
+                // A transient scope/DOM readiness failure must not consume the
+                // only copy of the newest cumulative stream frame.
+                latest.latestFrame = latest.latestFrame || frame;
+                latest.renderRetries += 1;
+                setTimeout(() => scheduleFastGenerationRender(id), Math.min(250, 25 * latest.renderRetries));
+                return;
+            } else if (!latest.terminal) {
+                warn('[MCS] stream frame not applied after bounded retries; keeping generation for terminal reconciliation', id);
+            }
+            if (latest.latestFrame && !latest.terminal) scheduleFastGenerationRender(id);
+        }
     };
 
-    if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(render);
-    } else {
-        setTimeout(render, 0);
-    }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => { void render(); });
+    else setTimeout(() => { void render(); }, 0);
 }
 
 // Extracted stream-frame visual update: the existing DOM/message-rendering
@@ -8460,16 +8747,21 @@ if (
             event.stopImmediatePropagation();
             event.stopPropagation();
 
-            if (isStop || isSend) {
+            if (isStop) {
                 if (!settings.remoteStop) {
-                    statusText('Another client is generating this shared chat.', true);
+                    statusText('Remote Stop is disabled. The other client is still generating.', true);
                     return;
                 }
                 try {
                     await requestRemoteStop();
                 } catch (error) {
                     warn('remote stop failed', error);
+                    statusText('Remote Stop could not be confirmed. The other generation may still be running.', true);
                 }
+            } else if (isSend) {
+                // Do not silently reinterpret Send as Stop. Keep the text in the
+                // composer and make the blocked send explicit.
+                statusText('Another tab is generating this chat. Your typed message was NOT sent. Wait for completion or press the Stop button, then Send again.', true);
             } else if (isGenerationMutation) {
                 statusText('Another client is generating this shared chat.', true);
             }
@@ -8509,13 +8801,7 @@ if (
         event.preventDefault();
         event.stopImmediatePropagation();
         event.stopPropagation();
-
-        if (!settings.remoteStop) {
-            statusText('Another client is generating this shared chat.', true);
-            return;
-        }
-
-        try { await requestRemoteStop(); } catch (error) { warn('remote stop via Enter failed', error); }
+        statusText('Another tab is generating this chat. Your typed message was NOT sent. Wait for completion or press the Stop button, then press Enter again.', true);
     };
 
     document.addEventListener('click', clickHandler, true);
@@ -9374,6 +9660,45 @@ if (
     }
 }
 
+function ensureBroadcastChannel() {
+    if (bc) return bc;
+    if (typeof BroadcastChannel !== 'function') return null;
+
+    try {
+        const channel = new BroadcastChannel(BC_NAME);
+        channel.addEventListener('message', message => {
+            const data = message.data;
+            if (!data || typeof data !== 'object' || data.scopeKey !== scopeKeyValue) return;
+
+            if (data.kind === 'generation-stream' && currentScope) {
+                handleGenerationFastStreamEvent({ ...data, __mcsFromBroadcastChannel: true });
+                return;
+            }
+            if (data.kind === 'generation-started' && currentScope) {
+                handleGenerationFastStartEvent({ ...data, __mcsFromBroadcastChannel: true });
+                return;
+            }
+            if (data.kind === 'generation-terminal' && currentScope) {
+                handleGenerationFastTerminalEvent({ ...data, __mcsFromBroadcastChannel: true });
+                return;
+            }
+            if (data.kind === 'generation-stop-requested' && currentScope) {
+                void handleRemoteStopEvent({
+                    scope: data.scope || currentScope,
+                    generationId: data.generationId,
+                    generation: data.generation || null,
+                }).catch(error => warn('BroadcastChannel remote stop handling failed', error));
+            }
+        });
+        bc = channel;
+        return bc;
+    } catch (error) {
+        bc = null;
+        log('[MCS] BroadcastChannel unavailable; continuing without tab wakeups', error);
+        return null;
+    }
+}
+
 async function onActivate() {
     activationInProgress = true;
 
@@ -9383,87 +9708,9 @@ async function onActivate() {
         unwireUiGuards();
         uninstallRemoteUiObserver();
 
-try {
-    bc?.close?.();
-} catch {
-    /* ignore */
-}
-
+try { bc?.close?.(); } catch { /* ignore */ }
 bc = null;
-
-try {
-    if (typeof BroadcastChannel === 'function') {
-        bc = new BroadcastChannel(BC_NAME);
-    }
-} catch (error) {
-    // Sync must continue via SSE/API when BroadcastChannel is blocked by the
-    // browser, private mode, permissions policy, or site-storage restrictions.
-    bc = null;
-
-    log(
-        '[MCS] BroadcastChannel unavailable; continuing without tab wakeups',
-        error,
-    );
-}
-
-bc?.addEventListener('message', message => {
-    const data = message.data;
-
-    if (!data || typeof data !== 'object') return;
-    if (data.scopeKey !== scopeKeyValue) return;
-
-    if (
-        data.kind === 'generation-stream' &&
-        currentScope
-    ) {
-        handleGenerationFastStreamEvent({
-            ...data,
-            __mcsFromBroadcastChannel: true,
-        });
-
-        return;
-    }
-
-    if (
-        data.kind === 'generation-started' &&
-        currentScope
-    ) {
-        handleGenerationFastStartEvent({
-            ...data,
-            __mcsFromBroadcastChannel: true,
-        });
-
-        return;
-    }
-
-    if (
-        data.kind === 'generation-terminal' &&
-        currentScope
-    ) {
-        handleGenerationFastTerminalEvent({
-            ...data,
-            __mcsFromBroadcastChannel: true,
-        });
-
-        return;
-    }
-
-    if (
-        data.kind === 'generation-stop-requested' &&
-        currentScope
-    ) {
-        handleRemoteStopEvent({
-            scope: data.scope || currentScope,
-            generationId: data.generationId,
-            generation: data.generation || null,
-        }).catch(error => {
-            warn(
-                'BroadcastChannel remote stop handling failed',
-                error,
-            );
-        });
-    }
-});
+ensureBroadcastChannel();
 
 if (!storageHandler) {
     storageHandler = event => {
@@ -9588,6 +9835,7 @@ function onEnableInternal() {
         settings.enabled = true;
         saveSettings();
         refreshLiveContext();
+        ensureBroadcastChannel();
         ++scopeEpoch;
         wireEvents();
         wireUiGuards();
